@@ -31,6 +31,10 @@ class FlightInfo:
         arrival_time: Scheduled arrival time
         departure_date: Flight date
         direction: Whether this is departure or return flight
+        departure_airport: Full name of departure airport (optional)
+        arrival_airport: Full name of arrival airport (optional)
+        departure_airport_code: IATA code of departure airport (optional)
+        arrival_airport_code: IATA code of arrival airport (optional)
     """
     flight_no: str
     airline: str
@@ -40,20 +44,29 @@ class FlightInfo:
     arrival_time: str
     departure_date: date
     direction: FlightDirection
+    departure_airport: Optional[str] = None       # 出发机场全称
+    arrival_airport: Optional[str] = None         # 到达机场全称
+    departure_airport_code: Optional[str] = None  # IATA 代码
+    arrival_airport_code: Optional[str] = None    # IATA 代码
 
 
 @dataclass
 class FlightPrice:
     """Data class representing a flight price snapshot.
 
+    For one-way flights ``return_flight_info`` is ``None`` and ``price`` is
+    the single-leg fare.  For round-trip combined records ``return_flight_info``
+    holds the return-leg details and ``price`` is the combined total fare.
+
     Attributes:
-        flight_info: Associated flight information
-        price: Current price
-        currency: Currency code (e.g., "CNY")
-        seat_class: Seat class (e.g., "经济舱", "商务舱")
-        available_seats: Number of available seats (if available)
-        scraped_at: Timestamp when this price was scraped
-        source: Data source platform (e.g., "ctrip")
+        flight_info: Outbound (or single-leg) flight information.
+        price: Fare — single-leg for one-way, combined total for round-trip.
+        currency: Currency code (e.g., "CNY").
+        seat_class: Seat class (e.g., "经济舱", "商务舱").
+        available_seats: Number of available seats (if available).
+        scraped_at: Timestamp when this price was scraped.
+        source: Data source platform (e.g., "ctrip").
+        return_flight_info: Return-leg flight info (round-trip only, else None).
     """
     flight_info: FlightInfo
     price: Decimal
@@ -62,6 +75,7 @@ class FlightPrice:
     available_seats: Optional[int]
     scraped_at: datetime
     source: str
+    return_flight_info: Optional[FlightInfo] = None  # 往返程回程航班信息
 
 
 @dataclass

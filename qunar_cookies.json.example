@@ -1,0 +1,14 @@
+[
+  {
+    "name": "QN1",
+    "value": "在此填入 Cookie 的值",
+    "domain": ".qunar.com",
+    "path": "/"
+  },
+  {
+    "name": "_qnauthtoken",
+    "value": "在此填入 Cookie 的值",
+    "domain": ".qunar.com",
+    "path": "/"
+  }
+]

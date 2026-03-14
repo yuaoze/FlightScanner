@@ -7,8 +7,6 @@ import streamlit as st
 from datetime import date, timedelta
 from decimal import Decimal
 
-from sqlalchemy.orm import Session
-
 from flightscanner.core.services import RouteService
 
 
@@ -20,84 +18,125 @@ def render_sidebar(session_factory):
     """
     st.header("添加新路线")
 
-    with st.form("add_route_form"):
-        # Origin city
-        origin = st.text_input(
-            "出发城市",
-            placeholder="例如：北京",
-            help="输入出发城市的中文名称",
-        )
+    min_date = date.today()
+    max_date = min_date + timedelta(days=365)
 
-        # Destination city
-        destination = st.text_input(
-            "到达城市",
-            placeholder="例如：上海",
-            help="输入到达城市的中文名称",
-        )
+    # Origin / destination
+    origin = st.text_input(
+        "出发城市",
+        placeholder="例如：北京",
+        help="输入出发城市的中文名称",
+        key="sidebar_origin",
+    )
+    destination = st.text_input(
+        "到达城市",
+        placeholder="例如：上海",
+        help="输入到达城市的中文名称",
+        key="sidebar_destination",
+    )
 
-        # Target date
-        min_date = date.today()
-        max_date = min_date + timedelta(days=365)
-        target_date = st.date_input(
-            "目标旅行日期",
-            min_value=min_date,
+    # Target date
+    target_date = st.date_input(
+        "目标旅行日期",
+        min_value=min_date,
+        max_value=max_date,
+        help="选择计划出行的日期",
+        key="sidebar_target_date",
+    )
+
+    # Trip type — 使用普通 radio（不在 st.form 内），切换时立即触发重渲染
+    trip_type_label = st.radio(
+        "行程类型",
+        options=["单程", "往返"],
+        horizontal=True,
+        help="单程仅监控去程价格；往返同时监控去程和回程",
+        key="sidebar_trip_type",
+    )
+    trip_type = "roundtrip" if trip_type_label == "往返" else "oneway"
+
+    # 回程日期：仅"往返"时显示
+    return_date = None
+    if trip_type == "roundtrip":
+        return_date = st.date_input(
+            "回程日期",
+            min_value=target_date + timedelta(days=1),
             max_value=max_date,
-            help="选择计划出行的日期",
+            help="选择回程日期（须晚于出发日期）",
+            key="sidebar_return_date",
         )
 
-        # Target price
-        target_price = st.number_input(
-            "目标价格 (¥)",
-            min_value=100,
-            max_value=50000,
-            value=800,
-            step=50,
-            help="设置您的目标价格，当价格低于此价格时会收到提醒",
-        )
+    # International checkbox
+    is_international = st.checkbox(
+        "国际航班",
+        value=False,
+        help="勾选后请使用中文城市名，如「东京」、「首尔」（系统将自动识别国际路线）",
+        key="sidebar_is_international",
+    )
 
-        # Scrape interval
-        scrape_interval = st.select_slider(
-            "采集间隔（小时）",
-            options=[1, 2, 3, 4, 6, 8, 12, 24],
-            value=6,
-            help="设置价格采集的时间间隔",
-        )
+    # Target price
+    target_price = st.number_input(
+        "目标价格 (¥)",
+        min_value=100,
+        max_value=50000,
+        value=800,
+        step=50,
+        help="设置您的目标价格，当价格低于此价格时会收到提醒",
+        key="sidebar_target_price",
+    )
 
-        # Submit button
-        submitted = st.form_submit_button("添加路线", type="primary")
+    # Scrape interval
+    scrape_interval = st.select_slider(
+        "采集间隔（小时）",
+        options=[1, 2, 3, 4, 6, 8, 12, 24],
+        value=6,
+        help="设置价格采集的时间间隔",
+        key="sidebar_scrape_interval",
+    )
 
-        if submitted:
-            # Validation
-            if not origin or not destination:
-                st.error("请填写出发城市和到达城市。")
-                return
+    # Submit button
+    if st.button("添加路线", type="primary", use_container_width=True):
+        # Validation
+        if not origin or not destination:
+            st.error("请填写出发城市和到达城市。")
+            return
 
-            if origin == destination:
-                st.error("出发城市和到达城市不能相同。")
-                return
+        if origin == destination:
+            st.error("出发城市和到达城市不能相同。")
+            return
 
-            # Add route to database
+        if trip_type == "roundtrip" and return_date is None:
+            st.error("往返程请选择回程日期。")
+            return
+
+        # Add route to database
+        try:
+            session = session_factory()
             try:
-                session = session_factory()
-                try:
-                    service = RouteService(session)
-                    route = service.add_route(
-                        origin=origin,
-                        destination=destination,
-                        target_date=target_date,
-                        target_price=Decimal(str(target_price)),
-                        scrape_interval=scrape_interval,
-                    )
-                    st.success(
-                        f"路线已添加：{origin} → {destination}，日期：{target_date}，采集间隔：{scrape_interval}小时"
-                    )
-                    st.rerun()
-                finally:
-                    session.close()
-            except ValueError as e:
-                st.error(str(e))
-            except Exception as e:
-                st.error(f"添加路线失败：{e}")
+                service = RouteService(session)
+                route = service.add_route(
+                    origin=origin,
+                    destination=destination,
+                    target_date=target_date,
+                    target_price=Decimal(str(target_price)),
+                    scrape_interval=scrape_interval,
+                    return_date=return_date,
+                    trip_type=trip_type,
+                    is_international=is_international,
+                )
+                # 通知 app.py 立即采集并注册定期任务
+                st.session_state["new_route_id"] = route.id
+                trip_label = "往返" if trip_type == "roundtrip" else "单程"
+                st.success(
+                    f"路线已添加：{origin} → {destination}，{trip_label}，"
+                    f"日期：{target_date}，采集间隔：{scrape_interval}小时"
+                )
+                st.rerun()
+            finally:
+                session.close()
+        except ValueError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"添加路线失败：{e}")
 
     # Instructions
     st.markdown("---")

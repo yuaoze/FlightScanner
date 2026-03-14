@@ -4,6 +4,7 @@ This module provides email notification functionality using SMTP
 for sending price alerts to users.
 """
 
+import json
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -118,12 +119,25 @@ class EmailNotifier(Notifier):
         Args:
             flight_price: Flight price information.
             trend: Price trend analysis.
-            message: Alert message.
+            message: Alert message (JSON NotifyContext or plain text).
 
         Returns:
             Plain text email body.
         """
         flight = flight_price.flight_info
+        ctx = self._parse_message(message)
+
+        # 买点增强信息（仅在解析成功时展示）
+        extra = ""
+        if ctx.get("avg_30d", 0) > 0:
+            extra = (
+                f"\n买点分析:\n"
+                f"  30天均价: ¥{ctx['avg_30d']:.0f}\n"
+                f"  30天最低: ¥{ctx['min_30d']:.0f}\n"
+                f"  低于均价: {abs(ctx.get('pct_vs_avg', 0)):.1f}%\n"
+                f"  触发原因: {ctx.get('trigger_reason', '')}\n"
+                f"  买点建议: {ctx.get('recommendation', '')}\n"
+            )
 
         body = f"""
 FlightScanner 价格提醒
@@ -140,14 +154,13 @@ FlightScanner 价格提醒
   当前价格: ¥{flight_price.price}
   舱位等级: {flight_price.seat_class}
   数据来源: {flight_price.source}
-
+{extra}
 趋势分析:
   趋势方向: {trend.direction}
   置信度: {trend.confidence:.0%}
   建议: {trend.recommendation}
 
 {'=' * 50}
-{message}
 
 此邮件由 FlightScanner 自动发送。
 """
@@ -161,16 +174,47 @@ FlightScanner 价格提醒
         Args:
             flight_price: Flight price information.
             trend: Price trend analysis.
-            message: Alert message.
+            message: Alert message (JSON NotifyContext or plain text).
 
         Returns:
             HTML email body.
         """
         flight = flight_price.flight_info
+        ctx = self._parse_message(message)
 
         # Color coding for trend direction
         trend_colors = {"down": "#28a745", "up": "#dc3545", "stable": "#ffc107"}
         trend_color = trend_colors.get(trend.direction, "#6c757d")
+
+        # 买点增强 HTML 块（仅在解析成功时展示）
+        extra_html = ""
+        if ctx.get("avg_30d", 0) > 0:
+            reason_labels = {
+                "target_hit": "已达目标价 🎯",
+                "near_30d_low": "接近30天最低价 📉",
+                "below_avg": "显著低于均价 💡",
+            }
+            reason_label = reason_labels.get(ctx.get("trigger_reason", ""), ctx.get("trigger_reason", ""))
+            extra_html = f"""
+            <div class="flight-info">
+                <h2>买点分析</h2>
+                <table style="width:100%; border-collapse:collapse;">
+                    <tr>
+                        <td style="padding:4px 8px;"><strong>30天均价</strong></td>
+                        <td style="padding:4px 8px;">¥{ctx['avg_30d']:.0f}</td>
+                        <td style="padding:4px 8px;"><strong>30天最低</strong></td>
+                        <td style="padding:4px 8px;">¥{ctx['min_30d']:.0f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:4px 8px;"><strong>低于均价</strong></td>
+                        <td style="padding:4px 8px; color:#28a745;">{abs(ctx.get('pct_vs_avg', 0)):.1f}%</td>
+                        <td style="padding:4px 8px;"><strong>低于目标价</strong></td>
+                        <td style="padding:4px 8px; color:#28a745;">{abs(ctx.get('pct_vs_target', 0)):.1f}%</td>
+                    </tr>
+                </table>
+                <p><strong>触发原因：</strong>{reason_label}</p>
+                <p><strong>买点建议：</strong><span style="color:#28a745; font-weight:bold;">{ctx.get('recommendation', '')}</span></p>
+            </div>"""
 
         html = f"""
 <!DOCTYPE html>
@@ -215,16 +259,12 @@ FlightScanner 价格提醒
                 <p><strong>舱位等级:</strong> {flight_price.seat_class}</p>
                 <p><strong>数据来源:</strong> {flight_price.source}</p>
             </div>
-
+            {extra_html}
             <div class="trend trend-{trend.direction}" style="border-left: 4px solid {trend_color};">
                 <h3>趋势分析</h3>
                 <p><strong>趋势方向:</strong> {trend.direction.upper()}</p>
                 <p><strong>置信度:</strong> {trend.confidence:.0%}</p>
                 <p><strong>建议:</strong> {trend.recommendation}</p>
-            </div>
-
-            <div class="flight-info">
-                <p>{message}</p>
             </div>
         </div>
 
@@ -237,3 +277,18 @@ FlightScanner 价格提醒
 </html>
 """
         return html
+
+    @staticmethod
+    def _parse_message(message: str) -> dict:
+        """将 JSON 消息字符串反序列化为字典。
+
+        Args:
+            message: JSON 格式的消息字符串（或普通文本）。
+
+        Returns:
+            包含通知上下文字段的字典；解析失败时返回空字典。
+        """
+        try:
+            return json.loads(message)
+        except Exception:
+            return {}

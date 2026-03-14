@@ -9,6 +9,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     create_engine,
+    text,
     Column,
     Integer,
     String,
@@ -64,9 +65,18 @@ class Flight(Base):
     direction = Column(String(20), nullable=False)  # "departure" or "return"
     created_at = Column(DateTime, default=utcnow, nullable=False)
 
-    # Relationship
+    # 机场信息（通过迁移添加，可空）
+    departure_airport = Column(String(100), nullable=True)       # 出发机场全称
+    arrival_airport = Column(String(100), nullable=True)         # 到达机场全称
+    departure_airport_code = Column(String(10), nullable=True)   # IATA 代码，如 "PEK"
+    arrival_airport_code = Column(String(10), nullable=True)     # IATA 代码，如 "HND"
+
+    # Relationship（仅跟踪以本航班为去程/单程的价格记录）
     price_histories = relationship(
-        "PriceHistory", back_populates="flight", cascade="all, delete-orphan"
+        "PriceHistory",
+        foreign_keys="[PriceHistory.flight_id]",
+        back_populates="flight",
+        cascade="all, delete-orphan",
     )
 
     # Unique constraint: same flight on same date with same direction should be unique
@@ -120,6 +130,26 @@ class Route(Base):
     created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
 
+    # 往返程 + 国际标记（通过迁移添加）
+    return_date = Column(Date, nullable=True)                              # 回程日期，单程=None
+    trip_type = Column(String(20), default="oneway")                      # "oneway"/"roundtrip"
+    is_international = Column(Integer, default=0, nullable=False)         # 1=国际，0=国内
+
+    # 机场过滤（可空，NULL=不限机场）
+    dep_airport_code = Column(String(10), nullable=True)   # 出发机场 IATA 代码，如 "PEK"
+    arr_airport_code = Column(String(10), nullable=True)   # 到达机场 IATA 代码，如 "HND"
+
+    # 时间段过滤（可空，NULL=不限时间，格式 "HH:MM"）
+    dep_time_from = Column(String(10), nullable=True)   # 起飞时间段开始，如 "06:00"
+    dep_time_to   = Column(String(10), nullable=True)   # 起飞时间段结束，如 "12:00"
+    arr_time_from = Column(String(10), nullable=True)   # 落地时间段开始
+    arr_time_to   = Column(String(10), nullable=True)   # 落地时间段结束
+
+    # 通知防骚扰字段（通过迁移添加）
+    last_notified_at    = Column(DateTime, nullable=True)           # 上次通知时间（UTC）
+    last_notified_price = Column(Numeric(10, 2), nullable=True)     # 上次通知时的价格
+    notify_threshold_pct = Column(Numeric(5, 2), nullable=True)    # 用户自定义低于均价 N% 时通知（None=使用全局默认）
+
     # Relationship
     price_histories = relationship(
         "PriceHistory", back_populates="route", cascade="all, delete-orphan"
@@ -163,6 +193,8 @@ class PriceHistory(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     flight_id = Column(Integer, ForeignKey("flights.id"), nullable=False, index=True)
     route_id = Column(Integer, ForeignKey("routes.id"), nullable=True, index=True)
+    # 往返程回程航班（单程时为 NULL）
+    return_flight_id = Column(Integer, ForeignKey("flights.id"), nullable=True, index=True)
     price = Column(Numeric(10, 2), nullable=False)
     currency = Column(String(10), nullable=False, default="CNY")
     seat_class = Column(String(50), nullable=False)
@@ -171,7 +203,8 @@ class PriceHistory(Base):
     scraped_at = Column(DateTime, default=utcnow, nullable=False, index=True)
 
     # Relationships
-    flight = relationship("Flight", back_populates="price_histories")
+    flight = relationship("Flight", foreign_keys=[flight_id], back_populates="price_histories")
+    return_flight = relationship("Flight", foreign_keys=[return_flight_id])
     route = relationship("Route", back_populates="price_histories")
 
     # Indexes for efficient querying
@@ -205,6 +238,40 @@ class PriceHistory(Base):
         return Decimal(str(self.price))
 
 
+def _apply_migrations(engine) -> None:
+    """幂等地为已存在的表添加新列（SQLite 不支持 IF NOT EXISTS，用 try/except 跳过已存在列）。"""
+    stmts = [
+        "ALTER TABLE flights ADD COLUMN departure_airport TEXT",
+        "ALTER TABLE flights ADD COLUMN arrival_airport TEXT",
+        "ALTER TABLE flights ADD COLUMN departure_airport_code TEXT",
+        "ALTER TABLE flights ADD COLUMN arrival_airport_code TEXT",
+        "ALTER TABLE routes ADD COLUMN return_date DATE",
+        "ALTER TABLE routes ADD COLUMN trip_type TEXT NOT NULL DEFAULT 'oneway'",
+        "ALTER TABLE routes ADD COLUMN is_international INTEGER NOT NULL DEFAULT 0",
+        # 往返程回程航班 FK（单程时为 NULL）
+        "ALTER TABLE price_history ADD COLUMN return_flight_id INTEGER REFERENCES flights(id)",
+        # 机场过滤字段
+        "ALTER TABLE routes ADD COLUMN dep_airport_code TEXT",
+        "ALTER TABLE routes ADD COLUMN arr_airport_code TEXT",
+        # 时间段过滤字段
+        "ALTER TABLE routes ADD COLUMN dep_time_from TEXT",
+        "ALTER TABLE routes ADD COLUMN dep_time_to TEXT",
+        "ALTER TABLE routes ADD COLUMN arr_time_from TEXT",
+        "ALTER TABLE routes ADD COLUMN arr_time_to TEXT",
+        # 通知防骚扰字段
+        "ALTER TABLE routes ADD COLUMN last_notified_at DATETIME",
+        "ALTER TABLE routes ADD COLUMN last_notified_price NUMERIC",
+        "ALTER TABLE routes ADD COLUMN notify_threshold_pct NUMERIC",
+    ]
+    with engine.connect() as conn:
+        for stmt in stmts:
+            try:
+                conn.execute(text(stmt))
+                conn.commit()
+            except Exception:
+                pass  # 列已存在时 SQLite 报错，直接跳过
+
+
 def init_db(db_url: str = "sqlite:///flightscanner.db"):
     """Initialize database and create all tables.
 
@@ -217,4 +284,5 @@ def init_db(db_url: str = "sqlite:///flightscanner.db"):
     engine = create_engine(db_url, echo=False, pool_pre_ping=True)
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine)
+    _apply_migrations(engine)
     return engine, SessionLocal

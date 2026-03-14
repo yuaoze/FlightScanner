@@ -55,13 +55,15 @@ class TestCtripScraper:
         assert scraper.max_retries == 5
 
     def test_build_search_url_one_way(self, scraper: CtripScraper, search_params: SearchParams):
-        """Test URL building for one-way flights."""
+        """Test URL building for one-way flights using IATA city codes."""
         url = scraper._build_search_url(search_params)
 
         assert "flights.ctrip.com" in url
         assert "oneway" in url
-        assert "北京" in url
-        assert "上海" in url
+        # 北京 → bjs，上海 → sha（携程使用 IATA 城市代码构建 URL）
+        assert "bjs" in url
+        assert "sha" in url
+        assert "depdate" in url
 
     def test_build_search_url_round_trip(self, scraper: CtripScraper):
         """Test URL building for round-trip flights."""
@@ -75,8 +77,9 @@ class TestCtripScraper:
         url = scraper._build_search_url(params)
 
         assert "flights.ctrip.com" in url
-        assert "北京" in url
-        assert "上海" in url
+        assert "round" in url
+        assert "bjs" in url
+        assert "sha" in url
 
     @pytest.mark.asyncio
     async def test_close_cleans_up_resources(self, scraper: CtripScraper):
@@ -86,12 +89,17 @@ class TestCtripScraper:
         scraper._browser = AsyncMock()
         scraper._context = AsyncMock()
 
+        # Save references before close() resets them to None
+        mock_context = scraper._context
+        mock_browser = scraper._browser
+        mock_playwright = scraper._playwright
+
         await scraper.close()
 
         # Verify cleanup methods were called
-        scraper._context.close.assert_called_once()
-        scraper._browser.close.assert_called_once()
-        scraper._playwright.stop.assert_called_once()
+        mock_context.close.assert_called_once()
+        mock_browser.close.assert_called_once()
+        mock_playwright.stop.assert_called_once()
 
         # Verify attributes are reset
         assert scraper._context is None
@@ -113,8 +121,9 @@ class TestCtripScraper:
         """Test that search_flights returns empty list when no flights found."""
         with patch.object(scraper, '_ensure_browser'), \
              patch.object(scraper, '_is_blocked', return_value=False), \
-             patch.object(scraper, '_wait_for_results'), \
-             patch.object(scraper, '_parse_flights', return_value=[]):
+             patch.object(scraper, '_parse_api_responses', return_value=[]), \
+             patch.object(scraper, '_parse_flights_from_dom', return_value=[]), \
+             patch('asyncio.sleep'):
 
             # Mock page
             mock_page = AsyncMock()
@@ -133,7 +142,8 @@ class TestCtripScraper:
         import asyncio
         from flightscanner.interfaces import NetworkTimeoutError
 
-        with patch.object(scraper, '_ensure_browser'):
+        with patch.object(scraper, '_ensure_browser'), \
+             patch('asyncio.sleep'):
             # Mock page that times out
             mock_page = AsyncMock()
             mock_page.goto.side_effect = asyncio.TimeoutError("Page load timeout")
@@ -153,7 +163,8 @@ class TestCtripScraper:
         from flightscanner.interfaces import AntiCrawlerDetectedError
 
         with patch.object(scraper, '_ensure_browser'), \
-             patch.object(scraper, '_is_blocked', return_value=True):
+             patch.object(scraper, '_is_blocked', return_value=True), \
+             patch('asyncio.sleep'):
 
             # Mock page
             mock_page = AsyncMock()
@@ -225,10 +236,13 @@ class TestCtripScraper:
 
     @pytest.mark.asyncio
     async def test_search_flights_retries_on_failure(self, scraper: CtripScraper, search_params: SearchParams):
-        """Test that search_flights retries on transient failures."""
+        """Test that search_flights raises ParseError on unexpected failure."""
         from flightscanner.interfaces import ParseError
 
-        with patch.object(scraper, '_ensure_browser'):
+        with patch.object(scraper, '_ensure_browser'), \
+             patch.object(scraper, '_is_blocked', return_value=False), \
+             patch('asyncio.sleep'):
+
             # Mock page
             mock_page = AsyncMock()
             mock_page.goto = AsyncMock()
@@ -237,23 +251,10 @@ class TestCtripScraper:
             mock_context.new_page.return_value = mock_page
             scraper._context = mock_context
 
-            # Mock _is_blocked to return False
-            with patch.object(scraper, '_is_blocked', return_value=False):
-                # Mock _wait_for_results to raise exception first time
-                call_count = 0
-
-                async def mock_wait_for_results(page):
-                    nonlocal call_count
-                    call_count += 1
-                    if call_count == 1:
-                        raise Exception("First attempt failed")
-
-                with patch.object(scraper, '_wait_for_results', side_effect=mock_wait_for_results):
-                    # Mock _parse_flights to return empty list
-                    with patch.object(scraper, '_parse_flights', return_value=[]):
-                        # Should retry due to tenacity decorator
-                        # (In actual test, we'd check the retry behavior)
-                        pass
+            # _parse_api_responses raises unexpected exception
+            with patch.object(scraper, '_parse_api_responses', side_effect=RuntimeError("unexpected")):
+                with pytest.raises(ParseError):
+                    await scraper.search_flights(search_params)
 
 
 @pytest.mark.asyncio
@@ -266,7 +267,8 @@ async def test_scraper_integration_mock():
     scraper = CtripScraper(headless=True, timeout=5000)
 
     # Mock all Playwright components
-    with patch('flightscanner.scrapers.ctrip_scraper.async_playwright') as mock_playwright_func:
+    with patch('flightscanner.scrapers.ctrip_scraper.async_playwright') as mock_playwright_func, \
+         patch('asyncio.sleep'):
         # Setup mock playwright
         mock_playwright = AsyncMock()
         mock_playwright_func.return_value.start = AsyncMock(return_value=mock_playwright)

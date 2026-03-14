@@ -48,8 +48,11 @@ class RuleBasedAnalyzer(PriceAnalyzer):
                 best_booking_time=None,
             )
 
+        # 按采集时间降序排序，确保 sorted_prices[0] 为最新记录
+        sorted_prices = sorted(historical_prices, key=lambda fp: fp.scraped_at, reverse=True)
+
         # Extract prices
-        prices = [float(fp.price) for fp in historical_prices]
+        prices = [float(fp.price) for fp in sorted_prices]
 
         # Calculate statistics
         avg_price = mean(prices)
@@ -63,7 +66,7 @@ class RuleBasedAnalyzer(PriceAnalyzer):
             price_stdev = 0.0
 
         # Get the most recent price
-        current_price = historical_prices[0].price  # Assuming sorted by scraped_at desc
+        current_price = sorted_prices[0].price
 
         # Determine trend direction
         # Allow 10% deviation from average for "stable" classification
@@ -155,7 +158,7 @@ class RuleBasedAnalyzer(PriceAnalyzer):
             return False
 
         # Check confidence
-        if trend.confidence < 0.5:
+        if trend.confidence < 0.1:
             return False
 
         return True

@@ -82,6 +82,9 @@ def sample_flight_prices():
     """Create sample flight prices for testing."""
     prices = []
     base_date = date.today() + timedelta(days=7)
+    # 使用固定时间戳（15天前），确保所有 sample 价格时间一致且
+    # 早于趋势历史数据（1-10天前），以便趋势分析取到最新的历史价格
+    scraped_at = datetime.now(timezone.utc) - timedelta(days=15)
 
     # Create multiple flights with different prices
     flight_data = [
@@ -109,7 +112,7 @@ def sample_flight_prices():
             currency="CNY",
             seat_class=seat_class,
             available_seats=15,
-            scraped_at=datetime.now(timezone.utc),
+            scraped_at=scraped_at,
             source="ctrip",
         )
         prices.append(fp)

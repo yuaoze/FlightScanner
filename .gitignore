@@ -58,11 +58,22 @@ logs/
 .env
 .env.local
 
+# Cookie files (contain sensitive login credentials — never commit)
+qunar_cookies.json
+ctrip_cookies.json
+
 # Screenshots and debug files
 debug_screenshot.png
 *.png
 *.jpg
 *.jpeg
+# Scraper debug output & captured API responses
+*_debug_*.json
+*_debug_*.html
+*_debug_*.txt
+qunar_mobile_api.json
+qunar_mobile_debug.html
+ctrip_batch_search.json
 
 # OS
 .DS_Store

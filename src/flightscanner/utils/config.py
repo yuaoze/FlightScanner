@@ -56,9 +56,23 @@ class Settings(BaseSettings):
         default=None, description="Telegram chat ID"
     )
 
+    # WeCom (企业微信) Notification Configuration
+    wecom_webhook_url: Optional[str] = Field(
+        default=None, description="WeCom group robot Webhook URL"
+    )
+
+    # FeiShu (飞书) Notification Configuration
+    feishu_webhook_url: Optional[str] = Field(
+        default=None, description="飞书自定义机器人 Webhook URL"
+    )
+    feishu_webhook_secret: Optional[str] = Field(
+        default=None, description="飞书 Webhook 签名校验密钥（可选）"
+    )
+
     # Scraper Configuration
     scraper_type: str = Field(
-        default="qunar", description="Scraper to use: 'qunar' or 'ctrip'"
+        default="qunar",
+        description="启用的爬虫平台，单个或逗号分隔多个：'qunar'、'ctrip'、'qunar,ctrip'",
     )
     scraper_headless: bool = Field(
         default=True, description="Run browser in headless mode"
@@ -73,20 +87,41 @@ class Settings(BaseSettings):
         default=None,
         description="Qunar cookies JSON string for authentication (optional)",
     )
+    ctrip_cookies: Optional[str] = Field(
+        default=None,
+        description="Ctrip cookies JSON string for authentication (optional)",
+    )
 
     # Alert Configuration
     alert_price_threshold: int = Field(
         default=800, description="Default price threshold for alerts (CNY)"
     )
 
+    # Notification anti-spam configuration
+    notify_cooldown_hours: int = Field(
+        default=24, description="Minimum hours between repeat notifications for the same route"
+    )
+    notify_below_avg_threshold: float = Field(
+        default=10.0, description="Notify when price is N% below the 30-day average"
+    )
+
     @field_validator("scraper_type")
     @classmethod
     def validate_scraper_type(cls, v: str) -> str:
-        """Validate scraper type."""
-        allowed = ["qunar", "ctrip"]
-        if v.lower() not in allowed:
-            raise ValueError(f"Scraper type must be one of {allowed}")
-        return v.lower()
+        """验证爬虫平台配置，支持单个或逗号分隔的多个平台名。"""
+        allowed = {"qunar", "ctrip"}
+        platforms = [p.strip().lower() for p in v.split(",") if p.strip()]
+        if not platforms:
+            raise ValueError("scraper_type 不能为空")
+        invalid = set(platforms) - allowed
+        if invalid:
+            raise ValueError(
+                f"未知爬虫平台：{invalid}。可选值：{allowed}"
+            )
+        # 去重并保持顺序
+        seen = set()
+        unique = [p for p in platforms if not (p in seen or seen.add(p))]
+        return ",".join(unique)
 
     @field_validator("deepseek_api_key")
     @classmethod

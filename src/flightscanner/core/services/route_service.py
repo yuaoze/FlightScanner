@@ -4,16 +4,16 @@ This module provides business logic for route management operations.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from decimal import Decimal
 from typing import Optional, List
 
 from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
-from sqlalchemy.sql import literal_column
 
 from flightscanner.models.database import Route, PriceHistory, Flight
 from flightscanner.interfaces import FlightPrice
+from flightscanner.utils.city_codes import is_international_route
 
 
 @dataclass
@@ -32,6 +32,15 @@ class RouteWithLatestPrice:
         latest_price: Latest scraped price (if any).
         latest_scraped_at: Timestamp of latest price scrape (if any).
         price_count: Number of price records for this route.
+        return_date: Return date for round-trip flights (None for one-way).
+        trip_type: "oneway" or "roundtrip".
+        is_international: Whether this is an international flight.
+        dep_airport_code: Departure airport IATA code filter (None = any airport).
+        arr_airport_code: Arrival airport IATA code filter (None = any airport).
+        dep_time_from: Departure time window start (HH:MM, None = no limit).
+        dep_time_to: Departure time window end (HH:MM, None = no limit).
+        arr_time_from: Arrival time window start (HH:MM, None = no limit).
+        arr_time_to: Arrival time window end (HH:MM, None = no limit).
     """
     id: int
     origin: str
@@ -44,6 +53,17 @@ class RouteWithLatestPrice:
     latest_price: Optional[Decimal]
     latest_scraped_at: Optional[datetime]
     price_count: int
+    return_date: Optional[date] = None
+    trip_type: str = "oneway"
+    is_international: bool = False
+    dep_airport_code: Optional[str] = None
+    arr_airport_code: Optional[str] = None
+    dep_time_from: Optional[str] = None
+    dep_time_to: Optional[str] = None
+    arr_time_from: Optional[str] = None
+    arr_time_to: Optional[str] = None
+    last_notified_at: Optional[datetime] = None
+    last_notified_price: Optional[Decimal] = None
 
 
 class RouteService:
@@ -67,7 +87,16 @@ class RouteService:
         destination: str,
         target_date: date,
         target_price: Decimal,
-        scrape_interval: int = 6
+        scrape_interval: int = 6,
+        return_date: Optional[date] = None,
+        trip_type: str = "oneway",
+        is_international: Optional[bool] = None,
+        dep_airport_code: Optional[str] = None,
+        arr_airport_code: Optional[str] = None,
+        dep_time_from: Optional[str] = None,
+        dep_time_to: Optional[str] = None,
+        arr_time_from: Optional[str] = None,
+        arr_time_to: Optional[str] = None,
     ) -> Route:
         """Add a new route to monitor.
 
@@ -77,6 +106,16 @@ class RouteService:
             target_date: Target travel date.
             target_price: Target price threshold for alerts.
             scrape_interval: Scrape interval in hours (default 6).
+            return_date: Return date for round-trip flights (optional).
+            trip_type: "oneway" or "roundtrip" (default "oneway").
+            is_international: Whether this is an international route. If None,
+                auto-inferred from city names via is_international_route().
+            dep_airport_code: Departure airport IATA code filter (None = any airport).
+            arr_airport_code: Arrival airport IATA code filter (None = any airport).
+            dep_time_from: Departure time window start "HH:MM" (None = no limit).
+            dep_time_to: Departure time window end "HH:MM" (None = no limit).
+            arr_time_from: Arrival time window start "HH:MM" (None = no limit).
+            arr_time_to: Arrival time window end "HH:MM" (None = no limit).
 
         Returns:
             The created Route object.
@@ -98,6 +137,10 @@ class RouteService:
                 f"Route already exists: {origin} -> {destination} on {target_date}"
             )
 
+        # 自动推断是否国际航班
+        if is_international is None:
+            is_international = is_international_route(origin, destination)
+
         route = Route(
             origin=origin,
             destination=destination,
@@ -105,6 +148,15 @@ class RouteService:
             target_price=target_price,
             scrape_interval=scrape_interval,
             is_active=1,
+            return_date=return_date,
+            trip_type=trip_type,
+            is_international=int(is_international),
+            dep_airport_code=dep_airport_code or None,
+            arr_airport_code=arr_airport_code or None,
+            dep_time_from=dep_time_from or None,
+            dep_time_to=dep_time_to or None,
+            arr_time_from=arr_time_from or None,
+            arr_time_to=arr_time_to or None,
         )
 
         self.session.add(route)
@@ -120,13 +172,35 @@ class RouteService:
             List of RouteWithLatestPrice objects containing route data
             and aggregated price information.
         """
-        # Subquery to get latest price info per route
-        latest_price_subq = (
+        # Subquery 1: per-route latest scraped_at.
+        latest_time_subq = (
             self.session.query(
                 PriceHistory.route_id,
                 func.max(PriceHistory.scraped_at).label("latest_scraped_at"),
             )
             .filter(PriceHistory.route_id.isnot(None))
+            .group_by(PriceHistory.route_id)
+            .subquery()
+        )
+
+        # Subquery 2: minimum price among records whose scraped_at equals the
+        # latest scraped_at found above.  Joining on both route_id AND scraped_at
+        # ensures we only aggregate within the most-recent batch, not all history.
+        # Using MIN(price) over that batch avoids duplicate route rows when multiple
+        # flights share the same scraped_at timestamp.
+        latest_price_subq = (
+            self.session.query(
+                PriceHistory.route_id,
+                func.min(PriceHistory.price).label("latest_price"),
+                latest_time_subq.c.latest_scraped_at,
+            )
+            .join(
+                latest_time_subq,
+                and_(
+                    PriceHistory.route_id == latest_time_subq.c.route_id,
+                    PriceHistory.scraped_at == latest_time_subq.c.latest_scraped_at,
+                ),
+            )
             .group_by(PriceHistory.route_id)
             .subquery()
         )
@@ -142,7 +216,7 @@ class RouteService:
             .subquery()
         )
 
-        # Main query joining route with latest price
+        # Main query: one row per route, no PriceHistory join needed
         results = (
             self.session.query(
                 Route.id,
@@ -153,20 +227,24 @@ class RouteService:
                 Route.scrape_interval,
                 Route.is_active,
                 Route.created_at,
-                PriceHistory.price.label("latest_price"),
+                Route.return_date,
+                Route.trip_type,
+                Route.is_international,
+                Route.dep_airport_code,
+                Route.arr_airport_code,
+                Route.dep_time_from,
+                Route.dep_time_to,
+                Route.arr_time_from,
+                Route.arr_time_to,
+                Route.last_notified_at,
+                Route.last_notified_price,
+                latest_price_subq.c.latest_price,
                 latest_price_subq.c.latest_scraped_at,
                 func.coalesce(price_count_subq.c.price_count, 0).label("price_count"),
             )
             .outerjoin(
                 latest_price_subq,
                 Route.id == latest_price_subq.c.route_id,
-            )
-            .outerjoin(
-                PriceHistory,
-                and_(
-                    Route.id == PriceHistory.route_id,
-                    PriceHistory.scraped_at == latest_price_subq.c.latest_scraped_at,
-                ),
             )
             .outerjoin(
                 price_count_subq,
@@ -192,6 +270,21 @@ class RouteService:
                     latest_price=row.latest_price,
                     latest_scraped_at=row.latest_scraped_at,
                     price_count=row.price_count or 0,
+                    return_date=row.return_date,
+                    trip_type=row.trip_type or "oneway",
+                    is_international=bool(row.is_international),
+                    dep_airport_code=row.dep_airport_code,
+                    arr_airport_code=row.arr_airport_code,
+                    dep_time_from=row.dep_time_from,
+                    dep_time_to=row.dep_time_to,
+                    arr_time_from=row.arr_time_from,
+                    arr_time_to=row.arr_time_to,
+                    last_notified_at=row.last_notified_at,
+                    last_notified_price=(
+                        Decimal(str(row.last_notified_price))
+                        if row.last_notified_price is not None
+                        else None
+                    ),
                 )
             )
 
@@ -301,6 +394,9 @@ class RouteService:
     ) -> List[FlightPrice]:
         """Get price history for a specific route.
 
+        For round-trip routes each returned FlightPrice contains both
+        ``flight_info`` (outbound leg) and ``return_flight_info`` (return leg).
+
         Args:
             route_id: The route ID.
             days: Number of days to look back (default 30).
@@ -309,12 +405,18 @@ class RouteService:
             List of FlightPrice objects with historical data.
         """
         from datetime import timedelta
+        from sqlalchemy.orm import aliased
+        from flightscanner.interfaces import FlightInfo, FlightDirection
 
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        # 使用 aliased 区分去程航班和回程航班两个 Flight 关联
+        ReturnFlight = aliased(Flight, name="return_flight")
 
         results = (
-            self.session.query(PriceHistory, Flight)
+            self.session.query(PriceHistory, Flight, ReturnFlight)
             .join(Flight, PriceHistory.flight_id == Flight.id)
+            .outerjoin(ReturnFlight, PriceHistory.return_flight_id == ReturnFlight.id)
             .filter(
                 and_(
                     PriceHistory.route_id == route_id,
@@ -325,10 +427,8 @@ class RouteService:
             .all()
         )
 
-        from flightscanner.interfaces import FlightInfo, FlightDirection
-
         flight_prices = []
-        for price_history, flight in results:
+        for price_history, flight, return_flight in results:
             flight_info = FlightInfo(
                 flight_no=flight.flight_no,
                 airline=flight.airline,
@@ -338,7 +438,29 @@ class RouteService:
                 arrival_time=flight.arrival_time,
                 departure_date=flight.departure_date,
                 direction=FlightDirection(flight.direction),
+                departure_airport=flight.departure_airport,
+                arrival_airport=flight.arrival_airport,
+                departure_airport_code=flight.departure_airport_code,
+                arrival_airport_code=flight.arrival_airport_code,
             )
+
+            # 往返程：组装回程航班信息
+            return_flight_info = None
+            if return_flight is not None:
+                return_flight_info = FlightInfo(
+                    flight_no=return_flight.flight_no,
+                    airline=return_flight.airline,
+                    departure_city=return_flight.departure_city,
+                    arrival_city=return_flight.arrival_city,
+                    departure_time=return_flight.departure_time,
+                    arrival_time=return_flight.arrival_time,
+                    departure_date=return_flight.departure_date,
+                    direction=FlightDirection(return_flight.direction),
+                    departure_airport=return_flight.departure_airport,
+                    arrival_airport=return_flight.arrival_airport,
+                    departure_airport_code=return_flight.departure_airport_code,
+                    arrival_airport_code=return_flight.arrival_airport_code,
+                )
 
             flight_price = FlightPrice(
                 flight_info=flight_info,
@@ -348,11 +470,57 @@ class RouteService:
                 available_seats=price_history.available_seats,
                 scraped_at=price_history.scraped_at,
                 source=price_history.source,
+                return_flight_info=return_flight_info,
             )
 
             flight_prices.append(flight_price)
 
         return flight_prices
+
+    def _find_or_create_flight(self, flight_info: "FlightInfo") -> Flight:
+        """查找或创建 Flight 记录（内部辅助方法）。
+
+        Args:
+            flight_info: 航班基本信息。
+
+        Returns:
+            对应的 Flight ORM 对象（已 flush 到 session）。
+        """
+        from flightscanner.interfaces import FlightInfo  # 避免循环导入
+
+        flight = (
+            self.session.query(Flight)
+            .filter(
+                and_(
+                    Flight.flight_no == flight_info.flight_no,
+                    Flight.departure_date == flight_info.departure_date,
+                    Flight.departure_city == flight_info.departure_city,
+                    Flight.arrival_city == flight_info.arrival_city,
+                    Flight.direction == flight_info.direction.value,
+                )
+            )
+            .first()
+        )
+
+        if not flight:
+            flight = Flight(
+                flight_no=flight_info.flight_no,
+                airline=flight_info.airline,
+                departure_city=flight_info.departure_city,
+                arrival_city=flight_info.arrival_city,
+                departure_time=flight_info.departure_time,
+                arrival_time=flight_info.arrival_time,
+                departure_date=flight_info.departure_date,
+                direction=flight_info.direction.value,
+                departure_airport=flight_info.departure_airport,
+                arrival_airport=flight_info.arrival_airport,
+                departure_airport_code=flight_info.departure_airport_code,
+                arrival_airport_code=flight_info.arrival_airport_code,
+            )
+            self.session.add(flight)
+            self.session.flush()
+
+        return flight
 
     def save_price_for_route(
         self,
@@ -361,8 +529,9 @@ class RouteService:
     ) -> int:
         """Save a price snapshot linked to a route.
 
-        This method creates or finds the Flight record and creates
-        a PriceHistory record linked to both the flight and route.
+        For round-trip combined records (``flight_price.return_flight_info``
+        is not None) both the outbound and return Flight records are created
+        and ``PriceHistory.return_flight_id`` is set.
 
         Args:
             route_id: The route ID to link the price to.
@@ -371,43 +540,19 @@ class RouteService:
         Returns:
             The ID of the created PriceHistory record.
         """
-        from flightscanner.repositories.sqlalchemy_repo import SQLAlchemyRepository
+        # ── 去程（或单程）航班 ────────────────────────────────────────────
+        flight = self._find_or_create_flight(flight_price.flight_info)
 
-        # Use the repository to save the flight and get the flight ID
-        repo = SQLAlchemyRepository(self.session)
+        # ── 往返程：回程航班 ──────────────────────────────────────────────
+        return_flight_id: Optional[int] = None
+        if flight_price.return_flight_info is not None:
+            return_flight = self._find_or_create_flight(flight_price.return_flight_info)
+            return_flight_id = return_flight.id
 
-        # Find or create flight record
-        flight = (
-            self.session.query(Flight)
-            .filter(
-                and_(
-                    Flight.flight_no == flight_price.flight_info.flight_no,
-                    Flight.departure_date == flight_price.flight_info.departure_date,
-                    Flight.departure_city == flight_price.flight_info.departure_city,
-                    Flight.arrival_city == flight_price.flight_info.arrival_city,
-                    Flight.direction == flight_price.flight_info.direction.value,
-                )
-            )
-            .first()
-        )
-
-        if not flight:
-            flight = Flight(
-                flight_no=flight_price.flight_info.flight_no,
-                airline=flight_price.flight_info.airline,
-                departure_city=flight_price.flight_info.departure_city,
-                arrival_city=flight_price.flight_info.arrival_city,
-                departure_time=flight_price.flight_info.departure_time,
-                arrival_time=flight_price.flight_info.arrival_time,
-                departure_date=flight_price.flight_info.departure_date,
-                direction=flight_price.flight_info.direction.value,
-            )
-            self.session.add(flight)
-            self.session.flush()
-
-        # Create price history with route_id
+        # ── 创建价格快照 ──────────────────────────────────────────────────
         price_history = PriceHistory(
             flight_id=flight.id,
+            return_flight_id=return_flight_id,
             route_id=route_id,
             price=flight_price.price,
             currency=flight_price.currency,
@@ -421,3 +566,25 @@ class RouteService:
         self.session.commit()
 
         return price_history.id
+
+    def update_notification_state(
+        self,
+        route_id: int,
+        notified_at: datetime,
+        price: Decimal,
+    ) -> None:
+        """Update the route's last notification timestamp and price.
+
+        Used by the anti-spam cooldown mechanism to track when and at what
+        price the last notification was sent.
+
+        Args:
+            route_id: The route ID to update.
+            notified_at: UTC timestamp of the notification.
+            price: Price at the time of notification.
+        """
+        route = self.session.query(Route).filter(Route.id == route_id).first()
+        if route:
+            route.last_notified_at = notified_at
+            route.last_notified_price = price
+            self.session.commit()

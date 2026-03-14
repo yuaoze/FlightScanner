@@ -1,0 +1,20 @@
+[
+  {
+    "name": "GUID",
+    "value": "在此填入 Cookie 的值",
+    "domain": ".ctrip.com",
+    "path": "/"
+  },
+  {
+    "name": "ibu_uid",
+    "value": "在此填入 Cookie 的值",
+    "domain": ".ctrip.com",
+    "path": "/"
+  },
+  {
+    "name": "_bfa",
+    "value": "在此填入 Cookie 的值",
+    "domain": ".ctrip.com",
+    "path": "/"
+  }
+]

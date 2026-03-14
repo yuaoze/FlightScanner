@@ -383,12 +383,12 @@ class TestRuleBasedAnalyzer:
         trend = analyzer.predict_trend(prices, base_date)
 
         # Manually set low confidence for testing
-        trend.confidence = 0.3
+        trend.confidence = 0.05
 
         current_price = Decimal("650.00")
         threshold = Decimal("700.00")
 
-        # Confidence is below 0.5
+        # Confidence is below 0.1
         assert analyzer.should_alert(current_price, trend, threshold) is False
 
     def test_predict_trend_returns_all_fields(self, analyzer: RuleBasedAnalyzer, sample_flight_prices):
