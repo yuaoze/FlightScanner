@@ -33,20 +33,39 @@ def _render_source_price_summary(
     if not price_history:
         return
 
-    # Step 1: find the latest scraped_at per source platform
-    latest_time: Dict[str, object] = {}
+    # Step 1: find the latest batch_id per source platform
+    # 使用 batch_id 分组（而非精确时间戳），确保同一次采集的所有记录都被纳入比较
+    latest_batch: Dict[str, str] = {}
     for fp in price_history:
         src = fp.source
-        if src not in latest_time or fp.scraped_at > latest_time[src]:
-            latest_time[src] = fp.scraped_at
+        bid = fp.batch_id
+        if bid is None:
+            continue
+        if src not in latest_batch or bid > latest_batch[src]:
+            latest_batch[src] = bid
 
-    # Step 2: among records at that latest timestamp, keep the minimum price
+    # Step 2: among records in that latest batch, keep the minimum price
     latest: Dict[str, FlightPrice] = {}
     for fp in price_history:
         src = fp.source
-        if fp.scraped_at == latest_time.get(src):
-            if src not in latest or fp.price < latest[src].price:
-                latest[src] = fp
+        bid = fp.batch_id
+        if bid is None or bid != latest_batch.get(src):
+            continue
+        if src not in latest or fp.price < latest[src].price:
+            latest[src] = fp
+
+    # Fallback：若所有记录都没有 batch_id（旧数据），退回时间戳匹配
+    if not latest:
+        latest_time: Dict[str, object] = {}
+        for fp in price_history:
+            src = fp.source
+            if src not in latest_time or fp.scraped_at > latest_time[src]:
+                latest_time[src] = fp.scraped_at
+        for fp in price_history:
+            src = fp.source
+            if fp.scraped_at == latest_time.get(src):
+                if src not in latest or fp.price < latest[src].price:
+                    latest[src] = fp
 
     if not latest:
         return
@@ -276,6 +295,10 @@ def _render_route_card(
                 )
                 if st.button("保存", key=f"save_interval_{route.id}"):
                     route_service.update_route_interval(route.id, new_interval)
+                    # 重新调度所有路线，使新的采集间隔生效
+                    from ui.app import _get_monitor
+                    _get_monitor().reschedule_all_routes()
+                    st.success(f"采集间隔已更新为 {new_interval} 小时")
                     st.rerun()
 
         # Metadata

@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.0.3] - 2026-03-17
+
+### Fixed
+
+- **最低价计算错误（核心 bug）**：同一次采集会话中，多条记录因 Playwright 异步写入而产生微秒级时间差。旧逻辑以精确 `scraped_at` 时间戳分组，导致只取最后几条记录的最低价（如 ¥1563），而非整批次的最低价（如 ¥303）
+  - 新增 `PriceHistory.batch_id` 列（`VARCHAR(100) nullable`）及复合索引 `(route_id, batch_id)` / `(source, batch_id)`
+  - `FlightPrice` dataclass 新增 `batch_id: Optional[str]` 字段
+  - `scrape_route()` 在存库前为本次采集所有记录统一生成并写入 `batch_id`（格式：`route_{id}_{timestamp}_{hash8}`）
+  - `RouteService.get_all_routes()` 子查询由 `MAX(scraped_at)` 精确时间匹配改为 `MAX(batch_id)` 批次匹配，确保取整批最低价
+  - `save_price_for_route()` 写入 `batch_id`；`get_route_price_history()` 返回含 `batch_id` 的 FlightPrice
+  - `_apply_migrations()` 补充 `batch_id` 迁移语句，兼容已存在的旧数据库
+
+- **平台最新价展示错误**：`_render_source_price_summary`（overview.py）同样使用精确时间戳匹配，与上述 bug 同根同源；改为按 `batch_id` 分组取最低价，保留旧数据无 `batch_id` 时的时间戳兜底逻辑
+
+- **SQLite 并发写入异常**：APScheduler 采集线程与 Streamlit 主线程共享同一 `engine`，`check_same_thread` 默认为 `True` 会触发跨线程写入报错；`init_db()` 新增 `check_same_thread=False` 及 WAL 日志模式（`PRAGMA journal_mode=WAL`），支持读写并发
+
+### Removed
+
+- 趋势图"最新价蓝圈"标注（`latest_markers` 图层）：该标注基于有缺陷的时间戳匹配逻辑生成，且视觉上与折线点重叠造成混淆，一并移除
+- `_agg_by_session()` 的 `show_latest_only` 参数及相关代码路径（已无调用方）
+
 ## [0.2.2] - 2026-03-11
 
 ### Added

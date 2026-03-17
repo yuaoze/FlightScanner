@@ -172,6 +172,29 @@ class PriceMonitorScheduler:
 
             logger.info("路线 %s 共采集到 %d 条价格（合并去重后）", route.id, len(flight_prices))
 
+            # ── 生成本次采集的批次 ID ──────────────────────────────────────
+            # 格式: "route_{route_id}_{timestamp}_{hash}"
+            # 用于标记这一次采集的所有记录，确保同一批次的数据被统一处理
+            import hashlib
+            from datetime import datetime
+            from decimal import Decimal
+
+            batch_timestamp = datetime.now(timezone.utc).isoformat()
+            # 计算哈希值：使用路由 ID、来源平台、采集时间戳
+            hash_input = f"{route.id}_{''.join(fp.source for fp in flight_prices)}_{batch_timestamp}"
+            batch_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+            batch_id = f"route_{route.id}_{batch_timestamp}_{batch_hash}"
+
+            # 为所有 FlightPrice 对象标记 batch_id
+            for fp in flight_prices:
+                fp.batch_id = batch_id
+
+            # ── 往返程配对：将去程/回程单独记录合并为含往返总价的组合记录 ──────
+            # 对已含 return_flight_info 的记录（如携程、Qunar 国际往返）直接透传；
+            # 对 Qunar 国内往返 DOM 解析返回的 DEPARTURE/RETURN 分离记录则进行配对。
+            if trip_type == "roundtrip":
+                flight_prices = self._combine_roundtrip_prices(flight_prices)
+
             # ── 按路线配置的机场/时间段过滤 ─────────────────────────────
             flight_prices = self._apply_route_filters(route, flight_prices)
             if not flight_prices:
@@ -188,7 +211,7 @@ class PriceMonitorScheduler:
                 route_service = RouteService(session)
                 for fp in flight_prices:
                     route_service.save_price_for_route(route.id, fp)
-                logger.info("路线 %s 已保存 %d 条价格记录", route.id, len(flight_prices))
+                logger.info("路线 %s 已保存 %d 条价格记录（批次 ID: %s）", route.id, len(flight_prices), batch_id)
 
                 # ── 价格告警判断 ───────────────────────────────────────────
                 # 1. 获取30天历史并计算统计数据

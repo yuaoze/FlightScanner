@@ -506,7 +506,6 @@ class QunarScraper(FlightScraper):
                 params.departure_date, params.return_date,
             )
             return await self._search_inter_roundtrip(params)
-        # ──────────────────────────────────────────────────────────────────
 
         page: Optional[Page] = None
         captured_api_responses: List[Dict] = []
@@ -739,10 +738,13 @@ class QunarScraper(FlightScraper):
     def _build_search_url(self, params: SearchParams) -> str:
         """Build Qunar search URL from parameters.
 
-        Domestic routes use the searchDepartureAirport / searchArrivalAirport /
-        searchDepartureTime parameter format.  International routes require the
-        fromCity / toCity / fromDate / isInter=true format; the round-trip
-        endpoint also differs (interroundtrip_compare.htm).
+        Qunar 页面区分：
+        - oneway_list.htm / roundtrip_list_new.htm：两端都在中国
+        - oneway_list_inter.htm / roundtrip_list_inter.htm：至少一端不在中国
+                (包含真正的国际航班、非中国→非中国 等)
+
+        所有情况都使用 searchDepartureAirport / searchArrivalAirport 参数格式，
+        只是根据城市类型选择不同的页面。
 
         Args:
             params: Search parameters.
@@ -758,68 +760,47 @@ class QunarScraper(FlightScraper):
 
         intl = is_international_route(params.departure_city, params.arrival_city)
 
-        if intl:
-            # ── 国际航班：使用 fromCity/fromDate/isInter=true 格式 ──────────
-            if params.return_date:
-                to_date = params.return_date.strftime("%Y-%m-%d")
-                base_url = "https://flight.qunar.com/site/interroundtrip_compare.htm"
-                url = (
-                    f"{base_url}?"
-                    f"fromCity={from_city_encoded}&"
-                    f"toCity={to_city_encoded}&"
-                    f"fromDate={from_date}&"
-                    f"toDate={to_date}&"
-                    f"fromCode={from_code}&"
-                    f"toCode={to_code}&"
-                    f"from=flight_dom_search&"
-                    f"lowestPrice=null&"
-                    f"isInter=true"
-                )
-            else:
-                base_url = "https://flight.qunar.com/site/oneway_list.htm"
-                url = (
-                    f"{base_url}?"
-                    f"fromCity={from_city_encoded}&"
-                    f"toCity={to_city_encoded}&"
-                    f"fromDate={from_date}&"
-                    f"fromCode={from_code}&"
-                    f"toCode={to_code}&"
-                    f"from=flight_dom_search&"
-                    f"lowestPrice=null&"
-                    f"isInter=true"
-                )
+        # ── 根据路由类型选择页面：纯国内 vs 涉及非中国城市 ───────────────
+        if params.return_date:
+            to_date = params.return_date.strftime("%Y-%m-%d")
+            # 往返：国内用 roundtrip_list_new.htm，跨国用 roundtrip_list_inter.htm
+            base_url = (
+                "https://flight.qunar.com/site/roundtrip_list_inter.htm"
+                if intl
+                else "https://flight.qunar.com/site/roundtrip_list_new.htm"
+            )
+            url = (
+                f"{base_url}?"
+                f"searchDepartureAirport={from_city_encoded}&"
+                f"searchArrivalAirport={to_city_encoded}&"
+                f"searchDepartureTime={from_date}&"
+                f"searchReturnTime={to_date}&"
+                f"nextNDays=0&"
+                f"startSearch=true&"
+                f"fromCode={from_code}&"
+                f"toCode={to_code}&"
+                f"from=flight_dom_search&"
+                f"lowestPrice=null"
+            )
         else:
-            # ── 国内航班：沿用原有 searchDepartureAirport 格式 ───────────────
-            if params.return_date:
-                to_date = params.return_date.strftime("%Y-%m-%d")
-                base_url = "https://flight.qunar.com/site/roundtrip_list_new.htm"
-                url = (
-                    f"{base_url}?"
-                    f"searchDepartureAirport={from_city_encoded}&"
-                    f"searchArrivalAirport={to_city_encoded}&"
-                    f"searchDepartureTime={from_date}&"
-                    f"searchReturnTime={to_date}&"
-                    f"nextNDays=0&"
-                    f"startSearch=true&"
-                    f"fromCode={from_code}&"
-                    f"toCode={to_code}&"
-                    f"from=flight_dom_search&"
-                    f"lowestPrice=null"
-                )
-            else:
-                base_url = "https://flight.qunar.com/site/oneway_list.htm"
-                url = (
-                    f"{base_url}?"
-                    f"searchDepartureAirport={from_city_encoded}&"
-                    f"searchArrivalAirport={to_city_encoded}&"
-                    f"searchDepartureTime={from_date}&"
-                    f"nextNDays=0&"
-                    f"startSearch=true&"
-                    f"fromCode={from_code}&"
-                    f"toCode={to_code}&"
-                    f"from=flight_dom_search&"
-                    f"lowestPrice=null"
-                )
+            # 单程：国内用 oneway_list.htm，跨国用 oneway_list_inter.htm
+            base_url = (
+                "https://flight.qunar.com/site/oneway_list_inter.htm"
+                if intl
+                else "https://flight.qunar.com/site/oneway_list.htm"
+            )
+            url = (
+                f"{base_url}?"
+                f"searchDepartureAirport={from_city_encoded}&"
+                f"searchArrivalAirport={to_city_encoded}&"
+                f"searchDepartureTime={from_date}&"
+                f"nextNDays=0&"
+                f"startSearch=true&"
+                f"fromCode={from_code}&"
+                f"toCode={to_code}&"
+                f"from=flight_dom_search&"
+                f"lowestPrice=null"
+            )
 
         return url
 

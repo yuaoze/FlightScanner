@@ -610,13 +610,26 @@ def get_airport_list(city: str) -> List[Dict[str, str]]:
 
 
 def is_international_route(origin: str, destination: str) -> bool:
-    """若出发地或目的地不在国内城市集合中，则视为国际航班。
+    """判断是否需要使用 Qunar 国际/跨国搜索页面。
+
+    Qunar 页面区分：
+    - oneway_list.htm：两端都是中国城市
+    - oneway_list_inter.htm：至少一端不是中国城市
+               (包含真正的国际航班、非中国→非中国、中国→非中国 等)
+
+    注：虽然 MNL→CEB（菲律宾→菲律宾）不是"真正的国际航班"，
+    但 Qunar 仍要求使用 oneway_list_inter.htm 处理任何涉及非中国城市的路由。
 
     Args:
         origin: 出发城市中文名。
         destination: 目的城市中文名。
 
     Returns:
-        True 表示国际航班，False 表示国内航班。
+        True 表示需要使用 _inter 页面，False 表示使用普通页面。
     """
-    return origin not in _DOMESTIC_CITIES or destination not in _DOMESTIC_CITIES
+    origin_domestic = origin in _DOMESTIC_CITIES
+    dest_domestic = destination in _DOMESTIC_CITIES
+
+    # 只有两端都在中国时，才使用普通页面
+    # 任何包含非中国城市的路由，都需要用 _inter 页面
+    return not (origin_domestic and dest_domestic)

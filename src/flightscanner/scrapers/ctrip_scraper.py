@@ -599,10 +599,29 @@ class CtripScraper(FlightScraper):
             arrival_airport_code=arr_airport_code or None,
         )
 
+        # ── 往返搜索：构建标记信息 ──────────────────────────────────
+        # 携程往返搜索时 API 只返回去程航班信息，回程信息被合并到 adultPrice 中。
+        # 无法从 API 提取真实的回程航班，但可以创建虚拟的占位符来标记这是已合并的往返记录，
+        # 防止下游 _combine_roundtrip_prices() 误将其当作单程去程记录处理。
+        return_flight_info: Optional[FlightInfo] = None
+        if params.return_date is not None:
+            # 创建虚拟的回程航班占位符
+            # 这是 Ctrip API 的局限：返回合计价但不返回回程航班细节
+            return_flight_info = FlightInfo(
+                flight_no="VIRTUAL_RETURN",  # 虚拟占位
+                airline="",  # 不可知
+                departure_city=params.arrival_city,
+                arrival_city=params.departure_city,
+                departure_time="00:00",
+                arrival_time="00:00",
+                departure_date=params.return_date,
+                direction=FlightDirection.RETURN,
+            )
+
         # ── 提取价格档位 ─────────────────────────────────────────────────────
-        # 往返搜索时（params.return_date 非空），携程在去程列表中直接展示往返合计
-        # 价格，无需单独采集回程数据。此时优先读取往返合计专用字段，再回退到通用
-        # 价格字段（往返搜索语境下 adultPrice 通常也是合计价）。
+        # 往返搜索时（params.return_date 非空），携程在搜索结果中直接展示往返合计
+        # 价格（adultPrice = 两程合计）。设置 return_flight_info 以标记此为已合并
+        # 的往返记录，防止 _combine_roundtrip_prices() 将其误当单程处理。
         price_list = (
             itinerary.get("priceList")
             or itinerary.get("prices")
@@ -636,6 +655,13 @@ class CtripScraper(FlightScraper):
                     )
                 if not raw_price:
                     continue
+
+                # ── 座位可用性检查 ──────────────────────────────────────────────
+                # 跳过无座位信息或座位数为0的记录（已售罄或过期数据）
+                seats_left = price_entry.get("seatsLeft")
+                if seats_left is None or seats_left == 0:
+                    continue
+
                 price = Decimal(str(raw_price))
                 cabin_code = str(
                     price_entry.get("cabinType")
@@ -649,11 +675,10 @@ class CtripScraper(FlightScraper):
                     price=price,
                     currency="CNY",
                     seat_class=seat_class,
-                    available_seats=price_entry.get("seatsLeft"),
+                    available_seats=seats_left,
                     scraped_at=datetime.now(timezone.utc),
                     source="ctrip",
-                    # 往返搜索时不填 return_flight_info：携程仅记录往返合计价，
-                    # 无需存储完整的回程航班数据。
+                    return_flight_info=return_flight_info,
                 ))
             except Exception as exc:
                 logger.debug("解析价格档位失败：%s", exc)

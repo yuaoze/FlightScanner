@@ -201,6 +201,9 @@ class PriceHistory(Base):
     available_seats = Column(Integer, nullable=True)
     source = Column(String(50), nullable=False, index=True)
     scraped_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+    # 采集批次 ID：同一次采集批次的所有记录使用相同的 batch_id
+    # 用于替代按 scraped_at 精确匹配，解决同秒内多条记录的问题
+    batch_id = Column(String(100), nullable=True, index=True)  # 格式: "source_date_timestamp_hash"
 
     # Relationships
     flight = relationship("Flight", foreign_keys=[flight_id], back_populates="price_histories")
@@ -223,6 +226,17 @@ class PriceHistory(Base):
             "ix_price_history_route_scraped",
             "route_id",
             "scraped_at",
+        ),
+        # 基于批次 ID 的索引（新增）
+        Index(
+            "ix_price_history_route_batch",
+            "route_id",
+            "batch_id",
+        ),
+        Index(
+            "ix_price_history_source_batch",
+            "source",
+            "batch_id",
         ),
     )
 
@@ -262,6 +276,8 @@ def _apply_migrations(engine) -> None:
         "ALTER TABLE routes ADD COLUMN last_notified_at DATETIME",
         "ALTER TABLE routes ADD COLUMN last_notified_price NUMERIC",
         "ALTER TABLE routes ADD COLUMN notify_threshold_pct NUMERIC",
+        # batch_id：用于标记同一次采集会话的所有记录（解决同秒多条记录取最低价错误问题）
+        "ALTER TABLE price_history ADD COLUMN batch_id TEXT",
     ]
     with engine.connect() as conn:
         for stmt in stmts:
@@ -281,7 +297,17 @@ def init_db(db_url: str = "sqlite:///flightscanner.db"):
     Returns:
         Tuple of (engine, SessionLocal) for database operations.
     """
-    engine = create_engine(db_url, echo=False, pool_pre_ping=True)
+    # SQLite 需要 check_same_thread=False，因为 APScheduler 采集线程和 Streamlit
+    # 主线程会共享同一个 engine；同时开启 WAL 模式提升并发读写性能
+    connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
+    engine = create_engine(db_url, echo=False, pool_pre_ping=True, connect_args=connect_args)
+
+    # 对 SQLite 开启 WAL 模式（Write-Ahead Logging），允许读写并发
+    if db_url.startswith("sqlite"):
+        with engine.connect() as conn:
+            conn.execute(text("PRAGMA journal_mode=WAL"))
+            conn.commit()
+
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine)
     _apply_migrations(engine)

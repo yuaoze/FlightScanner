@@ -108,6 +108,7 @@ def _color_enc(df_agg: pd.DataFrame) -> alt.Color:
 
 
 def _target_rule(target_price: Decimal) -> alt.Chart:
+    """Draw a horizontal dashed red line representing the target price."""
     return (
         alt.Chart(pd.DataFrame({"t": [float(target_price)]}))
         .mark_rule(color="red", strokeDash=[5, 5], opacity=0.7)
@@ -164,7 +165,7 @@ def _render_simple_view(df: pd.DataFrame, target_price: Decimal, route_name: str
 
     line = (
         alt.Chart(df_agg)
-        .mark_line(point=True)
+        .mark_line(point=True, opacity=0.7)
         .encode(
             x=alt.X("date:T", title="采集时间"),
             y=alt.Y("min_price:Q", title="最低价 (¥)", scale=alt.Scale(zero=False)),
@@ -188,11 +189,10 @@ def _render_simple_view(df: pd.DataFrame, target_price: Decimal, route_name: str
 
 def _render_simple_stats(df_agg: pd.DataFrame, target_price: Decimal) -> None:
     st.markdown("#### 价格统计")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
 
     all_min = df_agg["min_price"].min()
     all_min_date = df_agg.loc[df_agg["min_price"].idxmin(), "date"]
-    latest_row = df_agg.loc[df_agg["date"].idxmax()]
     diff = all_min - float(target_price)
 
     with col1:
@@ -204,8 +204,6 @@ def _render_simple_stats(df_agg: pd.DataFrame, target_price: Decimal) -> None:
             delta=all_min_date.strftime("%m/%d %H:%M"),
         )
     with col3:
-        st.metric("最近一次最低价", f"¥{latest_row['min_price']:.0f}")
-    with col4:
         st.metric(
             "最低价 vs 目标",
             f"¥{all_min:.0f}",

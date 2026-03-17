@@ -256,6 +256,111 @@ class TestCtripScraper:
                 with pytest.raises(ParseError):
                     await scraper.search_flights(search_params)
 
+    def test_parse_itinerary_roundtrip_sets_return_flight_info(self, scraper: CtripScraper):
+        """往返搜索时 _parse_itinerary 应创建虚拟占位符标记 return_flight_info，
+        表示此记录已包含往返合计价格。Ctrip API 往返搜索时只返回去程 segment，
+        回程信息被合并到 adultPrice 中，无法单独提取。
+        """
+        from flightscanner.interfaces import FlightDirection
+
+        itinerary = {
+            "flightSegments": [
+                {
+                    "segmentNo": 1,
+                    "airlineName": "深圳航空",
+                    "flightList": [{
+                        "flightNo": "ZH4835",
+                        "marketAirlineName": "深圳航空",
+                        "departureAirportCode": "PVG",
+                        "arrivalAirportCode": "CTU",
+                        "departureDateTime": "2026-04-01 10:00:00",
+                        "arrivalDateTime": "2026-04-01 13:00:00",
+                    }],
+                },
+            ],
+            "priceList": [{"adultPrice": 2300, "cabin": "Y", "seatsLeft": 5}],
+        }
+        params = SearchParams(
+            departure_city="上海",
+            arrival_city="成都",
+            departure_date=date.today() + timedelta(days=7),
+            return_date=date.today() + timedelta(days=14),
+        )
+
+        result = scraper._parse_itinerary(itinerary, params)
+
+        assert len(result) == 1
+        fp = result[0]
+        assert fp.price == 2300
+        assert fp.flight_info.flight_no == "ZH4835"
+        assert fp.flight_info.direction == FlightDirection.DEPARTURE
+        # 虚拟占位符标记此为已合并的往返记录
+        assert fp.return_flight_info is not None, "return_flight_info 应为虚拟占位符"
+        assert fp.return_flight_info.flight_no == "VIRTUAL_RETURN"
+        assert fp.return_flight_info.direction == FlightDirection.RETURN
+
+    def test_parse_itinerary_oneway_no_return_flight_info(self, scraper: CtripScraper):
+        """单程搜索时 return_flight_info 应为 None。"""
+        itinerary = {
+            "flightSegments": [{
+                "segmentNo": 1,
+                "airlineName": "深圳航空",
+                "flightList": [{
+                    "flightNo": "ZH4835",
+                    "departureAirportCode": "PVG",
+                    "arrivalAirportCode": "CTU",
+                    "departureDateTime": "2026-04-01 10:00:00",
+                    "arrivalDateTime": "2026-04-01 13:00:00",
+                }],
+            }],
+            "priceList": [{"adultPrice": 1150, "cabin": "Y", "seatsLeft": 5}],
+        }
+        params = SearchParams(
+            departure_city="上海",
+            arrival_city="成都",
+            departure_date=date.today() + timedelta(days=7),
+            return_date=None,
+        )
+
+        result = scraper._parse_itinerary(itinerary, params)
+
+        assert len(result) == 1
+        assert result[0].return_flight_info is None
+
+    def test_parse_itinerary_filters_no_seats(self, scraper: CtripScraper):
+        """无座位信息的记录应被过滤掉（售罄或过期数据）。"""
+        itinerary = {
+            "flightSegments": [{
+                "segmentNo": 1,
+                "airlineName": "深圳航空",
+                "flightList": [{
+                    "flightNo": "ZH4835",
+                    "departureAirportCode": "PVG",
+                    "arrivalAirportCode": "CTU",
+                    "departureDateTime": "2026-04-01 10:00:00",
+                    "arrivalDateTime": "2026-04-01 13:00:00",
+                }],
+            }],
+            "priceList": [
+                {"adultPrice": 1150, "cabin": "Y", "seatsLeft": None},  # 无座位，应过滤
+                {"adultPrice": 1150, "cabin": "Y", "seatsLeft": 0},      # 无座位，应过滤
+                {"adultPrice": 1500, "cabin": "Y", "seatsLeft": 5},      # 有座位，应保留
+            ],
+        }
+        params = SearchParams(
+            departure_city="上海",
+            arrival_city="成都",
+            departure_date=date.today() + timedelta(days=7),
+            return_date=None,
+        )
+
+        result = scraper._parse_itinerary(itinerary, params)
+
+        # 仅保留有座位的记录
+        assert len(result) == 1
+        assert result[0].price == 1500
+        assert result[0].available_seats == 5
+
 
 @pytest.mark.asyncio
 async def test_scraper_integration_mock():

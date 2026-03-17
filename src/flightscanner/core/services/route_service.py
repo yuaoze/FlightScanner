@@ -172,7 +172,7 @@ class RouteService:
             List of RouteWithLatestPrice objects containing route data
             and aggregated price information.
         """
-        # Subquery 1: per-route latest scraped_at.
+        # Subquery 1: per-route latest scraped_at (for display)
         latest_time_subq = (
             self.session.query(
                 PriceHistory.route_id,
@@ -183,25 +183,58 @@ class RouteService:
             .subquery()
         )
 
-        # Subquery 2: minimum price among records whose scraped_at equals the
-        # latest scraped_at found above.  Joining on both route_id AND scraped_at
-        # ensures we only aggregate within the most-recent batch, not all history.
-        # Using MIN(price) over that batch avoids duplicate route rows when multiple
-        # flights share the same scraped_at timestamp.
-        latest_price_subq = (
+        # Subquery 2: latest batch_id per (route_id, source) pair
+        # Uses batch_id to group all records from a single scrape session,
+        # avoiding the issue where multiple records at the same second would
+        # have the same scraped_at timestamp but different prices
+        latest_batch_per_source_subq = (
             self.session.query(
                 PriceHistory.route_id,
-                func.min(PriceHistory.price).label("latest_price"),
+                PriceHistory.source,
+                func.max(PriceHistory.batch_id).label("latest_batch_id"),
+            )
+            .filter(
+                and_(
+                    PriceHistory.route_id.isnot(None),
+                    PriceHistory.batch_id.isnot(None),
+                )
+            )
+            .group_by(PriceHistory.route_id, PriceHistory.source)
+            .subquery()
+        )
+
+        # Subquery 3: minimum price per source within their latest batch
+        # This ensures we get the minimum price from all records in the latest
+        # collection session for each platform, not just records at exact same timestamp
+        min_price_per_source_subq = (
+            self.session.query(
+                PriceHistory.route_id,
+                func.min(PriceHistory.price).label("source_min_price"),
+            )
+            .join(
+                latest_batch_per_source_subq,
+                and_(
+                    PriceHistory.route_id == latest_batch_per_source_subq.c.route_id,
+                    PriceHistory.source == latest_batch_per_source_subq.c.source,
+                    PriceHistory.batch_id == latest_batch_per_source_subq.c.latest_batch_id,
+                ),
+            )
+            .group_by(PriceHistory.route_id, PriceHistory.source)
+            .subquery()
+        )
+
+        # Subquery 4: overall minimum across all sources (各平台最新采集的最低价的最小值)
+        latest_price_subq = (
+            self.session.query(
+                min_price_per_source_subq.c.route_id,
+                func.min(min_price_per_source_subq.c.source_min_price).label("latest_price"),
                 latest_time_subq.c.latest_scraped_at,
             )
             .join(
                 latest_time_subq,
-                and_(
-                    PriceHistory.route_id == latest_time_subq.c.route_id,
-                    PriceHistory.scraped_at == latest_time_subq.c.latest_scraped_at,
-                ),
+                min_price_per_source_subq.c.route_id == latest_time_subq.c.route_id,
             )
-            .group_by(PriceHistory.route_id)
+            .group_by(min_price_per_source_subq.c.route_id)
             .subquery()
         )
 
@@ -471,6 +504,7 @@ class RouteService:
                 scraped_at=price_history.scraped_at,
                 source=price_history.source,
                 return_flight_info=return_flight_info,
+                batch_id=price_history.batch_id,
             )
 
             flight_prices.append(flight_price)
@@ -560,6 +594,7 @@ class RouteService:
             available_seats=flight_price.available_seats,
             source=flight_price.source,
             scraped_at=flight_price.scraped_at,
+            batch_id=flight_price.batch_id,
         )
 
         self.session.add(price_history)

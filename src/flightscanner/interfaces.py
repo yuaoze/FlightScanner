@@ -67,6 +67,7 @@ class FlightPrice:
         scraped_at: Timestamp when this price was scraped.
         source: Data source platform (e.g., "ctrip").
         return_flight_info: Return-leg flight info (round-trip only, else None).
+        batch_id: Batch ID for grouping records from a single scrape session.
     """
     flight_info: FlightInfo
     price: Decimal
@@ -76,6 +77,7 @@ class FlightPrice:
     scraped_at: datetime
     source: str
     return_flight_info: Optional[FlightInfo] = None  # 往返程回程航班信息
+    batch_id: Optional[str] = None  # 采集批次 ID（用于标记同一次采集）
 
 
 @dataclass
