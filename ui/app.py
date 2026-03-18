@@ -18,6 +18,7 @@ from flightscanner.utils.city_codes import (
 )
 from ui.utils.db import get_session, get_session_local
 from ui.components.overview import render_overview_cards, render_route_list
+from ui.components.cookie_manager import render_cookie_manager_dialog
 
 
 # ── Background scheduler singleton ────────────────────────────────────────────
@@ -572,10 +573,13 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
-    _, hd_btn = st.columns([8, 2])
-    with hd_btn:
+    _, hd_btn_add, hd_btn_cookie = st.columns([7, 2, 1])
+    with hd_btn_add:
         if st.button("＋ 添加监控", type="primary", use_container_width=True):
             _show_add_route_dialog(get_session_local())
+    with hd_btn_cookie:
+        if st.button("🔑", help="Cookie 管理", use_container_width=True):
+            render_cookie_manager_dialog()
 
     # ── Flash message from previous scrape ─────────────────────────────
     if "_flash" in st.session_state:
