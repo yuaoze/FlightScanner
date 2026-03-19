@@ -37,52 +37,6 @@ class LoginRequiredError(ScraperError):
     pass
 
 
-# Mapping from Chinese city names to IATA airport codes
-# Used to build valid Qunar search URLs
-CITY_AIRPORT_CODES: Dict[str, str] = {
-    "北京": "BJS",
-    "上海": "SHA",
-    "广州": "CAN",
-    "深圳": "SZX",
-    "成都": "CTU",
-    "重庆": "CKG",
-    "武汉": "WUH",
-    "西安": "XIY",
-    "杭州": "HGH",
-    "南京": "NKG",
-    "厦门": "XMN",
-    "昆明": "KMG",
-    "三亚": "SYX",
-    "青岛": "TAO",
-    "大连": "DLC",
-    "哈尔滨": "HRB",
-    "沈阳": "SHE",
-    "长沙": "CSX",
-    "郑州": "CGO",
-    "天津": "TSN",
-    "合肥": "HFE",
-    "贵阳": "KWE",
-    "南宁": "NNG",
-    "长春": "CGQ",
-    "太原": "TYN",
-    "石家庄": "SJW",
-    "福州": "FOC",
-    "济南": "TNA",
-    "南昌": "KHN",
-    "海口": "HAK",
-    "兰州": "LHW",
-    "西宁": "XNN",
-    "乌鲁木齐": "URC",
-    "呼和浩特": "HET",
-    "银川": "INC",
-    "珠海": "ZUH",
-    "温州": "WNZ",
-    "宁波": "NGB",
-    "烟台": "YNT",
-    "桂林": "KWL",
-}
-
-
 class QunarScraper(FlightScraper):
     """Qunar flight data scraper using Playwright.
 
@@ -505,7 +459,17 @@ class QunarScraper(FlightScraper):
                 params.departure_city, params.arrival_city,
                 params.departure_date, params.return_date,
             )
-            return await self._search_inter_roundtrip(params)
+            results = await self._search_inter_roundtrip(params)
+            if results:
+                return results
+            # interroundtrip_compare.htm 未返回 flightPrices 数据，
+            # 降级为分别搜索去程和回程单程，由 _combine_roundtrip_prices 配对。
+            logger.info(
+                "[往返] interroundtrip_compare 无数据，降级为分程搜索: %s→%s / %s→%s",
+                params.departure_city, params.arrival_city,
+                params.arrival_city, params.departure_city,
+            )
+            return await self._search_inter_roundtrip_fallback(params)
 
         page: Optional[Page] = None
         captured_api_responses: List[Dict] = []
@@ -724,7 +688,7 @@ class QunarScraper(FlightScraper):
                 await page.close()
 
     def _get_airport_code(self, city: str) -> str:
-        """Get IATA airport code for a Chinese city name.
+        """Get IATA city-level code for a Chinese city name.
 
         Args:
             city: Chinese city name.
@@ -732,8 +696,8 @@ class QunarScraper(FlightScraper):
         Returns:
             IATA code if found, otherwise the city name itself.
         """
-        # 优先使用去哪儿专用映射，不存在时回退到共享城市代码表
-        return CITY_AIRPORT_CODES.get(city) or get_city_code(city) or city
+        # 使用共享城市代码表（城市级代码，不绑定特定机场）
+        return get_city_code(city) or city
 
     def _build_search_url(self, params: SearchParams) -> str:
         """Build Qunar search URL from parameters.
@@ -803,6 +767,43 @@ class QunarScraper(FlightScraper):
             )
 
         return url
+
+    def _build_interroundtrip_compare_url(self, params: SearchParams) -> str:
+        """构建 interroundtrip_compare.htm 国际往返比价页面 URL。
+
+        该页面使用 fromCity/toCity/fromDate/toDate 参数格式，并调用与
+        ``roundtrip_list_inter.htm`` 不同的后端 API，可覆盖东南亚等
+        ``wwwsearch`` 接口不返回数据的航线。
+
+        Args:
+            params: 搜索参数，必须包含 ``return_date``。
+
+        Returns:
+            interroundtrip_compare.htm 完整 URL。
+        """
+        from_city_encoded = quote(params.departure_city)
+        to_city_encoded = quote(params.arrival_city)
+        from_code = self._get_airport_code(params.departure_city)
+        to_code = self._get_airport_code(params.arrival_city)
+        from_date = params.departure_date.strftime("%Y-%m-%d")
+        to_date = params.return_date.strftime("%Y-%m-%d")  # type: ignore[union-attr]
+        return (
+            f"https://flight.qunar.com/site/interroundtrip_compare.htm?"
+            f"fromCity={from_city_encoded}&"
+            f"toCity={to_city_encoded}&"
+            f"fromDate={from_date}&"
+            f"toDate={to_date}&"
+            f"fromCode={from_code}&"
+            f"toCode={to_code}&"
+            f"from=flight_dom_search&"
+            f"lowestPrice=null&"
+            f"isInter=true&"
+            f"favoriteKey=&"
+            f"showTotalPr=null&"
+            f"adultNum=1&"
+            f"childNum=0&"
+            f"cabinClass="
+        )
 
     def _build_mobile_search_url(self, params: SearchParams) -> str:
         """构建移动端去哪儿机票搜索 URL。
@@ -1637,11 +1638,51 @@ class QunarScraper(FlightScraper):
         logger.info("[往返] 解析得到 %d 条往返组合价格（共 %d 条原始）", len(prices), len(fps))
         return prices
 
-    async def _search_inter_roundtrip(self, params: SearchParams) -> List[FlightPrice]:
-        """通过 interroundtrip_compare 页面采集国际往返航班价格。
+    async def _click_price_sort(self, page: Page) -> bool:
+        """尝试点击价格升序（低价优先）排序按钮。
 
-        拦截 ``touch/api/inter/wwwsearch`` 接口响应，轮询直到 flightPrices
-        非空，解析为含 return_flight_info 和往返总价的 FlightPrice 列表。
+        按优先级依次尝试常见选择器，任一成功即返回 True；
+        若所有选择器均未命中，记录警告并返回 False（调用方继续执行不受影响）。
+
+        Args:
+            page: 当前 Playwright Page 实例。
+
+        Returns:
+            True 表示点击成功，False 表示未找到排序按钮。
+        """
+        # 优先级从高到低：先精确文字匹配，再类名匹配
+        selectors = [
+            "text=价格升序",
+            "text=低价优先",
+            "text=价格从低到高",
+            "[class*='sort']:has-text('价格')",
+            ".sort-price",
+            ".J-sort-price",
+            "[data-sort='price']",
+            "li:has-text('价格')",
+        ]
+        for sel in selectors:
+            try:
+                elem = page.locator(sel).first
+                if await elem.is_visible(timeout=2000):
+                    await elem.click()
+                    logger.info("[往返] 已点击价格排序按钮（选择器: %s）", sel)
+                    return True
+            except Exception:
+                continue
+        logger.warning("[往返] 未找到价格排序按钮，将对采集结果自行排序")
+        return False
+
+    async def _search_inter_roundtrip(self, params: SearchParams) -> List[FlightPrice]:
+        """通过 interroundtrip_compare.htm 页面采集国际往返航班价格。
+
+        导航到 ``interroundtrip_compare.htm``（使用 fromCity/toCity/fromDate/toDate
+        参数格式），广泛捕获所有 qunar.com JSON API 响应，解析为含
+        ``return_flight_info`` 和往返总价的 ``FlightPrice`` 列表。
+
+        与旧版不同，此实现不仅限于拦截 ``wwwsearch`` 接口——
+        ``interroundtrip_compare.htm`` 可能调用不同的后端端点，广泛捕获可确保
+        兼容东南亚等 ``wwwsearch`` 接口不返回数据的航线。
 
         Args:
             params: 搜索参数，必须包含 return_date。
@@ -1652,34 +1693,50 @@ class QunarScraper(FlightScraper):
         import json as _j
 
         page: Optional[Page] = None
-        best_result: Dict = {}
+        # 收集所有来自 qunar.com 的 JSON 响应，用于尝试多种解析策略
+        captured_responses: List[Dict] = []
         scraped_at = datetime.now(timezone.utc)
 
         try:
             page = await self._context.new_page()
-            url = self._build_search_url(params)
-            logger.info("[往返] 导航到: %s", url)
 
-            # ── 拦截 wwwsearch 接口，保存含数据的响应 ─────────────────────
-            async def _intercept(route, request) -> None:
+            # ── Session 热身：国际往返 API 同样需要 session cookie ─────────
+            logger.info("[往返] Session 热身...")
+            try:
+                await page.goto(
+                    "https://www.qunar.com/",
+                    wait_until="domcontentloaded",
+                    timeout=self.timeout,
+                )
+                await asyncio.sleep(random.uniform(1, 3))
+                logger.info("[往返] Session 热身完成")
+            except Exception as _warm_exc:
+                logger.warning("[往返] Session 热身失败（%s），继续执行", _warm_exc)
+            # ──────────────────────────────────────────────────────────────
+
+            url = self._build_interroundtrip_compare_url(params)
+            logger.info("[往返] 导航到 interroundtrip_compare: %s", url)
+
+            # ── 广泛捕获所有 qunar.com JSON 响应 ──────────────────────────
+            # interroundtrip_compare.htm 可能调用与 roundtrip_list_inter.htm
+            # 不同的后端 API，因此不限定特定端点，保存所有含 JSON 的响应。
+            async def _on_response(response) -> None:
                 try:
-                    resp = await route.fetch()
-                    body = await resp.body()
+                    if "qunar.com" not in response.url:
+                        return
+                    if not response.ok:
+                        return
+                    ct = response.headers.get("content-type", "")
+                    if "json" not in ct:
+                        return
+                    body = await response.body()
                     data = _j.loads(body.decode("utf-8", errors="replace"))
-                    fps = (data.get("result") or {}).get("flightPrices") or {}
-                    if fps:
-                        best_result.update(data.get("result", {}))
-                        logger.info("[往返] wwwsearch 返回 %d 条组合", len(fps))
-                    await route.fulfill(
-                        status=resp.status,
-                        headers=dict(resp.headers),
-                        body=body,
-                    )
+                    logger.debug("[往返] 捕获 API: %s", response.url)
+                    captured_responses.append({"url": response.url, "data": data})
                 except Exception as exc:
-                    logger.warning("[往返] wwwsearch 拦截异常: %s", exc)
-                    await route.continue_()
+                    logger.debug("[往返] 响应捕获异常: %s", exc)
 
-            await page.route("**/touch/api/inter/wwwsearch**", _intercept)
+            page.on("response", _on_response)
             # ──────────────────────────────────────────────────────────────
 
             try:
@@ -1687,13 +1744,34 @@ class QunarScraper(FlightScraper):
             except Exception as exc:
                 logger.debug("[往返] goto 异常（忽略）: %s", exc)
 
-            # 轮询最多 30s 等待数据
-            for _ in range(60):
+            # ── 等待初始数据，然后点击价格升序排序 ───────────────────────────
+            # 等待约 5s 让页面完成初始 API 请求，然后点击价格升序按钮；
+            # 如按钮触发新 API 请求则再等 10s 捕获排序后的数据，
+            # 如排序为纯客户端行为则等待无害，后续自行按价格排序。
+            await asyncio.sleep(5)
+            await self._click_price_sort(page)
+            await asyncio.sleep(10)
+            # ─────────────────────────────────────────────────────────────────
+
+            # 若此时仍无数据，继续轮询最多 15s
+            for _ in range(30):
                 await asyncio.sleep(0.5)
-                if best_result.get("flightPrices"):
+                if any(
+                    bool((r["data"].get("result") or {}).get("flightPrices"))
+                    for r in captured_responses
+                    if isinstance(r.get("data"), dict)
+                ):
                     break
             else:
-                logger.warning("[往返] 30s 内未收到有效 flightPrices 数据")
+                logger.warning(
+                    "[往返] 未收到有效 flightPrices 数据（共捕获 %d 条响应）",
+                    len(captured_responses),
+                )
+                if captured_responses:
+                    logger.info(
+                        "[往返] 已捕获 API URLs: %s",
+                        [r["url"] for r in captured_responses[:10]],
+                    )
 
         except Exception as exc:
             logger.error("[往返] 采集异常: %s", exc, exc_info=True)
@@ -1704,10 +1782,94 @@ class QunarScraper(FlightScraper):
                 except Exception:
                     pass
 
+        # ── 解析：优先使用最后一条含 flightPrices 的响应（排序后的最新数据）──
+        best_result: Optional[Dict] = None
+        for resp in reversed(captured_responses):
+            data = resp.get("data") or {}
+            result = data.get("result") or {}
+            if result.get("flightPrices"):
+                logger.info("[往返] 找到 flightPrices 数据来源: %s", resp["url"])
+                best_result = result
+                break
+
         if not best_result:
             return []
 
-        return self._parse_inter_roundtrip_result(best_result, scraped_at)
+        prices = self._parse_inter_roundtrip_result(best_result, scraped_at)
+        # 按往返总价升序排列，确保低价组合排前（无论页面排序是否生效）
+        prices.sort(key=lambda fp: fp.price)
+        logger.info("[往返] 返回 %d 条往返组合（已按价格升序）", len(prices))
+        return prices
+
+    async def _search_inter_roundtrip_fallback(
+        self, params: SearchParams
+    ) -> List[FlightPrice]:
+        """interroundtrip_compare.htm 无数据时的降级方案：分别搜索去程和回程单程。
+
+        对 ``interroundtrip_compare.htm`` 无法返回组合价格的国际航线，
+        通过各搜一次单程来模拟往返：
+        - 去程：departure_city→arrival_city，departure_date，方向 DEPARTURE
+        - 回程：arrival_city→departure_city，return_date，方向 RETURN
+
+        返回的记录由上游 ``_combine_roundtrip_prices()`` 负责配对。
+
+        Args:
+            params: 搜索参数，必须包含 return_date。
+
+        Returns:
+            去程 + 回程单程 FlightPrice 列表（方向已正确标记）。
+        """
+        outbound_params = SearchParams(
+            departure_city=params.departure_city,
+            arrival_city=params.arrival_city,
+            departure_date=params.departure_date,
+            return_date=None,  # 单程
+        )
+        return_params = SearchParams(
+            departure_city=params.arrival_city,   # 交换：回程出发 = 目的地
+            arrival_city=params.departure_city,   # 交换：回程到达 = 出发地
+            departure_date=params.return_date,    # 回程日期作为出发日
+            return_date=None,
+        )
+
+        logger.info(
+            "[往返降级] 搜去程 %s→%s %s",
+            outbound_params.departure_city,
+            outbound_params.arrival_city,
+            outbound_params.departure_date,
+        )
+        outbound_prices = await self.search_flights(outbound_params)
+
+        logger.info(
+            "[往返降级] 搜回程 %s→%s %s",
+            return_params.departure_city,
+            return_params.arrival_city,
+            return_params.departure_date,
+        )
+        return_prices = await self.search_flights(return_params)
+
+        # 将回程记录的方向改为 RETURN，以便 _combine_roundtrip_prices 正确配对
+        for fp in return_prices:
+            fp.flight_info = FlightInfo(
+                flight_no=fp.flight_info.flight_no,
+                airline=fp.flight_info.airline,
+                departure_city=fp.flight_info.departure_city,
+                arrival_city=fp.flight_info.arrival_city,
+                departure_time=fp.flight_info.departure_time,
+                arrival_time=fp.flight_info.arrival_time,
+                departure_date=fp.flight_info.departure_date,
+                direction=FlightDirection.RETURN,
+                departure_airport=fp.flight_info.departure_airport,
+                arrival_airport=fp.flight_info.arrival_airport,
+                departure_airport_code=fp.flight_info.departure_airport_code,
+                arrival_airport_code=fp.flight_info.arrival_airport_code,
+            )
+
+        logger.info(
+            "[往返降级] 去程 %d 条，回程 %d 条",
+            len(outbound_prices), len(return_prices),
+        )
+        return outbound_prices + return_prices
 
     async def _parse_flights(
         self, page: Page, params: SearchParams
