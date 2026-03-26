@@ -65,6 +65,7 @@ class QunarScraper(FlightScraper):
         max_retries: int = 3,
         cookies: Optional[List[Dict]] = None,
         cookies_file: Optional[str] = None,
+        max_results: int = 20,
     ):
         """Initialize the scraper.
 
@@ -76,10 +77,14 @@ class QunarScraper(FlightScraper):
             cookies_file: Path to a cookie file.  If None and ``cookies`` is
                 empty, falls back to ``DEFAULT_COOKIES_FILE`` in the working
                 directory.
+            max_results: Target number of flight results to collect via
+                scroll-loading.  Scrolling stops early when this count is
+                reached or no new elements appear.
         """
         self.headless = headless
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_results = max_results
 
         # Cookie 加载优先级：
         #   1. 显式传入的 cookies 列表
@@ -626,7 +631,24 @@ class QunarScraper(FlightScraper):
             # Wait for flight results to load
             await self._wait_for_results(page)
 
-            # Parse flight data from DOM
+            # ── 优先使用 wbdflightlist API 数据（完整 147 条）─────────────────
+            # DOM 只渲染约 20 个虚拟列表节点，scroll 无法加载更多；
+            # 而 wbdflightlist 一次性返回所有航班，直接解析效率最高。
+            api_flights_via_wbd: List[FlightPrice] = []
+            has_wbd = any("wbdflightlist" in (r.get("url") or "") for r in captured_api_responses)
+            if has_wbd:
+                api_flights_via_wbd = self._parse_api_responses(captured_api_responses, params)
+                if api_flights_via_wbd:
+                    api_flights_via_wbd.sort(key=lambda fp: fp.price)
+                    logger.info(
+                        "wbdflightlist API 解析得到 %d 条，保留最低 %d 条",
+                        len(api_flights_via_wbd), self.max_results,
+                    )
+                    logger.info(f"Found {len(api_flights_via_wbd[:self.max_results])} flights")
+                    return api_flights_via_wbd[: self.max_results]
+            # ─────────────────────────────────────────────────────────────────
+
+            # Parse flight data from DOM (fallback when API not available)
             flight_prices = await self._parse_flights(page, params)
 
             # If DOM parsing yielded nothing, try the captured API responses
@@ -1166,6 +1188,9 @@ class QunarScraper(FlightScraper):
                     direction=FlightDirection.DEPARTURE,
                     departure_airport=record.get("depAirport") or record.get("depAirportName"),
                     arrival_airport=record.get("arrAirport") or record.get("arrAirportName"),
+                    arrival_date=QunarScraper._compute_arrival_date(
+                        params.departure_date, dep_time, arr_time
+                    ),
                 )
                 results.append(FlightPrice(
                     flight_info=flight_info,
@@ -1528,6 +1553,43 @@ class QunarScraper(FlightScraper):
         await asyncio.sleep(5)
 
     @staticmethod
+    def _compute_arrival_date(
+        dep_date: date,
+        dep_time: Optional[str],
+        arr_time: Optional[str],
+        arr_date_str: Optional[str] = None,
+    ) -> Optional[date]:
+        """推算或解析到达日期。
+
+        优先使用 API 提供的 arrDate 字符串；无 arrDate 时通过时间差估算：
+        若到达时刻（HH:MM）早于起飞时刻（HH:MM），则到达日期 = 出发日期 + 1 天。
+
+        Args:
+            dep_date:    出发日期。
+            dep_time:    起飞时刻 "HH:MM"，可为 None。
+            arr_time:    到达时刻 "HH:MM"，可为 None。
+            arr_date_str: API 提供的到达日期字符串 "YYYY-MM-DD"，可为 None。
+
+        Returns:
+            到达日期，无法判断时返回 None。
+        """
+        from datetime import timedelta
+
+        # 优先：API 直接提供到达日期
+        if arr_date_str:
+            try:
+                return date.fromisoformat(arr_date_str)
+            except ValueError:
+                pass
+
+        # 降级：通过 HH:MM 字符串比较估算（只能判断是否跨日，+1 精度）
+        if dep_time and arr_time and len(dep_time) >= 5 and len(arr_time) >= 5:
+            if arr_time[:5] < dep_time[:5]:
+                return dep_date + timedelta(days=1)
+
+        return None
+
+    @staticmethod
     def _build_flight_info_from_trip(
         trip: Dict,
         direction: FlightDirection,
@@ -1559,19 +1621,25 @@ class QunarScraper(FlightScraper):
         except ValueError:
             return None
 
+        dep_time = first.get("depTime")
+        arr_time = last.get("arrTime")
+        arr_date_str = last.get("arrDate")  # wwwsearch API 提供到达日期
+        arr_date = QunarScraper._compute_arrival_date(dep_date, dep_time, arr_time, arr_date_str)
+
         return FlightInfo(
             flight_no=flight_no,
             airline=airline,
             departure_city=first.get("depCityName", ""),
             arrival_city=last.get("arrCityName", ""),
             departure_date=dep_date,
-            departure_time=first.get("depTime"),
-            arrival_time=last.get("arrTime"),
+            departure_time=dep_time,
+            arrival_time=arr_time,
             direction=direction,
             departure_airport=first.get("depAirportName"),
             arrival_airport=last.get("arrAirportName"),
             departure_airport_code=first.get("depAirportCode"),
             arrival_airport_code=last.get("arrAirportCode"),
+            arrival_date=arr_date,
         )
 
     def _parse_inter_roundtrip_result(
@@ -1863,6 +1931,7 @@ class QunarScraper(FlightScraper):
                 arrival_airport=fp.flight_info.arrival_airport,
                 departure_airport_code=fp.flight_info.departure_airport_code,
                 arrival_airport_code=fp.flight_info.arrival_airport_code,
+                arrival_date=fp.flight_info.arrival_date,
             )
 
         logger.info(
@@ -1888,6 +1957,26 @@ class QunarScraper(FlightScraper):
         try:
             # Get all flight elements using Qunar's actual CSS class
             flight_elements = await page.query_selector_all(".b-airfly")
+
+            # ── 滚动加载：持续滚动直到采集到目标数量 ──────────────────────────
+            target = self.max_results
+            MAX_SCROLLS, NO_NEW_THRESHOLD = 8, 2
+            no_new_count = 0
+            for _ in range(MAX_SCROLLS):
+                if len(flight_elements) >= target:
+                    break
+                prev = len(flight_elements)
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                flight_elements = await page.query_selector_all(".b-airfly")
+                if len(flight_elements) <= prev:
+                    no_new_count += 1
+                    if no_new_count >= NO_NEW_THRESHOLD:
+                        break
+                else:
+                    no_new_count = 0
+            flight_elements = flight_elements[:target]
+            # ──────────────────────────────────────────────────────────────────
 
             if not flight_elements:
                 logger.warning("No flight elements found on page")
@@ -2031,6 +2120,7 @@ class QunarScraper(FlightScraper):
                 direction=direction,
                 departure_airport=dep_airport,
                 arrival_airport=arr_airport,
+                arrival_date=self._compute_arrival_date(dep_date, dep_time, arr_time),
             )
 
             return FlightPrice(
@@ -2123,12 +2213,23 @@ class QunarScraper(FlightScraper):
                         if not isinstance(record, dict):
                             continue
                         try:
-                            # Price — try all common field names
+                            # 航班详情存在 binfo 子对象中：
+                            # - 直飞：binfo (单个 dict)
+                            # - 中转/连程：binfo1 + binfo2 (两段分开存储)
+                            binfo: Dict = record.get("binfo") or {}
+                            binfo1: Dict = record.get("binfo1") or {}
+                            binfo2: Dict = record.get("binfo2") or {}
+                            # 首段（出发信息）优先 binfo，其次 binfo1
+                            seg1: Dict = binfo if binfo else binfo1
+                            # 末段（到达信息）优先 binfo，其次 binfo2（连程末段）
+                            seg_last: Dict = binfo if binfo else (binfo2 if binfo2 else binfo1)
+
+                            # Price — minPrice 在顶层
                             price_raw = (
-                                record.get("price")
+                                record.get("minPrice")
+                                or record.get("price")
                                 or record.get("lowestPrice")
                                 or record.get("cheapestPrice")
-                                or record.get("minPrice")
                                 or record.get("floorPrice")
                                 or ""
                             )
@@ -2141,39 +2242,50 @@ class QunarScraper(FlightScraper):
                                 continue
                             price = Decimal(price_str)
 
-                            # Flight number
+                            # Flight number — seg1.airCode
                             flight_no = str(
-                                record.get("flightNo")
+                                seg1.get("airCode")
+                                or record.get("flightNo")
                                 or record.get("flight_no")
                                 or record.get("fn")
                                 or record.get("flightNumber")
                                 or "UNKNOWN"
                             ).strip()
 
-                            # Airline name
+                            # Airline name — seg1.fullName
                             airline = str(
-                                record.get("airlineName")
+                                seg1.get("fullName")
+                                or seg1.get("mainCarrierShortName")
+                                or record.get("airlineName")
                                 or record.get("airline_name")
                                 or record.get("airline")
                                 or record.get("carrier")
                                 or "未知航空"
                             ).strip()
 
-                            # Departure / arrival times
+                            # Departure time — seg1.depTime
                             dep_time = str(
-                                record.get("takeoffTime")
+                                seg1.get("depTime")
+                                or record.get("takeoffTime")
                                 or record.get("departureTime")
                                 or record.get("startTime")
-                                or record.get("depTime")
                                 or "00:00"
                             )[:5]
+
+                            # Arrival time — seg_last.arrTime（连程取末段到达）
                             arr_time = str(
-                                record.get("landTime")
+                                seg_last.get("arrTime")
+                                or record.get("landTime")
                                 or record.get("arrivalTime")
                                 or record.get("endTime")
-                                or record.get("arrTime")
                                 or "00:00"
                             )[:5]
+
+                            # Arrival date (cross-day flights)
+                            arr_date_str = (
+                                seg_last.get("arrDate")
+                                or seg_last.get("date")
+                            )
 
                             flight_info = FlightInfo(
                                 flight_no=flight_no,
@@ -2184,6 +2296,10 @@ class QunarScraper(FlightScraper):
                                 arrival_time=arr_time,
                                 departure_date=params.departure_date,
                                 direction=FlightDirection.DEPARTURE,
+                                arrival_date=self._compute_arrival_date(
+                                    params.departure_date, dep_time, arr_time,
+                                    arr_date_str=arr_date_str,
+                                ),
                             )
                             results.append(FlightPrice(
                                 flight_info=flight_info,
@@ -2233,6 +2349,9 @@ class QunarScraper(FlightScraper):
                             arrival_time=arr_time[:5],
                             departure_date=params.departure_date,
                             direction=FlightDirection.DEPARTURE,
+                            arrival_date=self._compute_arrival_date(
+                                params.departure_date, dep_time[:5], arr_time[:5]
+                            ),
                         )
                         results.append(FlightPrice(
                             flight_info=flight_info,

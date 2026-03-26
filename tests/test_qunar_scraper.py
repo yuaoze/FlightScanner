@@ -17,7 +17,8 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from flightscanner.interfaces import SearchParams
-from flightscanner.scrapers.qunar_scraper import QunarScraper, CITY_AIRPORT_CODES
+from flightscanner.scrapers.qunar_scraper import QunarScraper
+from flightscanner.utils.city_codes import CITY_CODE_MAP
 
 
 @pytest.fixture
@@ -57,7 +58,7 @@ class TestAirportCodeLookup:
         assert scraper._get_airport_code("未知城市") == "未知城市"
 
     def test_all_mapped_cities_have_three_letter_codes(self, scraper: QunarScraper):
-        for city, code in CITY_AIRPORT_CODES.items():
+        for city, code in CITY_CODE_MAP.items():
             assert len(code) == 3, f"{city} -> {code} should be 3 letters"
             assert code.isupper(), f"{city} -> {code} should be uppercase"
 
@@ -161,6 +162,71 @@ class TestBuildSearchUrl:
         assert "fromCode=SHA" in url
         assert "toCode=CTU" in url
         assert "startSearch=true" in url
+
+
+class TestBuildInterroundtripCompareUrl:
+    """Tests for _build_interroundtrip_compare_url()."""
+
+    def test_uses_interroundtrip_compare_base(self, scraper: QunarScraper):
+        params = SearchParams(
+            departure_city="上海",
+            arrival_city="马尼拉",
+            departure_date=date(2026, 5, 1),
+            return_date=date(2026, 5, 5),
+        )
+        url = scraper._build_interroundtrip_compare_url(params)
+        assert url.startswith("https://flight.qunar.com/site/interroundtrip_compare.htm")
+
+    def test_uses_fromcity_tocity_parameters(self, scraper: QunarScraper):
+        """interroundtrip_compare.htm 使用 fromCity/toCity，不用 searchDepartureAirport。"""
+        params = SearchParams(
+            departure_city="上海",
+            arrival_city="马尼拉",
+            departure_date=date(2026, 5, 1),
+            return_date=date(2026, 5, 5),
+        )
+        url = scraper._build_interroundtrip_compare_url(params)
+        assert "fromCity=" in url
+        assert "toCity=" in url
+        assert "fromDate=2026-05-01" in url
+        assert "toDate=2026-05-05" in url
+        # 不应包含 roundtrip_list_inter.htm 的参数格式
+        assert "searchDepartureAirport=" not in url
+        assert "searchArrivalAirport=" not in url
+
+    def test_contains_correct_airport_codes(self, scraper: QunarScraper):
+        params = SearchParams(
+            departure_city="上海",
+            arrival_city="马尼拉",
+            departure_date=date(2026, 5, 1),
+            return_date=date(2026, 5, 5),
+        )
+        url = scraper._build_interroundtrip_compare_url(params)
+        assert "fromCode=SHA" in url
+        assert "toCode=MNL" in url
+        assert "isInter=true" in url
+        assert "adultNum=1" in url
+        assert "childNum=0" in url
+
+    def test_matches_user_confirmed_url_format(self, scraper: QunarScraper):
+        """验证 URL 格式与用户确认的真实 URL 一致。"""
+        params = SearchParams(
+            departure_city="上海",
+            arrival_city="马尼拉",
+            departure_date=date(2026, 5, 1),
+            return_date=date(2026, 5, 5),
+        )
+        url = scraper._build_interroundtrip_compare_url(params)
+        # 用户提供的真实 URL 中包含的关键片段
+        assert "interroundtrip_compare.htm" in url
+        assert "fromCode=SHA" in url
+        assert "toCode=MNL" in url
+        assert "fromDate=2026-05-01" in url
+        assert "toDate=2026-05-05" in url
+        assert "isInter=true" in url
+        assert "from=flight_dom_search" in url
+        assert "adultNum=1" in url
+        assert "childNum=0" in url
 
 
 class TestNonHeadlessLoginFlow:

@@ -35,6 +35,8 @@ class FlightInfo:
         arrival_airport: Full name of arrival airport (optional)
         departure_airport_code: IATA code of departure airport (optional)
         arrival_airport_code: IATA code of arrival airport (optional)
+        arrival_date: Actual arrival date (optional; differs from departure_date
+            for overnight/multi-day flights)
     """
     flight_no: str
     airline: str
@@ -48,6 +50,7 @@ class FlightInfo:
     arrival_airport: Optional[str] = None         # 到达机场全称
     departure_airport_code: Optional[str] = None  # IATA 代码
     arrival_airport_code: Optional[str] = None    # IATA 代码
+    arrival_date: Optional[date] = None           # 实际到达日期（跨日航班与 departure_date 不同）
 
 
 @dataclass

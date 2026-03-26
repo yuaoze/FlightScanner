@@ -92,6 +92,14 @@ class Settings(BaseSettings):
         description="Ctrip cookies JSON string for authentication (optional)",
     )
 
+    # Scraper result limit
+    max_results_per_platform: int = Field(
+        default=20,
+        ge=5,
+        le=100,
+        description="每平台每批最多采集的航班数量（5~100）",
+    )
+
     # Alert Configuration
     alert_price_threshold: int = Field(
         default=800, description="Default price threshold for alerts (CNY)"

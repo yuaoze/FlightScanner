@@ -71,6 +71,9 @@ class Flight(Base):
     departure_airport_code = Column(String(10), nullable=True)   # IATA 代码，如 "PEK"
     arrival_airport_code = Column(String(10), nullable=True)     # IATA 代码，如 "HND"
 
+    # 实际到达日期（通过迁移添加，可空）——跨日/多日航班与 departure_date 不同
+    arrival_date = Column(Date, nullable=True)
+
     # Relationship（仅跟踪以本航班为去程/单程的价格记录）
     price_histories = relationship(
         "PriceHistory",
@@ -149,6 +152,7 @@ class Route(Base):
     last_notified_at    = Column(DateTime, nullable=True)           # 上次通知时间（UTC）
     last_notified_price = Column(Numeric(10, 2), nullable=True)     # 上次通知时的价格
     notify_threshold_pct = Column(Numeric(5, 2), nullable=True)    # 用户自定义低于均价 N% 时通知（None=使用全局默认）
+    max_results = Column(Integer, default=20, nullable=False)
 
     # Relationship
     price_histories = relationship(
@@ -278,6 +282,10 @@ def _apply_migrations(engine) -> None:
         "ALTER TABLE routes ADD COLUMN notify_threshold_pct NUMERIC",
         # batch_id：用于标记同一次采集会话的所有记录（解决同秒多条记录取最低价错误问题）
         "ALTER TABLE price_history ADD COLUMN batch_id TEXT",
+        # arrival_date：实际到达日期（跨日/多日航班的到达日期，可为 NULL）
+        "ALTER TABLE flights ADD COLUMN arrival_date DATE",
+        # max_results：每路线每平台最多采集的航班条数
+        "ALTER TABLE routes ADD COLUMN max_results INTEGER NOT NULL DEFAULT 20",
     ]
     with engine.connect() as conn:
         for stmt in stmts:

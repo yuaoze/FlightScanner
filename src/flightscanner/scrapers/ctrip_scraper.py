@@ -36,12 +36,15 @@ from flightscanner.utils.config import settings
 logger = logging.getLogger(__name__)
 
 # 舱位代码 → 中文描述
+# batchSearch API 可能返回 "@Y-Y" 等组合代码（取第一段字母前缀匹配）
 CABIN_TYPE_MAP: Dict[str, str] = {
     "Y": "经济舱",
     "S": "超级经济舱",
     "C": "商务舱",
     "F": "头等舱",
     "W": "超级经济舱",
+    "@Y-Y": "经济舱",
+    "@C-C": "商务舱",
 }
 
 
@@ -70,6 +73,7 @@ class CtripScraper(FlightScraper):
         headless: bool = True,
         timeout: int = 30000,
         max_retries: int = 3,
+        max_results: int = 20,
         cookies: Optional[List[Dict]] = None,
         cookies_file: Optional[str] = None,
     ):
@@ -79,6 +83,7 @@ class CtripScraper(FlightScraper):
             headless: 是否无头模式，默认 True。
             timeout: 页面超时毫秒数，默认 30000。
             max_retries: 最大重试次数，默认 3。
+            max_results: 每次采集最多保留的航班条数（按价格升序截取），默认 20。
             cookies: 已解析的 Playwright 格式 Cookie 列表（优先级最高）。
             cookies_file: Cookie 文件路径；为 None 时自动尝试
                 ``ctrip_cookies.json``。
@@ -86,6 +91,7 @@ class CtripScraper(FlightScraper):
         self.headless = headless
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_results = max_results
 
         # Cookie 加载优先级：
         #   1. 显式传入的 cookies 列表
@@ -352,6 +358,14 @@ class CtripScraper(FlightScraper):
 
             # ── 优先：解析捕获的 API 响应 ────────────────────────────────
             flight_prices = self._parse_api_responses(captured, params)
+            if flight_prices:
+                flight_prices.sort(key=lambda fp: fp.price)
+                total_api = len(flight_prices)
+                flight_prices = flight_prices[: self.max_results]
+                logger.info(
+                    "API 解析得到 %d 条，按价格升序保留最低 %d 条",
+                    total_api, len(flight_prices),
+                )
 
             # ── 备用：DOM 解析 ───────────────────────────────────────────
             if not flight_prices:
@@ -618,10 +632,10 @@ class CtripScraper(FlightScraper):
                 direction=FlightDirection.RETURN,
             )
 
-        # ── 提取价格档位 ─────────────────────────────────────────────────────
-        # 往返搜索时（params.return_date 非空），携程在搜索结果中直接展示往返合计
-        # 价格（adultPrice = 两程合计）。设置 return_flight_info 以标记此为已合并
-        # 的往返记录，防止 _combine_roundtrip_prices() 将其误当单程处理。
+        # ── 提取最低价格 ─────────────────────────────────────────────────────
+        # batchSearch 每个行程（itinerary）含多个价格档位（priceList），每档对应
+        # 不同的退改签套餐；价格监控只关心最低价，因此每个行程只保留一条记录。
+        # 往返搜索时 adultPrice = 两程合计；设置 return_flight_info 标记已合并。
         price_list = (
             itinerary.get("priceList")
             or itinerary.get("prices")
@@ -632,10 +646,13 @@ class CtripScraper(FlightScraper):
 
         is_roundtrip = params.return_date is not None
 
+        best_price: Optional[Decimal] = None
+        best_cabin_code = "Y"
+        best_seats: Optional[int] = None
+
         for price_entry in price_list:
             try:
                 if is_roundtrip:
-                    # 携程往返合计价格候选字段（按出现频率排序）
                     raw_price = (
                         price_entry.get("roundTripPrice")
                         or price_entry.get("twowayPrice")
@@ -656,32 +673,36 @@ class CtripScraper(FlightScraper):
                 if not raw_price:
                     continue
 
-                # ── 座位可用性检查 ──────────────────────────────────────────────
-                # 跳过无座位信息或座位数为0的记录（已售罄或过期数据）
                 seats_left = price_entry.get("seatsLeft")
-                if seats_left is None or seats_left == 0:
+                # 仅在 seatsLeft 明确为 0 时跳过（已售罄）；
+                # batchSearch API 不返回 seatsLeft，None 表示未知，不应过滤
+                if seats_left == 0:
                     continue
 
-                price = Decimal(str(raw_price))
-                cabin_code = str(
-                    price_entry.get("cabinType")
-                    or price_entry.get("cabin")
-                    or "Y"
-                ).strip().upper()
-                seat_class = CABIN_TYPE_MAP.get(cabin_code, "经济舱")
-
-                prices.append(FlightPrice(
-                    flight_info=flight_info,
-                    price=price,
-                    currency="CNY",
-                    seat_class=seat_class,
-                    available_seats=seats_left,
-                    scraped_at=datetime.now(timezone.utc),
-                    source="ctrip",
-                    return_flight_info=return_flight_info,
-                ))
+                candidate = Decimal(str(raw_price))
+                if best_price is None or candidate < best_price:
+                    best_price = candidate
+                    best_cabin_code = str(
+                        price_entry.get("cabin")
+                        or price_entry.get("cabinType")
+                        or "Y"
+                    ).strip().upper()
+                    best_seats = seats_left
             except Exception as exc:
                 logger.debug("解析价格档位失败：%s", exc)
+
+        if best_price is not None:
+            seat_class = CABIN_TYPE_MAP.get(best_cabin_code, "经济舱")
+            prices.append(FlightPrice(
+                flight_info=flight_info,
+                price=best_price,
+                currency="CNY",
+                seat_class=seat_class,
+                available_seats=best_seats,
+                scraped_at=datetime.now(timezone.utc),
+                source="ctrip",
+                return_flight_info=return_flight_info,
+            ))
 
         return prices
 

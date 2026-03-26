@@ -11,6 +11,7 @@ import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from statistics import median
 from typing import Dict, List, Optional, Set, Tuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -20,6 +21,7 @@ from flightscanner.models.database import Route
 from flightscanner.core.services import RouteService
 from flightscanner.scrapers import ScraperRegistry
 from flightscanner.analyzers import RuleBasedAnalyzer
+from flightscanner.analyzers.rule_based_analyzer import _batch_min_prices
 from flightscanner.notifiers import build_notifiers
 from flightscanner.interfaces import FlightDirection, FlightPrice, FlightScraper, Notifier, PriceTrend, SearchParams
 from flightscanner.models.database import init_db
@@ -110,6 +112,7 @@ class PriceMonitorScheduler:
                     "qunar",
                     headless=headless,
                     cookies=qunar_cookies,
+                    max_results=20,
                 )
             elif platform == "ctrip":
                 scraper = ScraperRegistry.get(
@@ -161,6 +164,9 @@ class PriceMonitorScheduler:
                 departure_date=route.target_date,
                 return_date=route.return_date if trip_type == "roundtrip" else None,
             )
+            for scraper in self.scrapers:
+                if hasattr(scraper, "max_results"):
+                    scraper.max_results = getattr(route, "max_results", 20)
             flight_prices = await self._scrape_all_platforms(params)
 
             if not flight_prices:
@@ -217,7 +223,7 @@ class PriceMonitorScheduler:
                 # 1. 获取30天历史并计算统计数据
                 history = route_service.get_route_price_history(route.id, days=30)
                 stats = self._compute_price_stats(history)
-                price_count = len(history)
+                price_count = int(stats.get("batch_count", len(history)))
 
                 # 2. 本次采集最低价记录
                 best_fp = min(flight_prices, key=lambda fp: fp.price)
@@ -346,15 +352,12 @@ class PriceMonitorScheduler:
         """
         return await self._scrape_oneway(params)
 
-    # 每个平台每次采集后仅保留价格最低的前 N 条，控制存储量并减少噪音
-    _PER_PLATFORM_LIMIT = 20
-
     async def _scrape_oneway(
         self, params: SearchParams
     ) -> List[FlightPrice]:
         """并发调用所有爬虫，合并去重搜索结果。
 
-        每个平台的原始结果按价格升序截取前 ``_PER_PLATFORM_LIMIT`` 条后再合并，
+        每个平台的原始结果按价格升序截取前 ``_per_platform_limit`` 条后再合并，
         避免低质量/高价结果堆积入库。
 
         Args:
@@ -376,7 +379,8 @@ class PriceMonitorScheduler:
                 logger.error("%s 采集失败：%s", platform, result)
             elif isinstance(result, list):
                 # ── 每平台仅保留最低的前 N 条 ────────────────────────────────
-                top = sorted(result, key=lambda fp: fp.price)[: self._PER_PLATFORM_LIMIT]
+                limit = getattr(scraper, "max_results", 20)
+                top = sorted(result, key=lambda fp: fp.price)[:limit]
                 logger.info(
                     "%s 采集到 %d 条结果，保留最低 %d 条",
                     platform, len(result), len(top),
@@ -505,15 +509,18 @@ class PriceMonitorScheduler:
             history: 价格历史记录列表。
 
         Returns:
-            包含 avg_30d、min_30d、max_30d 的字典；历史为空时全部返回 0.0。
+            包含 avg_30d、min_30d、max_30d、batch_count 的字典；历史为空时全部返回 0.0。
+            avg_30d 为各采集批次最低价的中位数，对偶发性特价票具有更强的鲁棒性。
         """
         if not history:
-            return {"avg_30d": 0.0, "min_30d": 0.0, "max_30d": 0.0}
+            return {"avg_30d": 0.0, "min_30d": 0.0, "max_30d": 0.0, "batch_count": 0.0}
         prices = [float(fp.price) for fp in history]
+        batch_mins = _batch_min_prices(history)
         return {
-            "avg_30d": sum(prices) / len(prices),
+            "avg_30d": median(batch_mins),
             "min_30d": min(prices),
             "max_30d": max(prices),
+            "batch_count": float(len(batch_mins)),
         }
 
     @staticmethod

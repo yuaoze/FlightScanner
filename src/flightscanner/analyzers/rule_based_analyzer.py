@@ -7,10 +7,35 @@ and generate recommendations.
 
 from datetime import date, datetime
 from decimal import Decimal
-from statistics import mean, stdev
-from typing import List, Optional
+from statistics import median, stdev
+from typing import Dict, List, Optional
 
 from flightscanner.interfaces import FlightPrice, PriceAnalyzer, PriceTrend
+
+
+def _batch_min_prices(price_records: List[FlightPrice]) -> List[float]:
+    """Return the minimum price per scrape batch.
+
+    Records that share a ``batch_id`` belong to the same scrape session.
+    For records without a ``batch_id`` (legacy data), each record is treated
+    as its own batch.
+
+    Using per-batch minimums as the unit normalises sessions with different
+    record counts and focuses analysis on the cheapest available fare.
+
+    Args:
+        price_records: Price history records, in any order.
+
+    Returns:
+        List of per-batch minimum prices (floats), one value per batch.
+    """
+    batches: Dict[str, float] = {}
+    for fp in price_records:
+        key = fp.batch_id if fp.batch_id else f"_solo_{id(fp)}"
+        price = float(fp.price)
+        if key not in batches or price < batches[key]:
+            batches[key] = price
+    return list(batches.values())
 
 
 class RuleBasedAnalyzer(PriceAnalyzer):
@@ -55,7 +80,10 @@ class RuleBasedAnalyzer(PriceAnalyzer):
         prices = [float(fp.price) for fp in sorted_prices]
 
         # Calculate statistics
-        avg_price = mean(prices)
+        # avg_price is the median of per-batch minimum prices, which is robust
+        # against outlier promotional fares and normalises sessions by count.
+        batch_mins = _batch_min_prices(historical_prices)
+        avg_price = median(batch_mins) if batch_mins else prices[0]
         min_price = min(prices)
         max_price = max(prices)
 

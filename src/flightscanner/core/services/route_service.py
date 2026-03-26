@@ -64,6 +64,7 @@ class RouteWithLatestPrice:
     arr_time_to: Optional[str] = None
     last_notified_at: Optional[datetime] = None
     last_notified_price: Optional[Decimal] = None
+    max_results: int = 20
 
 
 class RouteService:
@@ -97,6 +98,7 @@ class RouteService:
         dep_time_to: Optional[str] = None,
         arr_time_from: Optional[str] = None,
         arr_time_to: Optional[str] = None,
+        max_results: int = 20,
     ) -> Route:
         """Add a new route to monitor.
 
@@ -157,6 +159,7 @@ class RouteService:
             dep_time_to=dep_time_to or None,
             arr_time_from=arr_time_from or None,
             arr_time_to=arr_time_to or None,
+            max_results=max_results,
         )
 
         self.session.add(route)
@@ -271,6 +274,7 @@ class RouteService:
                 Route.arr_time_to,
                 Route.last_notified_at,
                 Route.last_notified_price,
+                Route.max_results,
                 latest_price_subq.c.latest_price,
                 latest_price_subq.c.latest_scraped_at,
                 func.coalesce(price_count_subq.c.price_count, 0).label("price_count"),
@@ -318,6 +322,7 @@ class RouteService:
                         if row.last_notified_price is not None
                         else None
                     ),
+                    max_results=row.max_results if row.max_results is not None else 20,
                 )
             )
 
@@ -475,6 +480,7 @@ class RouteService:
                 arrival_airport=flight.arrival_airport,
                 departure_airport_code=flight.departure_airport_code,
                 arrival_airport_code=flight.arrival_airport_code,
+                arrival_date=flight.arrival_date,
             )
 
             # 往返程：组装回程航班信息
@@ -493,6 +499,7 @@ class RouteService:
                     arrival_airport=return_flight.arrival_airport,
                     departure_airport_code=return_flight.departure_airport_code,
                     arrival_airport_code=return_flight.arrival_airport_code,
+                    arrival_date=return_flight.arrival_date,
                 )
 
             flight_price = FlightPrice(
@@ -550,6 +557,7 @@ class RouteService:
                 arrival_airport=flight_info.arrival_airport,
                 departure_airport_code=flight_info.departure_airport_code,
                 arrival_airport_code=flight_info.arrival_airport_code,
+                arrival_date=flight_info.arrival_date,
             )
             self.session.add(flight)
             self.session.flush()

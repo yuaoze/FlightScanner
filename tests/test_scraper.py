@@ -328,7 +328,7 @@ class TestCtripScraper:
         assert result[0].return_flight_info is None
 
     def test_parse_itinerary_filters_no_seats(self, scraper: CtripScraper):
-        """无座位信息的记录应被过滤掉（售罄或过期数据）。"""
+        """seatsLeft=0 的记录应被过滤（已售罄）；seatsLeft=None 表示 API 未返回座位信息，应保留。"""
         itinerary = {
             "flightSegments": [{
                 "segmentNo": 1,
@@ -342,9 +342,9 @@ class TestCtripScraper:
                 }],
             }],
             "priceList": [
-                {"adultPrice": 1150, "cabin": "Y", "seatsLeft": None},  # 无座位，应过滤
-                {"adultPrice": 1150, "cabin": "Y", "seatsLeft": 0},      # 无座位，应过滤
-                {"adultPrice": 1500, "cabin": "Y", "seatsLeft": 5},      # 有座位，应保留
+                {"adultPrice": 1150, "cabin": "Y", "seatsLeft": None},  # API 未返回，保留
+                {"adultPrice": 1150, "cabin": "Y", "seatsLeft": 0},      # 已售罄，过滤
+                {"adultPrice": 1500, "cabin": "Y", "seatsLeft": 5},      # 有座位，保留
             ],
         }
         params = SearchParams(
@@ -356,10 +356,10 @@ class TestCtripScraper:
 
         result = scraper._parse_itinerary(itinerary, params)
 
-        # 仅保留有座位的记录
+        # 每个行程只保留最低价；seatsLeft=None 的 ¥1150 条目优先于 ¥1500
         assert len(result) == 1
-        assert result[0].price == 1500
-        assert result[0].available_seats == 5
+        assert result[0].price == 1150
+        assert result[0].available_seats is None
 
 
 @pytest.mark.asyncio

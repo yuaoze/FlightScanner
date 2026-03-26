@@ -8,7 +8,7 @@ and price trend charts when expanded.
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -16,6 +16,87 @@ from flightscanner.core.services import RouteService, RouteWithLatestPrice
 from flightscanner.interfaces import FlightPrice
 from flightscanner.utils.city_codes import get_airport_name
 from ui.components.charts import _source_label, _to_beijing, render_price_trend_chart
+from ui.components.ai_brief import render_ai_brief
+
+
+# ── Arrival-time formatter with overnight (+N) marker ─────────────────────────
+
+def _fmt_arrival(
+    dep_time: Optional[str],
+    arr_time: Optional[str],
+    dep_date: Optional[date] = None,
+    arrival_date: Optional[date] = None,
+) -> str:
+    """Format arrival time, appending a +N day marker for cross-day flights.
+
+    Uses the actual arrival_date when provided for precise multi-day detection
+    (e.g. +2 for long-haul flights).  Falls back to HH:MM comparison (+1 max)
+    when dates are unavailable.
+
+    Args:
+        dep_time:     Departure time string "HH:MM" or None.
+        arr_time:     Arrival time string "HH:MM" or None.
+        dep_date:     Departure date or None.
+        arrival_date: Arrival date or None.
+
+    Returns:
+        Formatted string such as "06:30 +2" or "14:55".
+    """
+    if not arr_time:
+        return ""
+    if dep_date is not None and arrival_date is not None:
+        try:
+            delta = (arrival_date - dep_date).days
+            if delta > 0:
+                return f"{arr_time} +{delta}"
+            return arr_time
+        except Exception:
+            pass
+    if dep_time and arr_time < dep_time:
+        return f"{arr_time} +1"
+    return arr_time
+
+
+# ── Helpers shared by top-10 table and per-platform summary ───────────────────
+
+def _collect_latest_batch_records(
+    price_history: List[FlightPrice],
+) -> Tuple[Dict[str, str], List[FlightPrice]]:
+    """Return the latest batch_id per source and all records from those batches.
+
+    Args:
+        price_history: Full 30-day price history for a route.
+
+    Returns:
+        Tuple of (latest_batch dict, list of FlightPrice from those batches).
+        Falls back to timestamp-based grouping when batch_id is absent.
+    """
+    # Step 1: find latest batch_id per source
+    latest_batch: Dict[str, str] = {}
+    for fp in price_history:
+        bid = fp.batch_id
+        if bid is None:
+            continue
+        if fp.source not in latest_batch or bid > latest_batch[fp.source]:
+            latest_batch[fp.source] = bid
+
+    if latest_batch:
+        records = [
+            fp for fp in price_history
+            if fp.batch_id is not None and fp.batch_id == latest_batch.get(fp.source)
+        ]
+        return latest_batch, records
+
+    # Fallback: group by latest scraped_at per source
+    latest_time: Dict[str, object] = {}
+    for fp in price_history:
+        if fp.source not in latest_time or fp.scraped_at > latest_time[fp.source]:
+            latest_time[fp.source] = fp.scraped_at
+    records = [
+        fp for fp in price_history
+        if fp.scraped_at == latest_time.get(fp.source)
+    ]
+    return {}, records
 
 
 # ── Per-platform price summary (inside an expanded card) ──────────────────────
@@ -24,7 +105,7 @@ def _render_source_price_summary(
     price_history: List[FlightPrice],
     target_price: Decimal,
 ) -> None:
-    """Render the latest price per scraper platform as metric tiles.
+    """Render the latest minimum price per scraper platform as metric tiles.
 
     Args:
         price_history: Price records for this route (30-day window).
@@ -33,39 +114,14 @@ def _render_source_price_summary(
     if not price_history:
         return
 
-    # Step 1: find the latest batch_id per source platform
-    # 使用 batch_id 分组（而非精确时间戳），确保同一次采集的所有记录都被纳入比较
-    latest_batch: Dict[str, str] = {}
-    for fp in price_history:
-        src = fp.source
-        bid = fp.batch_id
-        if bid is None:
-            continue
-        if src not in latest_batch or bid > latest_batch[src]:
-            latest_batch[src] = bid
+    _, batch_records = _collect_latest_batch_records(price_history)
 
-    # Step 2: among records in that latest batch, keep the minimum price
+    # Keep the minimum-price record per source from the latest batch
     latest: Dict[str, FlightPrice] = {}
-    for fp in price_history:
+    for fp in batch_records:
         src = fp.source
-        bid = fp.batch_id
-        if bid is None or bid != latest_batch.get(src):
-            continue
         if src not in latest or fp.price < latest[src].price:
             latest[src] = fp
-
-    # Fallback：若所有记录都没有 batch_id（旧数据），退回时间戳匹配
-    if not latest:
-        latest_time: Dict[str, object] = {}
-        for fp in price_history:
-            src = fp.source
-            if src not in latest_time or fp.scraped_at > latest_time[src]:
-                latest_time[src] = fp.scraped_at
-        for fp in price_history:
-            src = fp.source
-            if fp.scraped_at == latest_time.get(src):
-                if src not in latest or fp.price < latest[src].price:
-                    latest[src] = fp
 
     if not latest:
         return
@@ -426,19 +482,22 @@ def _render_price_section(
             route_id=route.id,
         )
 
-        # Show latest combined flight detail
-        if history:
-            latest_fp = max(history, key=lambda fp: fp.scraped_at)
-            out = latest_fp.flight_info
-            ret = latest_fp.return_flight_info
+        # Show latest combined flight detail (cheapest from latest batch)
+        _, batch_records = _collect_latest_batch_records(history)
+        if batch_records:
+            best_fp = min(batch_records, key=lambda fp: fp.price)
+            out = best_fp.flight_info
+            ret = best_fp.return_flight_info
             if out and ret:
+                out_arr = _fmt_arrival(out.departure_time, out.arrival_time, out.departure_date, out.arrival_date)
+                ret_arr = _fmt_arrival(ret.departure_time, ret.arrival_time, ret.departure_date, ret.arrival_date)
                 st.caption(
                     f"去程：{out.flight_no} {out.airline}  "
-                    f"{out.departure_time}→{out.arrival_time}  "
+                    f"{out.departure_time}→{out_arr}  "
                     f"({out.departure_date})"
                     f"　｜　"
                     f"回程：{ret.flight_no} {ret.airline}  "
-                    f"{ret.departure_time}→{ret.arrival_time}  "
+                    f"{ret.departure_time}→{ret_arr}  "
                     f"({ret.departure_date})"
                 )
     else:
@@ -449,3 +508,7 @@ def _render_price_section(
             f"{route.origin} → {route.destination}",
             route_id=route.id,
         )
+
+    # ── AI 价格简报（按需生成，每日缓存）────────────────────────────────────
+    st.divider()
+    render_ai_brief(route, history)

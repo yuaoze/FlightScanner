@@ -55,6 +55,7 @@ def trigger_immediate_scrape(route_id: int) -> None:
             headless=settings.scraper_headless,
             enable_notifications=False,
         )
+
         with get_session() as session:
             route_service = RouteService(session)
             route = route_service.get_route_by_id(route_id)
@@ -182,7 +183,7 @@ def _show_add_route_dialog(session_factory) -> None:
         )
 
     # ── Price + interval ───────────────────────────────────────────────
-    c5, c6 = st.columns(2)
+    c5, c6, c7 = st.columns(3)
     with c5:
         target_price = st.number_input(
             "目标价格 (¥)",
@@ -198,6 +199,13 @@ def _show_add_route_dialog(session_factory) -> None:
             options=[1, 2, 3, 4, 6, 8, 12, 24],
             value=6,
             key="dlg_interval",
+        )
+    with c7:
+        max_results_per_route = st.slider(
+            "每平台采集上限",
+            min_value=5, max_value=100, step=5, value=20,
+            key="dlg_max_results",
+            help="每次采集最多保留的航班条数（5~100）",
         )
 
     # ── Time-window filters ────────────────────────────────────────────
@@ -292,6 +300,7 @@ def _show_add_route_dialog(session_factory) -> None:
                         dep_time_to=dep_time_to,
                         arr_time_from=arr_time_from,
                         arr_time_to=arr_time_to,
+                        max_results=max_results_per_route,
                     )
                     st.session_state["new_route_id"] = route.id
                     st.rerun()
@@ -573,7 +582,7 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
-    _, hd_btn_add, hd_btn_cookie = st.columns([7, 2, 1])
+    _, hd_btn_add, hd_btn_cookie = st.columns([8, 2, 1])
     with hd_btn_add:
         if st.button("＋ 添加监控", type="primary", use_container_width=True):
             _show_add_route_dialog(get_session_local())

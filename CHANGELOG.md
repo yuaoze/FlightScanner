@@ -1,5 +1,109 @@
 # Changelog
 
+## [1.2.0] - 2026-03-26
+
+### Added
+
+- **per-route 采集上限**：`max_results` 从全局设置下沉为每路线独立配置
+  - `Route` 表新增 `max_results INTEGER NOT NULL DEFAULT 20` 列（`_apply_migrations` 幂等迁移）
+  - `RouteWithLatestPrice` / `add_route()` / `get_all_routes()` 全链路透传 `max_results`
+  - `PriceMonitorScheduler.scrape_route()` 在每次采集前将 `route.max_results` 写入对应爬虫实例
+  - `_scrape_oneway()` 每平台上限改为 `getattr(scraper, "max_results", 20)`，删除旧的类变量 `_PER_PLATFORM_LIMIT` 和 `update_per_platform_limit()` 方法
+  - 「添加监控」弹窗新增 **每平台采集上限** 滑块（5~100，步长 5）；删除页头独立的 **⚙️ 采集设置** popover
+
+- **AI 简报自动触发**（`ui/components/ai_brief.py`）：
+  - 缓存键从「路线 ID + 今日日期」改为 **12 小时窗口**（`_12h_window_id()`），每半日自动失效重建
+  - 新增 `_should_auto_trigger()` 函数：满足以下任一条件时无需手动点击、自动生成简报：
+    1. 积累 ≥ 5 批独立采集数据（数据里程碑）
+    2. 当前批次最低价相对历史中位数偏离 ≥ 8%（价格异动）
+  - 不满足自动触发条件时仍保留「✨ 生成 AI 简报」手动按钮（数据积累阶段）
+
+- **`_compute_price_stats()` 鲁棒性改进**（`price_monitor.py`）：
+  - `avg_30d` 由所有历史条目均值改为**各批次最低价的中位数**（`median(_batch_min_prices(history))`），大幅降低偶发特价票对均值的干扰
+  - 新增 `batch_count` 字段，供通知逻辑统计有效批次数
+
+### Fixed
+
+- **去哪儿 wbdflightlist API 数据被丢弃**（`qunar_scraper.py`）：
+  - **根因**：`wbdflightlist` 一次性返回全部 147 条航班，但 DOM 已渲染约 20 个节点（非零），`search_flights()` 直接走 DOM 路径，API 数据被忽略；滚动也无法触发新 API 请求（虚拟列表）
+  - **修复（流程）**：`search_flights()` 在 DOM 解析前优先检测 `wbdflightlist` 捕获，有数据则解析并返回，跳过 DOM 和移动端回退路径
+  - **修复（解析器）**：`_parse_api_responses` wbdflightlist 分支原先从记录顶层读 `flightNo`/`airlineName`/`depTime` 等字段（均为 `None`），改为从 `binfo` 子对象读取；中转航班使用 `binfo1`（起飞段）+ `binfo2`（到达段）
+
+- **携程 batchSearch API 数据全部被丢弃**（`ctrip_scraper.py`）：
+  - **根因 1（过滤器 bug）**：`_parse_itinerary()` 检测 `seatsLeft is None` 即跳过，但 `batchSearch` 接口从不返回 `seatsLeft`（永远为 `None`）——导致 172 × ~15 条价格条目 100% 被过滤；修复为仅在 `seatsLeft == 0`（明确售罄）时才跳过
+  - **根因 2（重复条目）**：原逻辑为每个价格档位（退改签套餐）各创建一条 `FlightPrice`，同一航班产生 7~15 条重复记录；改为每行程仅保留最低 `adultPrice`，每行程输出一条记录
+  - **根因 3（舱位代码）**：`batchSearch` 使用 `cabin` 字段（非 `cabinType`）；新增 `@Y-Y`→经济舱、`@C-C`→商务舱 映射；字段查找顺序改为 `cabin` 优先
+  - **新增 `max_results` 参数**：`CtripScraper.__init__` 新增 `max_results: int = 20`；API 解析后按价格升序截取前 N 条
+  - 修正测试 `test_parse_itinerary_filters_no_seats`：更新断言以反映新的 `seatsLeft=None` 语义（保留而非过滤）
+
+### Test
+
+- Ctrip 测试从 15/18 通过 → **18/18 全部通过**
+- 全套测试（排除 e2e）从 116 通过 → **134 通过**
+
+## [1.1.0] - 2026-03-25
+
+### Added
+
+- **滚动加载（去哪儿桌面端）**：`QunarScraper._parse_flights()` 在首次获取 `.b-airfly` 元素后自动执行滚动循环，持续滚动直至采集到目标数量或连续两次无新元素后停止（最多 8 次滚动）；每次滚动随机等待 1.0~2.0 秒规避反爬
+
+- **最大采集数量配置**：
+  - `Settings.max_results_per_platform`（默认 20，范围 5~100）
+  - `QunarScraper.__init__` 新增 `max_results` 参数
+  - `PriceMonitorScheduler` 读取配置并传递给 QunarScraper，新增 `update_per_platform_limit()` 方法支持运行时动态调整
+  - 仪表板页头新增 **⚙️ 采集设置** popover，包含采集上限滑块（5~100，步长 5），保存到 `session_state` 并即时更新后台调度器及立即采集流程
+
+- **图表视图重设计**：
+  - 删除 `st.tabs` 双视图包装，统一为单一视图 `_render_unified_view`
+  - 过滤面板改为 3 列内联布局（起飞时间 | 到达时间 | 出发/到达机场 multi-select），移除 `st.expander`
+  - 图表类型选择改为 `st.radio` 水平按钮（折线图 / 价格区间），置于过滤面板内
+  - 统计指标精简为 4 个核心指标（历史最低/高、最近采集区间、最低价 vs 目标）
+  - 单程记录表格新增 **时长** 和 **经停** 列；往返表格新增 **去程时长** 列
+  - 飞行时长使用实际 `arrival_date` 避免 +N 天误差；经停数从联程航班号 "/" 计数
+
+- **AI 价格简报**（`src/flightscanner/analyzers/deepseek_analyzer.py` + `ui/components/ai_brief.py`）：
+  - 路线卡片展开后显示「✨ 生成 AI 简报」按钮，点击后按需调用 DeepSeek API
+  - 输出包含：趋势方向、置信度、关键因素、7日预测、建议操作、告警级别
+  - 自动降级逻辑：历史记录 < 7 条 → 规则引擎；无 `DEEPSEEK_API_KEY` → 规则引擎；API 失败（tenacity 3 次重试后）→ 规则引擎
+  - 结果按「路线ID + 今日日期」缓存到 `st.session_state`，每日只生成一次；支持手动 🔄 重新生成
+
+### Changed
+
+- `PriceMonitorScheduler._scrape_oneway()` 每平台上限由类变量 `_PER_PLATFORM_LIMIT = 20` 改为实例变量 `self._per_platform_limit`，与配置联动
+
+## [1.0.5] - 2026-03-23
+
+### Added
+
+- **`arrival_date` 字段全链路支持**：修正跨日/多日航班到达时间标注只能显示 `+1` 的限制
+  - `FlightInfo` 新增可选字段 `arrival_date: Optional[date]`，表示实际到达日期
+  - `flights` 表新增 `arrival_date DATE` 列（`_apply_migrations` 幂等迁移，旧数据库自动补列）
+  - 去哪儿爬虫全路径（wwwsearch API / DOM 解析 / 移动端 API / 通用 API 启发式）均计算并写入 `arrival_date`：
+    - wwwsearch API：直接读取末段 `arrDate` 字段（可覆盖 +2、+3 等多日场景）
+    - 其余路径：依据 `departure_date` + HH:MM 比较估算（+1 精度，作为兜底）
+  - `RouteService`：`_find_or_create_flight` 写库时保存 `arrival_date`；`get_route_price_history` 读库时携带 `arrival_date`
+
+### Changed
+
+- **`+N` 到达标记从 `+1` 升级为精确 `+N`**：
+  - `charts.py` 新增 `_day_offset_marker()` 函数，优先使用 `arrival_date − departure_date` 计算天数差，无 `arrival_date` 时降级为 HH:MM 字符串比较（最多 `+1`）
+  - `_build_dataframe` 的 `arr_time` / `ret_arr_time` 列改用 `_day_offset_marker()`
+  - `overview.py` `_fmt_arrival()` 同步升级：新增 `dep_date` / `arrival_date` 可选参数，往返程 caption 行传入完整日期信息
+
+## [1.0.4] - 2026-03-23
+
+### Added
+
+- **最新采集 · 最低10条航班列表**：在每个路线卡片展开后的价格区域新增紧凑表格，汇总所有平台最新批次的前10条最低价记录，显示价格、日期、时间段、航班号、平台来源，取代以往只展示每平台最低价单一指标的局限
+  - 单程路线：表格展示起飞→到达时间（含 `+1` 标记）、航班号、平台
+  - 往返路线：每行同时展示去程和回程的日期、时间段、航班号
+- **跨日到达 `+N` 标记**：当到达时间（HH:MM）早于起飞时间时，自动在到达时间后显示 `+1`，提示次日到达；适用于最低价表格和往返程详情标注行
+
+### Changed
+
+- 往返程最低价详情标注（卡片底部 caption 行）改为展示最新批次中价格最低的航班组合，而非时间戳最新的记录
+- `_render_source_price_summary` 内部重构：复用新抽取的 `_collect_latest_batch_records` 辅助函数，消除与 `_render_top10_latest_flights` 之间的重复批次查找逻辑
+
 ## [1.0.3] - 2026-03-17
 
 ### Fixed
