@@ -673,6 +673,13 @@ class CtripScraper(FlightScraper):
                 if not raw_price:
                     continue
 
+                # ── 含税总价 ──────────────────────────────────────────────────
+                # batchSearch 国际航班：adultPrice = 基础票价，adultTax = 机场税/燃油费；
+                # 国内航班：adultTax = None，adultPrice 已含税。
+                # 需相加才等于携程页面展示的最终价格。
+                adult_tax = price_entry.get("adultTax") or 0
+                raw_price = raw_price + adult_tax
+
                 seats_left = price_entry.get("seatsLeft")
                 # 仅在 seatsLeft 明确为 0 时跳过（已售罄）；
                 # batchSearch API 不返回 seatsLeft，None 表示未知，不应过滤

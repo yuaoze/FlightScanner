@@ -35,6 +35,7 @@
   - **根因 3（舱位代码）**：`batchSearch` 使用 `cabin` 字段（非 `cabinType`）；新增 `@Y-Y`→经济舱、`@C-C`→商务舱 映射；字段查找顺序改为 `cabin` 优先
   - **新增 `max_results` 参数**：`CtripScraper.__init__` 新增 `max_results: int = 20`；API 解析后按价格升序截取前 N 条
   - 修正测试 `test_parse_itinerary_filters_no_seats`：更新断言以反映新的 `seatsLeft=None` 语义（保留而非过滤）
+  - **国际航班含税价格**：`adultTax` 字段（国际航班单独列出的机场税/燃油费）未被加入最终价格，导致国际航班价格比携程页面展示值偏低（如 adultPrice=186 + adultTax=144，实际总价应为 330 而非 186）；修复为 `total = adultPrice + (adultTax or 0)`，国内航班 `adultTax=None` 不受影响
 
 ### Test
 
