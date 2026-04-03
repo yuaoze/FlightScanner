@@ -168,7 +168,7 @@ def render_ai_brief(
         price_history: Historical price records (30-day window).
     """
     cache_key = f"ai_brief_{route.id}_{_12h_window_id()}"
-    st.markdown("#### AI 价格简报")
+    st.markdown('<p class="fs-section-subtitle">AI 价格简报</p>', unsafe_allow_html=True)
 
     if cache_key not in st.session_state:
         should_trigger, reason = _should_auto_trigger(price_history)

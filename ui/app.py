@@ -5,12 +5,16 @@ for adding new monitoring routes.
 """
 
 import asyncio
+import logging
+import sys
 from datetime import date, timedelta
 from decimal import Decimal
+from typing import List, Optional
 
 import streamlit as st
 
 from flightscanner.core.services import RouteService
+from flightscanner.interfaces import FlightPrice, SearchParams
 from flightscanner.utils.city_codes import (
     ALL_CITIES_LIST,
     DOMESTIC_AIRPORT_MAP,
@@ -19,6 +23,17 @@ from flightscanner.utils.city_codes import (
 from ui.utils.db import get_session, get_session_local
 from ui.components.overview import render_overview_cards, render_route_list
 from ui.components.cookie_manager import render_cookie_manager_dialog
+
+
+# ── 日志配置：将 flightscanner 包的所有日志输出到终端 ────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,  # 覆盖 Streamlit 内部可能已设置的 root handler
+)
+# 爬虫模块调试时可临时改为 DEBUG
+logging.getLogger("flightscanner").setLevel(logging.INFO)
 
 
 # ── Background scheduler singleton ────────────────────────────────────────────
@@ -312,6 +327,375 @@ def _show_add_route_dialog(session_factory) -> None:
                 st.error(f"添加失败：{exc}")
 
 
+# ── Pinned-flight dialog helpers ───────────────────────────────────────────────
+
+def _clear_pf_dlg_state() -> None:
+    """清除精准航班弹窗相关的所有 session_state 键。"""
+    for key in list(st.session_state.keys()):
+        if key.startswith("_pf_"):
+            del st.session_state[key]
+
+
+def _search_flights_for_pinned(
+    origin: str,
+    destination: str,
+    dep_date: date,
+) -> List[FlightPrice]:
+    """在弹窗内执行同步航班搜索，返回 FlightPrice 列表。
+
+    使用 max_results=100 确保能覆盖大部分航班，方便用户从列表中选择目标航班。
+
+    Args:
+        origin: 出发城市。
+        destination: 目的地城市。
+        dep_date: 出发日期。
+
+    Returns:
+        搜索到的 FlightPrice 列表（按价格升序）。
+    """
+    from flightscanner.scheduler.price_monitor import PriceMonitorScheduler
+    from flightscanner.utils.config import settings
+
+    monitor = PriceMonitorScheduler(headless=settings.scraper_headless, enable_notifications=False)
+    for scraper in monitor.scrapers:
+        if hasattr(scraper, "max_results"):
+            scraper.max_results = 100
+
+    async def _run() -> List[FlightPrice]:
+        try:
+            params = SearchParams(
+                departure_city=origin,
+                arrival_city=destination,
+                departure_date=dep_date,
+                return_date=None,
+            )
+            return await monitor._scrape_all_platforms(params)
+        finally:
+            for scraper in monitor.scrapers:
+                await scraper.close()
+
+    return asyncio.run(_run())
+
+
+def _format_flight_option(flight_no: str, fp: "FlightPrice") -> str:
+    """Build a human-readable selectbox option string for a flight.
+
+    Format:  {flight_no}  {airline}  {dep_time}→{arr_time}[+N]  ¥{price:.0f}{stops}  [{source}]
+
+    Examples:
+        CA4509  国航  08:30→11:00  ¥480  [qunar]
+        CA953/MU5185  国航  07:00→15:30+1  ¥380  经停1次  [ctrip]
+    """
+    fi = fp.flight_info
+    arr_time = fi.arrival_time or ""
+
+    # 跨日标记（+1, +2…）
+    overnight = ""
+    if fi.arrival_date and fi.departure_date and fi.arrival_date > fi.departure_date:
+        delta = (fi.arrival_date - fi.departure_date).days
+        overnight = f"+{delta}"
+
+    # 中转标记
+    stops_str = ""
+    stop_count = flight_no.count("/")
+    if stop_count > 0:
+        stops_str = f"  经停{stop_count}次"
+
+    return (
+        f"{flight_no}  {fi.airline}  {fi.departure_time}→{arr_time}{overnight}"
+        f"  ¥{float(fp.price):.0f}{stops_str}  [{fp.source}]"
+    )
+
+
+@st.dialog("🎯 精准航班监控", width="large")
+def _show_add_pinned_flight_dialog(session_factory) -> None:
+    """多步弹窗：添加精准航班号监控路线。
+
+    Step 0 — 填写城市/日期，选择「搜索选择」或「手动输入」模式。
+    Step 1 — 搜索模式显示航班列表供选择；手动模式直接输入航班号。
+             两种模式均支持选择舱位。
+    Step 2 — 设置目标价格和采集间隔，确认添加。
+
+    Args:
+        session_factory: SQLAlchemy SessionLocal factory。
+    """
+    today = date.today()
+    max_date = today + timedelta(days=365)
+    step = st.session_state.get("_pf_step", 0)
+
+    # ── STEP 0: Cities + dates + mode ─────────────────────────────────────
+    if step == 0:
+        st.markdown("##### 第 1 步：填写路线与选择方式")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            origin = st.selectbox(
+                "出发城市", [""] + ALL_CITIES_LIST, index=0, key="_pf_origin_sel",
+                help="输入城市名可快速筛选",
+            )
+        with c2:
+            dest = st.selectbox(
+                "目的地", [""] + ALL_CITIES_LIST, index=0, key="_pf_dest_sel",
+                help="输入城市名可快速筛选",
+            )
+
+        c3, c4 = st.columns(2)
+        with c3:
+            dep_date = st.date_input(
+                "出发日期", min_value=today, max_value=max_date, key="_pf_dep_date_input",
+            )
+        with c4:
+            ret_date = st.date_input(
+                "返程日期（留空则为单程）", value=None,
+                min_value=dep_date + timedelta(days=1) if dep_date else today,
+                max_value=max_date, key="_pf_ret_date_input",
+            )
+
+        st.markdown("**航班选择方式**")
+        mode_label = st.radio(
+            "航班选择方式",
+            ["🔍 搜索选择（推荐）", "✏️ 手动输入航班号"],
+            key="_pf_mode_radio",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+        if origin and dest:
+            trip = "往返" if ret_date else "单程"
+            flag = "🌐 国际航班" if is_international_route(origin, dest) else "🏠 国内航班"
+            st.caption(f"{flag}　·　{trip}")
+
+        st.divider()
+        _, col_cancel, col_next = st.columns([4, 2, 2])
+        with col_cancel:
+            if st.button("取消", use_container_width=True, key="pf_cancel0"):
+                _clear_pf_dlg_state()
+                st.rerun()
+        with col_next:
+            is_search = "搜索" in mode_label
+            btn_label = "搜索航班" if is_search else "下一步"
+            if st.button(btn_label, type="primary", use_container_width=True, key="pf_next0"):
+                if not origin or not dest:
+                    st.error("请填写出发城市和目的地。")
+                    return
+                if origin == dest:
+                    st.error("出发地和目的地不能相同。")
+                    return
+
+                st.session_state["_pf_origin"] = origin
+                st.session_state["_pf_dest"] = dest
+                st.session_state["_pf_dep_date"] = dep_date
+                st.session_state["_pf_ret_date"] = ret_date
+                st.session_state["_pf_trip_type"] = "roundtrip" if ret_date else "oneway"
+                st.session_state["_pf_mode"] = "search" if is_search else "manual"
+
+                if is_search:
+                    with st.spinner(f"正在搜索 {origin} → {dest} 的航班…"):
+                        try:
+                            results = _search_flights_for_pinned(origin, dest, dep_date)
+                            st.session_state["_pf_search_results"] = results
+                            if ret_date:
+                                ret_results = _search_flights_for_pinned(dest, origin, ret_date)
+                                st.session_state["_pf_ret_search_results"] = ret_results
+                        except Exception as exc:
+                            st.error(f"搜索失败：{exc}")
+                            return
+
+                st.session_state["_pf_step"] = 1
+                st.rerun(scope="fragment")
+
+    # ── STEP 1: Flight selection or manual input ───────────────────────────
+    elif step == 1:
+        origin = st.session_state.get("_pf_origin", "")
+        dest = st.session_state.get("_pf_dest", "")
+        dep_date = st.session_state.get("_pf_dep_date")
+        ret_date = st.session_state.get("_pf_ret_date")
+        trip_type = st.session_state.get("_pf_trip_type", "oneway")
+        mode = st.session_state.get("_pf_mode", "manual")
+
+        trip_label = "（往返）" if trip_type == "roundtrip" else "（单程）"
+        st.markdown(f"##### 第 2 步：选择/输入航班号  {origin} → {dest} {trip_label}")
+
+        if mode == "search":
+            results: List[FlightPrice] = st.session_state.get("_pf_search_results", [])
+            if not results:
+                st.warning("未搜索到航班结果，请直接输入航班号。")
+                # Fall through to manual input below
+                mode = "manual"
+            else:
+                # 跨平台去重：同一航班号保留最低价（不限来源）
+                seen: dict = {}
+                for fp in results:
+                    no = fp.flight_info.flight_no
+                    if no not in seen or fp.price < seen[no].price:
+                        seen[no] = fp
+                options = [
+                    _format_flight_option(no, fp)
+                    for no, fp in sorted(seen.items(), key=lambda x: x[1].price)
+                ]
+
+                st.markdown(f"**去程航班** — {dep_date}")
+                out_sel = st.selectbox("选择去程航班", options, key="_pf_out_sel")
+                if out_sel:
+                    out_no = out_sel.split()[0]
+                    st.session_state["_pf_out_no"] = out_no
+                    fp_ref = seen.get(out_no)
+                    if fp_ref:
+                        st.session_state["_pf_out_dep_time"] = fp_ref.flight_info.departure_time
+
+                if trip_type == "roundtrip":
+                    ret_results: List[FlightPrice] = st.session_state.get("_pf_ret_search_results", [])
+                    ret_seen: dict = {}
+                    for fp in ret_results:
+                        no = fp.flight_info.flight_no
+                        if no not in ret_seen or fp.price < ret_seen[no].price:
+                            ret_seen[no] = fp
+
+                    if ret_seen:
+                        ret_options = [
+                            _format_flight_option(no, fp)
+                            for no, fp in sorted(ret_seen.items(), key=lambda x: x[1].price)
+                        ]
+                        st.markdown(f"**回程航班** — {ret_date}")
+                        in_sel = st.selectbox("选择回程航班", ret_options, key="_pf_in_sel")
+                        if in_sel:
+                            in_no = in_sel.split()[0]
+                            st.session_state["_pf_in_no"] = in_no
+                            fp_ref = ret_seen.get(in_no)
+                            if fp_ref:
+                                st.session_state["_pf_in_dep_time"] = fp_ref.flight_info.departure_time
+                    else:
+                        st.warning("未找到回程航班，请手动输入回程航班号。")
+                        in_manual = st.text_input(
+                            "回程航班号（如 CA954）", key="_pf_in_no_fallback",
+                            value=st.session_state.get("_pf_in_no", ""),
+                        )
+                        if in_manual:
+                            st.session_state["_pf_in_no"] = in_manual.upper().strip()
+
+        if mode == "manual":
+            out_manual = st.text_input(
+                "去程航班号（如 CA953）",
+                key="_pf_out_no_manual",
+                value=st.session_state.get("_pf_out_no", ""),
+                help="英文大写字母 + 数字，如 CA953、MU5185",
+            )
+            if out_manual:
+                st.session_state["_pf_out_no"] = out_manual.upper().strip()
+
+            if trip_type == "roundtrip":
+                in_manual = st.text_input(
+                    "回程航班号（如 CA954）",
+                    key="_pf_in_no_manual",
+                    value=st.session_state.get("_pf_in_no", ""),
+                )
+                if in_manual:
+                    st.session_state["_pf_in_no"] = in_manual.upper().strip()
+
+        # Cabin class (shown for both modes)
+        st.markdown("**舱位筛选**（可选）")
+        cabin_opts = ["不限（任意舱位）", "经济舱", "商务舱", "头等舱"]
+        cabin_sel = st.selectbox("舱位", cabin_opts, key="_pf_cabin_sel")
+        st.session_state["_pf_seat_class"] = None if cabin_sel == "不限（任意舱位）" else cabin_sel
+
+        st.divider()
+        col_back, _, col_next = st.columns([1, 3, 1])
+        with col_back:
+            if st.button("← 返回", use_container_width=True, key="pf_back1"):
+                st.session_state["_pf_step"] = 0
+                st.rerun(scope="fragment")
+        with col_next:
+            if st.button("下一步 →", type="primary", use_container_width=True, key="pf_next1"):
+                if not st.session_state.get("_pf_out_no"):
+                    st.error("请输入或选择去程航班号。")
+                    return
+                st.session_state["_pf_step"] = 2
+                st.rerun(scope="fragment")
+
+    # ── STEP 2: Target price + interval ───────────────────────────────────
+    elif step == 2:
+        origin = st.session_state.get("_pf_origin", "")
+        dest = st.session_state.get("_pf_dest", "")
+        dep_date = st.session_state.get("_pf_dep_date")
+        ret_date = st.session_state.get("_pf_ret_date")
+        trip_type = st.session_state.get("_pf_trip_type", "oneway")
+        out_no = st.session_state.get("_pf_out_no", "")
+        in_no = st.session_state.get("_pf_in_no", "")
+        seat_class = st.session_state.get("_pf_seat_class")
+        out_dep_time = st.session_state.get("_pf_out_dep_time")
+        in_dep_time = st.session_state.get("_pf_in_dep_time")
+
+        st.markdown("##### 第 3 步：设置目标价格")
+        st.markdown(f"**{origin} → {dest}**  ·  {dep_date}"
+                    + (f" ↔ {ret_date}" if trip_type == "roundtrip" else ""))
+        out_time_hint = f"  起飞参考 {out_dep_time}" if out_dep_time else ""
+        in_time_hint = (f"  回程 {in_no}  起飞参考 {in_dep_time}" if in_dep_time
+                        else (f"  回程 {in_no}" if in_no else ""))
+        st.caption(
+            f"🎯 去程 **{out_no}**{out_time_hint}"
+            + in_time_hint
+            + (f"　舱位：{seat_class}" if seat_class else "")
+        )
+        st.divider()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            target_price = st.number_input(
+                "目标价格 (¥)", min_value=100, max_value=50000,
+                value=800, step=50, key="_pf_target_price",
+            )
+        with c2:
+            scrape_interval = st.select_slider(
+                "采集间隔（小时）",
+                options=[1, 2, 3, 4, 6, 8, 12, 24], value=6,
+                key="_pf_interval",
+            )
+        with c3:
+            max_results_val = st.slider(
+                "采集上限",
+                min_value=20, max_value=200, step=20, value=100,
+                key="_pf_max_results",
+                help="每次搜索最多获取的结果数（越高找到目标航班的概率越大）",
+            )
+
+        col_back, _, col_submit = st.columns([1, 3, 1])
+        with col_back:
+            if st.button("← 返回", use_container_width=True, key="pf_back2"):
+                st.session_state["_pf_step"] = 1
+                st.rerun(scope="fragment")
+        with col_submit:
+            if st.button("开始精准监控", type="primary", use_container_width=True, key="pf_submit"):
+                try:
+                    session = session_factory()
+                    try:
+                        svc = RouteService(session)
+                        route = svc.add_route(
+                            origin=origin,
+                            destination=dest,
+                            target_date=dep_date,
+                            target_price=Decimal(str(target_price)),
+                            scrape_interval=scrape_interval,
+                            return_date=ret_date,
+                            trip_type=trip_type,
+                            max_results=max_results_val,
+                            monitoring_mode="flight",
+                            outbound_flight_no=out_no or None,
+                            inbound_flight_no=in_no or None,
+                            pinned_seat_class=seat_class,
+                            outbound_dep_time_ref=out_dep_time or None,
+                            inbound_dep_time_ref=in_dep_time or None,
+                        )
+                        st.session_state["new_route_id"] = route.id
+                        _clear_pf_dlg_state()
+                        st.rerun()
+                    finally:
+                        session.close()
+                except ValueError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"添加失败：{exc}")
+
+
 # ── CSS injection ──────────────────────────────────────────────────────────────
 
 def _inject_css() -> None:
@@ -320,7 +704,10 @@ def _inject_css() -> None:
         """
         <style>
         /* ── Global ────────────────────────────────────────────────── */
-        .stApp { background: #eef2f7; }
+        .stApp {
+            background  : #f3f4f8;
+            font-family : -apple-system, 'Helvetica Neue', 'Inter', system-ui, sans-serif;
+        }
         #MainMenu, footer { visibility: hidden; }
         .stDeployButton,
         [data-testid="stToolbar"],
@@ -374,42 +761,43 @@ def _inject_css() -> None:
         }
         .fs-stat-card {
             background   : white;
-            border-radius: 18px;
-            padding      : 1.5rem 1.75rem 1.25rem;
-            border       : 1px solid #e8edf2;
-            box-shadow   : 0 2px 10px rgba(15,23,42,0.05);
+            border-radius: 14px;
+            padding      : 1.1rem 1.4rem 1rem;
+            border       : 1px solid #eaedf2;
+            box-shadow   : 0 1px 3px rgba(0,0,0,0.05);
             position     : relative;
             overflow     : hidden;
             transition   : box-shadow 0.2s ease, transform 0.2s ease;
         }
         .fs-stat-card:hover {
-            box-shadow: 0 6px 20px rgba(15,23,42,0.10);
-            transform : translateY(-3px);
+            box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+            transform : translateY(-2px);
         }
         .fs-stat-card::before {
             content      : '';
             position     : absolute;
-            left: 0; top: 0; bottom: 0;
-            width        : 5px;
-            border-radius: 18px 0 0 18px;
+            top: 0; left: 0; right: 0; bottom: auto;
+            height       : 3px;
+            width        : auto;
+            border-radius: 14px 14px 0 0;
         }
-        .fs-stat-card.blue::before   { background: linear-gradient(180deg,#60a5fa,#3b82f6); }
-        .fs-stat-card.green::before  { background: linear-gradient(180deg,#34d399,#10b981); }
-        .fs-stat-card.amber::before  { background: linear-gradient(180deg,#fcd34d,#f59e0b); }
-        .fs-stat-card.purple::before { background: linear-gradient(180deg,#a78bfa,#8b5cf6); }
-        .fs-stat-icon  { font-size:1.5rem; display:block; margin-bottom:0.5rem; line-height:1; }
+        .fs-stat-card.blue::before   { background: linear-gradient(90deg,#60a5fa,#3d7ff5); }
+        .fs-stat-card.green::before  { background: linear-gradient(90deg,#34d399,#12b76a); }
+        .fs-stat-card.amber::before  { background: linear-gradient(90deg,#fcd34d,#f59e0b); }
+        .fs-stat-card.purple::before { background: linear-gradient(90deg,#a78bfa,#8b5cf6); }
         .fs-stat-value {
-            font-size     : 2.5rem;
-            font-weight   : 900;
-            color         : #0f172a;
+            font-size     : 2.1rem;
+            font-weight   : 800;
+            color         : #18191c;
             line-height   : 1;
-            letter-spacing: -0.04em;
+            letter-spacing: -0.03em;
             margin-bottom : 0.3rem;
+            margin-top    : 0.4rem;
         }
         .fs-stat-label {
             font-size     : 0.70rem;
             font-weight   : 700;
-            color         : #94a3b8;
+            color         : #9ca5b4;
             text-transform: uppercase;
             letter-spacing: 0.08em;
         }
@@ -424,46 +812,105 @@ def _inject_css() -> None:
         .fs-section-title {
             font-size     : 0.68rem;
             font-weight   : 700;
-            color         : #94a3b8;
+            color         : #9ca5b4;
             text-transform: uppercase;
             letter-spacing: 0.10em;
             white-space   : nowrap;
         }
-        .fs-section-line  { flex:1; height:1px; background:#e2e8f0; }
-        .fs-section-count { font-size:0.72rem; color:#94a3b8; white-space:nowrap; }
+        .fs-section-line  { flex:1; height:1px; background:#eaedf2; }
+        .fs-section-count { font-size:0.72rem; color:#9ca5b4; white-space:nowrap; }
 
         /* ── Route cards (expanders) ────────────────────────────────── */
         [data-testid="stExpander"] {
             background   : white;
-            border-radius: 18px;
-            border       : 1px solid #e8edf2 !important;
-            box-shadow   : 0 2px 10px rgba(15,23,42,0.05);
-            margin-bottom: 0.75rem;
+            border-radius: 14px;
+            border       : 1px solid #eaedf2 !important;
+            box-shadow   : 0 1px 4px rgba(0,0,0,0.05);
+            margin-bottom: 0.625rem;
             overflow     : hidden;
             transition   : box-shadow 0.2s ease;
         }
         [data-testid="stExpander"]:hover {
-            box-shadow: 0 5px 20px rgba(15,23,42,0.09);
+            box-shadow: 0 4px 14px rgba(0,0,0,0.08);
         }
         [data-testid="stExpander"] > details > summary {
-            padding    : 1.05rem 1.5rem;
+            padding    : 0.9rem 1.4rem;
             font-size  : 0.875rem;
             font-weight: 500;
-            color      : #1e293b;
+            color      : #18191c;
         }
         [data-testid="stExpander"] > details > summary:hover {
-            background: #fafcff;
+            background: #f8f9fb;
         }
         [data-testid="stExpander"] > details[open] > summary {
-            background   : #fafcff;
-            border-bottom: 1px solid #f1f5f9;
+            background   : #f8f9fb;
+            border-bottom: 1px solid #eaedf2;
+        }
+
+        /* ── Metadata chips ─────────────────────────────────────────── */
+        .fs-meta-row {
+            display  : flex;
+            flex-wrap: wrap;
+            gap      : 5px;
+            margin   : 0.3rem 0 0.5rem;
+        }
+        .fs-chip {
+            background   : #f4f5f7;
+            color        : #6e7788;
+            border-radius: 6px;
+            padding      : 2px 8px;
+            font-size    : 0.73rem;
+            font-weight  : 500;
+        }
+        .fs-chip-accent {
+            background   : #eff4ff;
+            color        : #3d7ff5;
+            border-radius: 6px;
+            padding      : 2px 8px;
+            font-size    : 0.73rem;
+            font-weight  : 600;
+        }
+
+        /* ── Platform price row ─────────────────────────────────────── */
+        .fs-price-row {
+            display    : flex;
+            gap        : 2rem;
+            margin     : 0.6rem 0;
+            align-items: flex-end;
+        }
+        .fs-price-source  { display: flex; flex-direction: column; gap: 2px; }
+        .fs-source-label {
+            font-size     : 0.66rem;
+            font-weight   : 700;
+            color         : #9ca5b4;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+        }
+        .fs-price-val {
+            font-size     : 1.6rem;
+            font-weight   : 800;
+            color         : #18191c;
+            letter-spacing: -0.03em;
+            line-height   : 1;
+        }
+        .fs-price-delta-down { font-size:0.72rem; font-weight:600; color:#12b76a; }
+        .fs-price-delta-up   { font-size:0.72rem; font-weight:600; color:#ef4444; }
+
+        /* ── Section subtitle ───────────────────────────────────────── */
+        .fs-section-subtitle {
+            font-size     : 0.72rem;
+            font-weight   : 700;
+            color         : #9ca5b4;
+            text-transform: uppercase;
+            letter-spacing: 0.10em;
+            margin        : 1rem 0 0.5rem;
         }
 
         /* ── Price progress bar ─────────────────────────────────────── */
         .fs-price-bar-wrap {
-            background   : #f1f5f9;
+            background   : #edf0f4;
             border-radius: 99px;
-            height       : 6px;
+            height       : 5px;
             overflow     : hidden;
             margin       : 0.35rem 0 0;
         }
@@ -476,75 +923,186 @@ def _inject_css() -> None:
             display        : flex;
             justify-content: space-between;
             font-size      : 0.72rem;
-            color          : #94a3b8;
+            color          : #9ca5b4;
             margin-top     : 0.25rem;
         }
 
         /* ── Metric tiles (inside expanders) ────────────────────────── */
         [data-testid="stMetric"] {
-            background   : #f8fafc;
-            border-radius: 14px;
-            padding      : 1rem 1.25rem;
-            border       : 1px solid #e8edf2;
+            background   : #f8f9fb;
+            border-radius: 12px;
+            padding      : 0.75rem 1rem;
+            border       : 1px solid #eaedf2;
         }
         [data-testid="stMetricValue"] > div {
-            font-size  : 1.75rem !important;
-            font-weight: 800     !important;
-            color      : #0f172a !important;
+            font-size  : 1.5rem !important;
+            font-weight: 800    !important;
+            color      : #18191c !important;
         }
         [data-testid="stMetricLabel"] > div {
             font-size     : 0.70rem  !important;
             font-weight   : 700      !important;
-            color         : #94a3b8  !important;
+            color         : #9ca5b4  !important;
             text-transform: uppercase !important;
             letter-spacing: 0.06em   !important;
         }
 
         /* ── Primary button ─────────────────────────────────────────── */
         button[data-testid="baseButton-primary"] {
-            background    : linear-gradient(135deg,#3b82f6,#2563eb) !important;
+            background    : linear-gradient(135deg,#3d7ff5,#2563eb) !important;
             border        : none    !important;
-            border-radius : 12px    !important;
+            border-radius : 10px    !important;
             font-weight   : 600     !important;
             letter-spacing: 0.01em  !important;
-            box-shadow    : 0 2px 10px rgba(37,99,235,0.25) !important;
+            box-shadow    : 0 2px 8px rgba(37,99,235,0.22) !important;
             transition    : all 0.2s !important;
         }
         button[data-testid="baseButton-primary"]:hover {
             background: linear-gradient(135deg,#2563eb,#1d4ed8) !important;
-            box-shadow: 0 4px 18px rgba(37,99,235,0.40) !important;
+            box-shadow: 0 4px 18px rgba(37,99,235,0.36) !important;
             transform : translateY(-1px) !important;
         }
 
         /* ── Secondary / default buttons ────────────────────────────── */
         button[data-testid="baseButton-secondary"] {
             background   : white            !important;
-            border       : 1px solid #e2e8f0 !important;
-            border-radius: 9px              !important;
-            color        : #475569          !important;
+            border       : 1px solid #eaedf2 !important;
+            border-radius: 8px              !important;
+            color        : #6e7788          !important;
             font-size    : 0.85rem          !important;
             transition   : all 0.15s        !important;
         }
         button[data-testid="baseButton-secondary"]:hover {
-            background  : #f8fafc !important;
-            border-color: #94a3b8 !important;
+            background  : #f8f9fb !important;
+            border-color: #9ca5b4 !important;
         }
 
         /* ── Divider ─────────────────────────────────────────────────── */
-        hr { border-color: #e2e8f0 !important; margin: 1.25rem 0 !important; }
+        hr { border-color: #eaedf2 !important; margin: 1.25rem 0 !important; }
 
         /* ── Caption ─────────────────────────────────────────────────── */
         [data-testid="stCaptionContainer"] p {
-            color    : #94a3b8 !important;
+            color    : #9ca5b4 !important;
             font-size: 0.78rem !important;
         }
 
         /* ── Alert boxes ─────────────────────────────────────────────── */
         [data-testid="stAlert"] { border-radius: 12px !important; }
+
+        /* ── History entry card (主页底部入口) ──────────────────────── */
+        .fs-history-entry {
+            background   : white;
+            border-radius: 14px;
+            border       : 1px solid #eaedf2;
+            box-shadow   : 0 1px 3px rgba(0,0,0,0.05);
+            padding      : 1rem 1.4rem;
+            display      : flex;
+            align-items  : center;
+            gap          : 0.75rem;
+            margin-top   : 0.5rem;
+            transition   : box-shadow 0.2s ease;
+        }
+        .fs-history-entry:hover { box-shadow: 0 4px 14px rgba(0,0,0,0.08); }
+
+        /* ── History page header strip (历史页顶部) ─────────────────── */
+        .fs-history-header {
+            background      : white;
+            border-radius   : 14px;
+            border          : 1px solid #eaedf2;
+            box-shadow      : 0 1px 3px rgba(0,0,0,0.05);
+            padding         : 1.1rem 1.4rem;
+            display         : flex;
+            align-items     : center;
+            justify-content : space-between;
+            margin-bottom   : 0.75rem;
+        }
+        .fs-history-header-title {
+            font-size     : 1.1rem;
+            font-weight   : 800;
+            color         : #18191c;
+            letter-spacing: -0.02em;
+        }
+        .fs-history-header-sub {
+            font-size : 0.78rem;
+            color     : #9ca5b4;
+            margin-top: 0.15rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+# ── History helpers ────────────────────────────────────────────────────────────
+
+def _render_history_entry(historical_routes: List) -> None:
+    """主页底部历史监控入口卡片。"""
+    if not historical_routes:
+        return
+    n = len(historical_routes)
+
+    # 分隔线
+    st.markdown(
+        """
+        <div class="fs-section-header" style="margin-top:1.75rem;">
+            <span class="fs-section-title">历史记录</span>
+            <div class="fs-section-line"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # 入口卡片（左：图标+文字；右：按钮）
+    col_info, col_btn = st.columns([7, 2])
+    with col_info:
+        st.markdown(
+            f'<div class="fs-history-entry">'
+            f'<span style="font-size:1.3rem;">🕐</span>'
+            f'<div>'
+            f'<div style="font-size:0.875rem;font-weight:700;color:#18191c;">历史监控</div>'
+            f'<div style="font-size:0.75rem;color:#9ca5b4;">{n} 条出行日期已过期的监控路线</div>'
+            f'</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with col_btn:
+        if st.button(
+            "查看历史 →",
+            key="btn_view_history",
+            use_container_width=True,
+            help="查看所有出行日期已过期的历史监控路线",
+        ):
+            st.session_state["_page"] = "history"
+            st.rerun()
+
+
+def _render_history_page(
+    historical_routes: List,
+    route_service: RouteService,
+) -> None:
+    """历史监控页：轻量 header + 路线卡片列表。"""
+    n = len(historical_routes)
+
+    # 顶部：返回按钮 + header 条
+    col_back, col_header = st.columns([2, 7])
+    with col_back:
+        if st.button("← 返回主页", key="btn_back_history"):
+            st.session_state["_page"] = "main"
+            st.rerun()
+    with col_header:
+        st.markdown(
+            f'<div class="fs-history-header">'
+            f'<div>'
+            f'<div class="fs-history-header-title">🕐 历史监控</div>'
+            f'<div class="fs-history-header-sub">出行日期已过期的监控路线</div>'
+            f'</div>'
+            f'<span class="fs-chip">{n} 条记录</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # 路线列表（复用现有组件）
+    render_route_list(historical_routes, route_service)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -560,6 +1118,11 @@ def main() -> None:
     _inject_css()
     _get_monitor()
 
+    # ── Page state init ─────────────────────────────────────────────────
+    if "_page" not in st.session_state:
+        st.session_state["_page"] = "main"
+    current_page = st.session_state["_page"]
+
     # ── Register newly added route with background scheduler ───────────
     if "new_route_id" in st.session_state:
         new_route_id: int = st.session_state.pop("new_route_id")
@@ -570,40 +1133,41 @@ def main() -> None:
                 session.expunge(new_route)
                 _get_monitor().register_new_route(new_route)
 
-    # ── Page header ────────────────────────────────────────────────────
-    st.markdown(
-        """
-        <div class="fs-header">
-            <div class="fs-header-left">
-                <div class="fs-header-title">✈️ FlightScanner</div>
-                <div class="fs-header-sub">实时航班价格监控 · 智能低价提醒</div>
+    # ── 主页 header（仅主页显示） ─────────────────────────────────────
+    if current_page == "main":
+        st.markdown(
+            """
+            <div class="fs-header">
+                <div class="fs-header-left">
+                    <div class="fs-header-title">✈️ FlightScanner</div>
+                    <div class="fs-header-sub">实时航班价格监控 · 智能低价提醒</div>
+                </div>
             </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    _, hd_btn_add, hd_btn_cookie = st.columns([8, 2, 1])
-    with hd_btn_add:
-        if st.button("＋ 添加监控", type="primary", use_container_width=True):
-            _show_add_route_dialog(get_session_local())
-    with hd_btn_cookie:
-        if st.button("🔑", help="Cookie 管理", use_container_width=True):
-            render_cookie_manager_dialog()
-
-    # ── Flash message from previous scrape ─────────────────────────────
-    if "_flash" in st.session_state:
-        level, msg = st.session_state.pop("_flash")
-        if level == "success":
-            st.success(msg)
-        else:
-            st.error(msg)
+            """,
+            unsafe_allow_html=True,
+        )
+        _, hd_btn_add, hd_btn_pinned, hd_btn_cookie = st.columns([6, 2, 2, 1])
+        with hd_btn_add:
+            if st.button("＋ 添加监控", type="primary", use_container_width=True):
+                _show_add_route_dialog(get_session_local())
+        with hd_btn_pinned:
+            if st.button("🎯 精准监控", use_container_width=True,
+                         help="按航班号精准追踪指定航班的价格动态"):
+                _show_add_pinned_flight_dialog(get_session_local())
+        with hd_btn_cookie:
+            if st.button("🔑", help="Cookie 管理", use_container_width=True):
+                render_cookie_manager_dialog()
 
     # ── Dashboard data ─────────────────────────────────────────────────
     with get_session() as session:
         svc = RouteService(session)
         routes = svc.get_all_routes()
 
-        # Drain any pending immediate-scrape triggers
+        today = date.today()
+        upcoming_routes   = [r for r in routes if r.target_date >= today]
+        historical_routes = [r for r in routes if r.target_date <  today]
+
+        # Drain any pending immediate-scrape triggers（遍历全量，历史页也能触发）
         scrape_ran = False
         for route in routes:
             key = f"trigger_scrape_{route.id}"
@@ -616,8 +1180,21 @@ def main() -> None:
         if scrape_ran:
             st.rerun()
 
-        render_overview_cards(routes)
-        render_route_list(routes, svc)
+        # Flash message from previous scrape
+        if "_flash" in st.session_state:
+            level, msg = st.session_state.pop("_flash")
+            if level == "success":
+                st.success(msg)
+            else:
+                st.error(msg)
+
+        # ── 路由分发 ────────────────────────────────────────────────────
+        if current_page == "history":
+            _render_history_page(historical_routes, svc)
+        else:
+            render_overview_cards(routes)            # 统计卡片：全量路线
+            render_route_list(upcoming_routes, svc)  # 路线列表：仅未来路线
+            _render_history_entry(historical_routes) # 底部历史入口
 
 
 if __name__ == "__main__":

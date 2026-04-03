@@ -652,17 +652,24 @@ class CtripScraper(FlightScraper):
 
         for price_entry in price_list:
             try:
+                # price_is_total=True 表示 raw_price 已是含税总价，不应再加 adultTax
+                price_is_total = False
                 if is_roundtrip:
-                    raw_price = (
-                        price_entry.get("roundTripPrice")
-                        or price_entry.get("twowayPrice")
-                        or price_entry.get("totalAdultPrice")
-                        or price_entry.get("roundPrice")
-                        or price_entry.get("adultPrice")
-                        or price_entry.get("price")
-                        or price_entry.get("salePrice")
-                        or 0
-                    )
+                    # 优先使用明确为"总价"的字段；这些字段通常已含税，不应再叠加 adultTax
+                    for field in ("roundTripPrice", "twowayPrice", "totalAdultPrice", "roundPrice"):
+                        v = price_entry.get(field)
+                        if v:
+                            raw_price = v
+                            price_is_total = True
+                            break
+                    else:
+                        # 降级为 adultPrice（基础票价，需叠加 adultTax）
+                        raw_price = (
+                            price_entry.get("adultPrice")
+                            or price_entry.get("price")
+                            or price_entry.get("salePrice")
+                            or 0
+                        )
                 else:
                     raw_price = (
                         price_entry.get("adultPrice")
@@ -676,9 +683,11 @@ class CtripScraper(FlightScraper):
                 # ── 含税总价 ──────────────────────────────────────────────────
                 # batchSearch 国际航班：adultPrice = 基础票价，adultTax = 机场税/燃油费；
                 # 国内航班：adultTax = None，adultPrice 已含税。
-                # 需相加才等于携程页面展示的最终价格。
-                adult_tax = price_entry.get("adultTax") or 0
-                raw_price = raw_price + adult_tax
+                # 若 raw_price 来自 roundTripPrice 等"总价"字段则已含税，不再叠加；
+                # 若降级为 adultPrice 则需相加才等于最终价格。
+                if not price_is_total:
+                    adult_tax = price_entry.get("adultTax") or 0
+                    raw_price = raw_price + adult_tax
 
                 seats_left = price_entry.get("seatsLeft")
                 # 仅在 seatsLeft 明确为 0 时跳过（已售罄）；

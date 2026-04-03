@@ -30,6 +30,17 @@ from flightscanner.utils.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _time_diff_minutes(t1: str, t2: str) -> int:
+    """两个 HH:MM 字符串的时间差（绝对值，分钟）。"""
+    def _to_min(t: str) -> int:
+        try:
+            h, m = map(int, t.split(":"))
+            return h * 60 + m
+        except (ValueError, AttributeError):
+            return 0
+    return abs(_to_min(t1) - _to_min(t2))
+
+
 @dataclass
 class NotifyContext:
     """通知上下文，包含触发价格提醒所需的完整信息。"""
@@ -156,6 +167,11 @@ class PriceMonitorScheduler:
         )
 
         try:
+            # ── 精准航班号监控模式 ─────────────────────────────────────────
+            if getattr(route, "monitoring_mode", "route") == "flight":
+                await self._scrape_pinned_flights(route)
+                return
+
             trip_type = getattr(route, "trip_type", "oneway")
 
             params = SearchParams(
@@ -332,6 +348,206 @@ class PriceMonitorScheduler:
 
         return result
 
+    async def _scrape_pinned_flights(self, route: Route) -> None:
+        """精准航班号监控：搜索指定航班，记录价格并更新航班状态。
+
+        对单程：仅搜索去程方向，匹配 outbound_flight_no。
+        对往返：分两次单程搜索，分别匹配去程/回程航班，存库价格为两段之和。
+
+        Args:
+            route: 精准监控路线（monitoring_mode == 'flight'）。
+        """
+        trip_type = getattr(route, "trip_type", "oneway")
+        outbound_no = getattr(route, "outbound_flight_no", None)
+        inbound_no = getattr(route, "inbound_flight_no", None)
+        seat_class = getattr(route, "pinned_seat_class", None)
+
+        if not outbound_no:
+            logger.warning("路线 %s 精准模式未设置 outbound_flight_no，跳过", route.id)
+            return
+
+        # ── 去程搜索（max_results 调高，确保能找到目标航班） ────────────────
+        for scraper in self.scrapers:
+            if hasattr(scraper, "max_results"):
+                scraper.max_results = 100
+
+        out_params = SearchParams(
+            departure_city=route.origin,
+            arrival_city=route.destination,
+            departure_date=route.target_date,
+            return_date=None,
+        )
+        out_prices = await self._scrape_all_platforms(out_params)
+        outbound_fp, out_status = self._match_pinned_flight(out_prices, outbound_no, seat_class)
+
+        # ── 往返程：回程搜索 ──────────────────────────────────────────────
+        inbound_fp: Optional[FlightPrice] = None
+        in_status = "available"
+        if trip_type == "roundtrip" and inbound_no and route.return_date:
+            in_params = SearchParams(
+                departure_city=route.destination,
+                arrival_city=route.origin,
+                departure_date=route.return_date,
+                return_date=None,
+            )
+            in_prices = await self._scrape_all_platforms(in_params)
+            inbound_fp, in_status = self._match_pinned_flight(in_prices, inbound_no, seat_class)
+
+        # ── 确定综合状态并写库 ────────────────────────────────────────────
+        status = self._determine_flight_status(
+            route, outbound_fp, inbound_fp, out_status, in_status, trip_type, inbound_no
+        )
+
+        session = self._SessionLocal()
+        try:
+            route_service = RouteService(session)
+            route_service.update_flight_status(route.id, status)
+        finally:
+            session.close()
+
+        if status in ("not_found", "sold_out"):
+            logger.info(
+                "路线 %s 精准航班 %s 状态：%s，跳过存库",
+                route.id, outbound_no, status,
+            )
+            return
+
+        # ── 组合价格并存库 ────────────────────────────────────────────────
+        if trip_type == "roundtrip" and outbound_fp and inbound_fp:
+            total_price = outbound_fp.price + inbound_fp.price
+            prices_to_save: List[FlightPrice] = [
+                FlightPrice(
+                    flight_info=outbound_fp.flight_info,
+                    price=total_price,
+                    currency=outbound_fp.currency,
+                    seat_class=outbound_fp.seat_class,
+                    available_seats=outbound_fp.available_seats,
+                    scraped_at=outbound_fp.scraped_at,
+                    source=outbound_fp.source,
+                    return_flight_info=inbound_fp.flight_info,
+                )
+            ]
+        elif outbound_fp:
+            prices_to_save = [outbound_fp]
+        else:
+            return
+
+        import hashlib
+        batch_timestamp = datetime.now(timezone.utc).isoformat()
+        batch_hash = hashlib.md5(
+            f"{route.id}_pinned_{batch_timestamp}".encode()
+        ).hexdigest()[:8]
+        batch_id = f"route_{route.id}_{batch_timestamp}_{batch_hash}"
+        for fp in prices_to_save:
+            fp.batch_id = batch_id
+
+        session = self._SessionLocal()
+        try:
+            route_service = RouteService(session)
+            for fp in prices_to_save:
+                route_service.save_price_for_route(route.id, fp)
+            logger.info(
+                "路线 %s 精准航班 %s 已存库（批次 %s）", route.id, outbound_no, batch_id
+            )
+
+            # ── 价格告警（与普通模式相同逻辑） ────────────────────────────
+            history = route_service.get_route_price_history(route.id, days=30)
+            stats = self._compute_price_stats(history)
+            price_count = int(stats.get("batch_count", len(history)))
+            best_fp = min(prices_to_save, key=lambda fp: fp.price)
+            should_notify, reason = self._should_notify(
+                route, best_fp.price, stats, price_count
+            )
+            if should_notify and not self._is_cooldown_active(route, best_fp.price):
+                if self.notifiers and history:
+                    trend = self.analyzer.predict_trend(history, route.target_date)
+                    ctx = self._build_notify_context(route, best_fp, stats, reason, price_count)
+                    message_json = self._build_alert_message_data(ctx)
+                    await self._send_alert(best_fp, trend, message_json)
+                self._update_route_notification_state(route.id, best_fp.price)
+        finally:
+            session.close()
+
+    @staticmethod
+    def _match_pinned_flight(
+        prices: List[FlightPrice],
+        target_flight_no: str,
+        seat_class_filter: Optional[str],
+    ) -> Tuple[Optional[FlightPrice], str]:
+        """从采集结果中匹配目标航班号和舱位，返回 (best_match, status)。
+
+        Status 取值：
+        - 'available'  — 找到航班且有余票
+        - 'sold_out'   — 找到航班但 available_seats == 0（明确售罄）
+        - 'not_found'  — 未在结果中找到目标航班号
+
+        Args:
+            prices: 采集到的 FlightPrice 列表。
+            target_flight_no: 目标航班号（不区分大小写）。
+            seat_class_filter: 指定舱位筛选，None 表示不限。
+
+        Returns:
+            (匹配到的最低价 FlightPrice 或 None, 状态字符串)
+        """
+        target = target_flight_no.upper().strip()
+        all_matching = [
+            fp for fp in prices
+            if fp.flight_info.flight_no.upper().strip() == target
+            and (not seat_class_filter or fp.seat_class == seat_class_filter)
+        ]
+
+        if not all_matching:
+            return None, "not_found"
+
+        available = [fp for fp in all_matching if fp.available_seats != 0]
+        if not available:
+            return None, "sold_out"
+
+        return min(available, key=lambda fp: fp.price), "available"
+
+    @staticmethod
+    def _determine_flight_status(
+        route: Route,
+        outbound_fp: Optional[FlightPrice],
+        inbound_fp: Optional[FlightPrice],
+        out_status: str,
+        in_status: str,
+        trip_type: str,
+        inbound_flight_no: Optional[str],
+    ) -> str:
+        """综合去程/回程匹配状态，返回路线最终航班状态。
+
+        优先级：sold_out > not_found > schedule_changed > available。
+
+        Returns:
+            'available' | 'sold_out' | 'not_found' | 'schedule_changed'
+        """
+        if out_status == "sold_out":
+            return "sold_out"
+        if out_status == "not_found":
+            return "not_found"
+
+        # 检查去程时刻是否变动（与参考时刻偏差 > 60 分钟）
+        outbound_dep_time_ref = getattr(route, "outbound_dep_time_ref", None)
+        if outbound_fp and outbound_dep_time_ref:
+            actual = outbound_fp.flight_info.departure_time
+            if actual and _time_diff_minutes(outbound_dep_time_ref, actual) > 60:
+                return "schedule_changed"
+
+        # 往返程：检查回程
+        if trip_type == "roundtrip" and inbound_flight_no:
+            if in_status == "sold_out":
+                return "sold_out"
+            if in_status == "not_found":
+                return "not_found"
+            inbound_dep_time_ref = getattr(route, "inbound_dep_time_ref", None)
+            if inbound_fp and inbound_dep_time_ref:
+                actual = inbound_fp.flight_info.departure_time
+                if actual and _time_diff_minutes(inbound_dep_time_ref, actual) > 60:
+                    return "schedule_changed"
+
+        return "available"
+
     async def _scrape_all_platforms(
         self, params: SearchParams
     ) -> List[FlightPrice]:
@@ -414,60 +630,67 @@ class PriceMonitorScheduler:
     def _combine_roundtrip_prices(prices: List[FlightPrice]) -> List[FlightPrice]:
         """将去程/回程价格记录配对为往返组合记录。
 
-        若爬虫已返回含 return_flight_info 的组合记录（往返总价），则直接返回。
-        否则按 FlightDirection 分组，为每个去程选取同来源中最便宜的回程进行配对，
-        生成 return_flight_info 已填充、price 为两段之和的 FlightPrice 列表。
+        两种来源均能正确处理：
+        1. 爬虫已返回含 return_flight_info 的组合记录（携程 batchSearch、Qunar 国际往返 API）
+           → 直接纳入结果集。
+        2. 爬虫返回单独的 DEPARTURE + RETURN 记录（Qunar 国际往返降级搜索）
+           → 按 FlightDirection 分组，每个去程选同来源最便宜的回程配对，
+           生成 return_flight_info 已填充、price 为两段之和的记录。
+
+        两类结果合并后一起返回，不会因存在组合记录而丢弃单程待配对记录。
 
         Args:
-            prices: 爬虫返回的原始价格列表，可能是单独的去程/回程或已组合的往返。
+            prices: 爬虫返回的原始价格列表，可能混合已组合记录与单程记录。
 
         Returns:
-            组合后的往返价格列表，每条记录含 return_flight_info 和合计总价。
-            若无法配对（缺去程或回程数据），则原样返回 prices。
+            组合后的往返价格列表，按价格升序排列。
+            若完全无法配对（既无组合记录也无去/回程对），则原样返回 prices。
         """
-        # 爬虫已返回组合往返记录，直接使用
+        # 爬虫已返回组合往返记录（如携程 batchSearch、Qunar 国际往返 API）
         combined_existing = [fp for fp in prices if fp.return_flight_info is not None]
-        if combined_existing:
-            return combined_existing
 
-        # 按方向分组
-        outbound = [fp for fp in prices if fp.flight_info.direction == FlightDirection.DEPARTURE]
-        returns = [fp for fp in prices if fp.flight_info.direction == FlightDirection.RETURN]
+        # 仅含单程记录（如 Qunar 国际往返降级搜索）：配对去程 + 回程
+        single_leg = [fp for fp in prices if fp.return_flight_info is None]
+        outbound = [fp for fp in single_leg if fp.flight_info.direction == FlightDirection.DEPARTURE]
+        returns = [fp for fp in single_leg if fp.flight_info.direction == FlightDirection.RETURN]
 
-        if not outbound or not returns:
-            logger.warning("往返程配对失败：去程 %d 条，回程 %d 条", len(outbound), len(returns))
-            return prices
+        newly_combined: List[FlightPrice] = []
+        if outbound and returns:
+            # 为每个去程找同来源最便宜的回程进行配对；若无同来源则跨来源取最低价
+            cheapest_return_by_source: Dict[str, FlightPrice] = {}
+            for fp in returns:
+                src = fp.source
+                if src not in cheapest_return_by_source or fp.price < cheapest_return_by_source[src].price:
+                    cheapest_return_by_source[src] = fp
+            cheapest_return_global = min(returns, key=lambda fp: fp.price)
 
-        # 为每个去程找同来源最便宜的回程进行配对；若无同来源则跨来源取最低价
-        cheapest_return_by_source: Dict[str, FlightPrice] = {}
-        for fp in returns:
-            src = fp.source
-            if src not in cheapest_return_by_source or fp.price < cheapest_return_by_source[src].price:
-                cheapest_return_by_source[src] = fp
-        cheapest_return_global = min(returns, key=lambda fp: fp.price)
-
-        combined: List[FlightPrice] = []
-        for out_fp in outbound:
-            ret_fp = cheapest_return_by_source.get(out_fp.source, cheapest_return_global)
-            seats = None
-            if out_fp.available_seats is not None and ret_fp.available_seats is not None:
-                seats = min(out_fp.available_seats, ret_fp.available_seats)
-            elif out_fp.available_seats is not None:
-                seats = out_fp.available_seats
-            combined.append(
-                FlightPrice(
-                    flight_info=out_fp.flight_info,
-                    price=out_fp.price + ret_fp.price,
-                    currency=out_fp.currency,
-                    seat_class=out_fp.seat_class,
-                    available_seats=seats,
-                    scraped_at=out_fp.scraped_at,
-                    source=out_fp.source,
-                    return_flight_info=ret_fp.flight_info,
+            for out_fp in outbound:
+                ret_fp = cheapest_return_by_source.get(out_fp.source, cheapest_return_global)
+                seats = None
+                if out_fp.available_seats is not None and ret_fp.available_seats is not None:
+                    seats = min(out_fp.available_seats, ret_fp.available_seats)
+                elif out_fp.available_seats is not None:
+                    seats = out_fp.available_seats
+                newly_combined.append(
+                    FlightPrice(
+                        flight_info=out_fp.flight_info,
+                        price=out_fp.price + ret_fp.price,
+                        currency=out_fp.currency,
+                        seat_class=out_fp.seat_class,
+                        available_seats=seats,
+                        scraped_at=out_fp.scraped_at,
+                        source=out_fp.source,
+                        return_flight_info=ret_fp.flight_info,
+                    )
                 )
-            )
+        elif single_leg:
+            logger.warning("往返程配对失败：去程 %d 条，回程 %d 条", len(outbound), len(returns))
 
-        return sorted(combined, key=lambda fp: fp.price)
+        all_combined = combined_existing + newly_combined
+        if not all_combined:
+            # 完全无法配对时原样返回，避免丢失数据
+            return prices
+        return sorted(all_combined, key=lambda fp: fp.price)
 
     async def _send_alert(
         self,

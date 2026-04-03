@@ -170,6 +170,7 @@ def _color_enc(df_agg: pd.DataFrame) -> alt.Color:
         "source_label:N",
         title="来源平台",
         legend=alt.Legend() if multi else None,
+        scale=alt.Scale(domain=["去哪儿", "携程"], range=["#3d7ff5", "#12b76a"]),
     )
 
 

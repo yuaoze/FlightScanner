@@ -65,6 +65,14 @@ class RouteWithLatestPrice:
     last_notified_at: Optional[datetime] = None
     last_notified_price: Optional[Decimal] = None
     max_results: int = 20
+    # 精准航班号监控字段
+    monitoring_mode: str = "route"
+    outbound_flight_no: Optional[str] = None
+    inbound_flight_no: Optional[str] = None
+    pinned_seat_class: Optional[str] = None
+    outbound_dep_time_ref: Optional[str] = None
+    inbound_dep_time_ref: Optional[str] = None
+    last_flight_status: Optional[str] = None
 
 
 class RouteService:
@@ -99,6 +107,12 @@ class RouteService:
         arr_time_from: Optional[str] = None,
         arr_time_to: Optional[str] = None,
         max_results: int = 20,
+        monitoring_mode: str = "route",
+        outbound_flight_no: Optional[str] = None,
+        inbound_flight_no: Optional[str] = None,
+        pinned_seat_class: Optional[str] = None,
+        outbound_dep_time_ref: Optional[str] = None,
+        inbound_dep_time_ref: Optional[str] = None,
     ) -> Route:
         """Add a new route to monitor.
 
@@ -160,6 +174,12 @@ class RouteService:
             arr_time_from=arr_time_from or None,
             arr_time_to=arr_time_to or None,
             max_results=max_results,
+            monitoring_mode=monitoring_mode,
+            outbound_flight_no=outbound_flight_no or None,
+            inbound_flight_no=inbound_flight_no or None,
+            pinned_seat_class=pinned_seat_class or None,
+            outbound_dep_time_ref=outbound_dep_time_ref or None,
+            inbound_dep_time_ref=inbound_dep_time_ref or None,
         )
 
         self.session.add(route)
@@ -275,6 +295,13 @@ class RouteService:
                 Route.last_notified_at,
                 Route.last_notified_price,
                 Route.max_results,
+                Route.monitoring_mode,
+                Route.outbound_flight_no,
+                Route.inbound_flight_no,
+                Route.pinned_seat_class,
+                Route.outbound_dep_time_ref,
+                Route.inbound_dep_time_ref,
+                Route.last_flight_status,
                 latest_price_subq.c.latest_price,
                 latest_price_subq.c.latest_scraped_at,
                 func.coalesce(price_count_subq.c.price_count, 0).label("price_count"),
@@ -323,6 +350,13 @@ class RouteService:
                         else None
                     ),
                     max_results=row.max_results if row.max_results is not None else 20,
+                    monitoring_mode=row.monitoring_mode or "route",
+                    outbound_flight_no=row.outbound_flight_no,
+                    inbound_flight_no=row.inbound_flight_no,
+                    pinned_seat_class=row.pinned_seat_class,
+                    outbound_dep_time_ref=row.outbound_dep_time_ref,
+                    inbound_dep_time_ref=row.inbound_dep_time_ref,
+                    last_flight_status=row.last_flight_status,
                 )
             )
 
@@ -630,4 +664,16 @@ class RouteService:
         if route:
             route.last_notified_at = notified_at
             route.last_notified_price = price
+            self.session.commit()
+
+    def update_flight_status(self, route_id: int, status: str) -> None:
+        """Update the pinned flight's last known status.
+
+        Args:
+            route_id: The route ID to update.
+            status: One of 'available', 'sold_out', 'not_found', 'schedule_changed'.
+        """
+        route = self.session.query(Route).filter(Route.id == route_id).first()
+        if route:
+            route.last_flight_status = status
             self.session.commit()

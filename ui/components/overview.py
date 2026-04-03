@@ -105,7 +105,7 @@ def _render_source_price_summary(
     price_history: List[FlightPrice],
     target_price: Decimal,
 ) -> None:
-    """Render the latest minimum price per scraper platform as metric tiles.
+    """Render the latest minimum price per scraper platform as an inline price row.
 
     Args:
         price_history: Price records for this route (30-day window).
@@ -126,20 +126,30 @@ def _render_source_price_summary(
     if not latest:
         return
 
-    sources = sorted(latest.keys())
-    cols = st.columns(len(sources))
-    for col, src in zip(cols, sources):
+    parts = []
+    for src in sorted(latest.keys()):
         fp = latest[src]
         price_val = float(fp.price)
         diff = price_val - float(target_price)
-        delta_str = f"{'↓' if diff < 0 else '↑'}¥{abs(diff):.0f} 相比目标"
-        with col:
-            st.metric(
-                label=f"{_source_label(src)} 最新价",
-                value=f"¥{price_val:.0f}",
-                delta=delta_str,
-                delta_color="inverse",
-            )
+        direction = "down" if diff < 0 else "up"
+        arrow = "↓" if diff < 0 else "↑"
+        label = "低于目标" if diff < 0 else "高于目标"
+        delta_html = (
+            f'<span class="fs-price-delta-{direction}">'
+            f'{arrow}¥{abs(diff):.0f} {label}'
+            f'</span>'
+        )
+        parts.append(
+            f'<div class="fs-price-source">'
+            f'<span class="fs-source-label">{_source_label(src)}</span>'
+            f'<span class="fs-price-val">¥{price_val:.0f}</span>'
+            f'{delta_html}'
+            f'</div>'
+        )
+    st.markdown(
+        f'<div class="fs-price-row">{"".join(parts)}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ── Top stat cards ─────────────────────────────────────────────────────────────
@@ -159,22 +169,18 @@ def render_overview_cards(routes: List[RouteWithLatestPrice]) -> None:
         f"""
         <div class="fs-stat-grid">
             <div class="fs-stat-card blue">
-                <span class="fs-stat-icon">📊</span>
                 <div class="fs-stat-value">{total}</div>
                 <div class="fs-stat-label">总路线数</div>
             </div>
             <div class="fs-stat-card green">
-                <span class="fs-stat-icon">📡</span>
                 <div class="fs-stat-value">{active}</div>
                 <div class="fs-stat-label">活跃监控</div>
             </div>
             <div class="fs-stat-card amber">
-                <span class="fs-stat-icon">🎯</span>
                 <div class="fs-stat-value">{on_target}</div>
                 <div class="fs-stat-label">达到目标价</div>
             </div>
             <div class="fs-stat-card purple">
-                <span class="fs-stat-icon">📅</span>
                 <div class="fs-stat-value">{upcoming}</div>
                 <div class="fs-stat-label">即将出行</div>
             </div>
@@ -182,6 +188,30 @@ def render_overview_cards(routes: List[RouteWithLatestPrice]) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+# ── Pinned-flight status badge ─────────────────────────────────────────────────
+
+_FLIGHT_STATUS_BADGE: Dict[str, str] = {
+    "sold_out":        '<span style="background:#fee2e2;color:#dc2626;border-radius:6px;padding:1px 7px;font-size:0.72rem;font-weight:700;">⚠️ 售罄</span>',
+    "not_found":       '<span style="background:#fef3c7;color:#d97706;border-radius:6px;padding:1px 7px;font-size:0.72rem;font-weight:700;">⚠️ 未找到</span>',
+    "schedule_changed":'<span style="background:#ede9fe;color:#7c3aed;border-radius:6px;padding:1px 7px;font-size:0.72rem;font-weight:700;">⚠️ 时刻已调整</span>',
+    "available":       '<span style="background:#dcfce7;color:#16a34a;border-radius:6px;padding:1px 7px;font-size:0.72rem;font-weight:700;">✓ 有票</span>',
+}
+
+
+def _flight_status_badge(status: Optional[str]) -> str:
+    """Return an HTML badge string for the given pinned-flight status.
+
+    Args:
+        status: One of 'available', 'sold_out', 'not_found', 'schedule_changed', or None.
+
+    Returns:
+        HTML badge string (empty string when status is None or unknown).
+    """
+    if not status:
+        return ""
+    return _FLIGHT_STATUS_BADGE.get(status, "")
 
 
 # ── Next-check countdown helper ────────────────────────────────────────────────
@@ -273,13 +303,21 @@ def _render_route_card(
         badges += "🌐 "
     if route.trip_type == "roundtrip":
         badges += "往返  "
+    # 精准航班号监控标注
+    is_pinned = getattr(route, "monitoring_mode", "route") == "flight"
+    if is_pinned:
+        out_no = getattr(route, "outbound_flight_no", "") or ""
+        in_no = getattr(route, "inbound_flight_no", "") or ""
+        flight_badge = f"🎯 {out_no}" + (f"+{in_no}" if in_no else "")
+        badges += f"{flight_badge}  "
 
     # Date display with days-until-travel countdown
     days_left = (route.target_date - date.today()).days
+    _fmt = lambda d: d.strftime('%m-%d') if d.year == date.today().year else str(d)
     if route.return_date:
-        date_info = f"{route.target_date} ↔ {route.return_date}"
+        date_info = f"{_fmt(route.target_date)} ↔ {_fmt(route.return_date)}"
     else:
-        date_info = str(route.target_date)
+        date_info = _fmt(route.target_date)
     if 0 < days_left <= 60:
         date_info += f"（{days_left}天后）"
 
@@ -288,10 +326,9 @@ def _render_route_card(
         pv = float(route.latest_price)
         tv = float(route.target_price)
         if route.latest_price <= route.target_price:
-            price_info = f"¥{pv:.0f}  🎯 已达目标 ¥{tv:.0f}"
+            price_info = f"¥{pv:.0f}  ✓"
         else:
-            diff = pv - tv
-            price_info = f"¥{pv:.0f}  /  目标 ¥{tv:.0f}  (+¥{diff:.0f})"
+            price_info = f"¥{pv:.0f} / ¥{tv:.0f}"
     else:
         price_info = f"暂无  /  目标 ¥{float(route.target_price):.0f}"
 
@@ -304,6 +341,17 @@ def _render_route_card(
     countdown = _next_check_countdown(route)
     if countdown:
         label += f"  ·  {countdown}"
+    # 精准监控航班状态提示（追加到标签末尾）
+    if is_pinned:
+        last_status = getattr(route, "last_flight_status", None)
+        status_text_map = {
+            "sold_out": "  ⚠️ 售罄",
+            "not_found": "  ⚠️ 未找到",
+            "schedule_changed": "  ⚠️ 时刻变动",
+            "available": "  ✓ 有票",
+        }
+        if last_status in status_text_map:
+            label += status_text_map[last_status]
 
     # ── Expandable card ───────────────────────────────────────────────
     with st.expander(label, expanded=False):
@@ -394,7 +442,36 @@ def _render_route_card(
         if countdown:
             meta.append(countdown)
 
-        st.caption("  ·  ".join(meta))
+        chips = "".join(f'<span class="fs-chip">{item}</span>' for item in meta)
+        st.markdown(f'<div class="fs-meta-row">{chips}</div>', unsafe_allow_html=True)
+
+        # ── 精准航班监控元信息 ──────────────────────────────────────────
+        if is_pinned:
+            out_no = getattr(route, "outbound_flight_no", "") or ""
+            in_no = getattr(route, "inbound_flight_no", "") or ""
+            out_time = getattr(route, "outbound_dep_time_ref", None)
+            in_time = getattr(route, "inbound_dep_time_ref", None)
+            seat = getattr(route, "pinned_seat_class", None)
+            last_status = getattr(route, "last_flight_status", None)
+
+            badge_html = _flight_status_badge(last_status)
+            parts_html = []
+            if out_no:
+                parts_html.append(f'<span class="fs-chip-accent">🎯 {out_no}</span>')
+            if out_time:
+                parts_html.append(f'<span class="fs-chip">去程 {out_time}</span>')
+            if in_no:
+                parts_html.append(f'<span class="fs-chip-accent">{in_no}</span>')
+            if in_time:
+                parts_html.append(f'<span class="fs-chip">回程 {in_time}</span>')
+            if seat:
+                parts_html.append(f'<span class="fs-chip">{seat}</span>')
+            if badge_html:
+                parts_html.append(badge_html)
+            st.markdown(
+                f'<div class="fs-meta-row" style="margin-top:0.2rem;">{"".join(parts_html)}</div>',
+                unsafe_allow_html=True,
+            )
 
         # ── Price-to-target progress bar ───────────────────────────────
         if route.latest_price:

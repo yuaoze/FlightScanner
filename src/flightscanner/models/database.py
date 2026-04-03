@@ -154,6 +154,15 @@ class Route(Base):
     notify_threshold_pct = Column(Numeric(5, 2), nullable=True)    # 用户自定义低于均价 N% 时通知（None=使用全局默认）
     max_results = Column(Integer, default=20, nullable=False)
 
+    # 精准航班号监控字段（通过迁移添加）
+    monitoring_mode       = Column(String(20), default="route", nullable=False)  # 'route' | 'flight'
+    outbound_flight_no    = Column(String(20), nullable=True)   # 指定去程航班号，如 "CA953"
+    inbound_flight_no     = Column(String(20), nullable=True)   # 指定回程航班号（往返时使用）
+    pinned_seat_class     = Column(String(50), nullable=True)   # 指定舱位，如 "经济舱"（None=不限）
+    outbound_dep_time_ref = Column(String(10), nullable=True)   # 添加时的去程起飞参考时刻 "HH:MM"
+    inbound_dep_time_ref  = Column(String(10), nullable=True)   # 添加时的回程起飞参考时刻 "HH:MM"
+    last_flight_status    = Column(String(30), nullable=True)   # 'available'|'sold_out'|'not_found'|'schedule_changed'
+
     # Relationship
     price_histories = relationship(
         "PriceHistory", back_populates="route", cascade="all, delete-orphan"
@@ -286,6 +295,14 @@ def _apply_migrations(engine) -> None:
         "ALTER TABLE flights ADD COLUMN arrival_date DATE",
         # max_results：每路线每平台最多采集的航班条数
         "ALTER TABLE routes ADD COLUMN max_results INTEGER NOT NULL DEFAULT 20",
+        # 精准航班号监控字段
+        "ALTER TABLE routes ADD COLUMN monitoring_mode TEXT NOT NULL DEFAULT 'route'",
+        "ALTER TABLE routes ADD COLUMN outbound_flight_no TEXT",
+        "ALTER TABLE routes ADD COLUMN inbound_flight_no TEXT",
+        "ALTER TABLE routes ADD COLUMN pinned_seat_class TEXT",
+        "ALTER TABLE routes ADD COLUMN outbound_dep_time_ref TEXT",
+        "ALTER TABLE routes ADD COLUMN inbound_dep_time_ref TEXT",
+        "ALTER TABLE routes ADD COLUMN last_flight_status TEXT",
     ]
     with engine.connect() as conn:
         for stmt in stmts:
