@@ -265,6 +265,55 @@ class PriceHistory(Base):
         return Decimal(str(self.price))
 
 
+class AIPredictionLog(Base):
+    """AI 预测记录表，用于 4 齿轮自进化引擎的闭环回测。
+
+    G1 执行器：采集后记录结构化预测。
+    G2 监控器：航班出发后回测，计算 Pain Index。
+    G3 诊断器：高痛失误 RCA。
+    G4 进化器：动态注入历史失误上下文。
+    """
+
+    __tablename__ = "ai_prediction_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    route_id = Column(Integer, ForeignKey("routes.id"), nullable=False, index=True)
+
+    # ── G1 执行器字段 ──────────────────────────────────────────
+    predicted_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+    price_at_prediction = Column(Numeric(10, 2), nullable=False)   # 预测时当前最低价
+    days_until_flight = Column(Integer, nullable=False)             # 预测时距出发天数
+    recommended_action = Column(String(10), nullable=False)         # "Buy" | "Wait"
+    reason = Column(Text, nullable=True)
+    trend = Column(String(20), nullable=True)                       # 上涨|下跌|震荡|稳定
+    confidence = Column(Numeric(4, 3), nullable=True)               # 0.000~1.000
+    llm_source = Column(String(20), nullable=False, default="rule_based")  # "deepseek"/"rule_based"
+
+    # ── G2 监控器字段 ──────────────────────────────────────────
+    outcome_status = Column(String(20), nullable=False, default="pending")
+    # pending | win | loss | neutral | skipped
+    actual_min_price = Column(Numeric(10, 2), nullable=True)        # 出发前最低价
+    actual_final_price = Column(Numeric(10, 2), nullable=True)      # 出发前最后采集价
+    pain_index = Column(Numeric(10, 2), nullable=True)              # Regret Cost (CNY)
+    catchable_low_exists = Column(Integer, nullable=True)           # 1=有可捕捉低价 0=无
+
+    # ── G3 诊断器字段 ──────────────────────────────────────────
+    rca_run_at = Column(DateTime, nullable=True)
+    error_category = Column(String(50), nullable=True)
+    rca_analysis = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_aiplog_route_predicted", "route_id", "predicted_at"),
+        Index("ix_aiplog_outcome", "outcome_status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AIPredictionLog(id={self.id}, route_id={self.route_id}, "
+            f"action='{self.recommended_action}', status='{self.outcome_status}')>"
+        )
+
+
 def _apply_migrations(engine) -> None:
     """幂等地为已存在的表添加新列（SQLite 不支持 IF NOT EXISTS，用 try/except 跳过已存在列）。"""
     stmts = [
@@ -303,6 +352,28 @@ def _apply_migrations(engine) -> None:
         "ALTER TABLE routes ADD COLUMN outbound_dep_time_ref TEXT",
         "ALTER TABLE routes ADD COLUMN inbound_dep_time_ref TEXT",
         "ALTER TABLE routes ADD COLUMN last_flight_status TEXT",
+        # AI 进化引擎：预测记录表（使用 CREATE TABLE IF NOT EXISTS，已有表静默跳过）
+        (
+            "CREATE TABLE IF NOT EXISTS ai_prediction_log ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "route_id INTEGER NOT NULL REFERENCES routes(id), "
+            "predicted_at DATETIME NOT NULL, "
+            "price_at_prediction NUMERIC NOT NULL, "
+            "days_until_flight INTEGER NOT NULL, "
+            "recommended_action TEXT NOT NULL, "
+            "reason TEXT, "
+            "trend TEXT, "
+            "confidence NUMERIC, "
+            "llm_source TEXT NOT NULL DEFAULT 'rule_based', "
+            "outcome_status TEXT NOT NULL DEFAULT 'pending', "
+            "actual_min_price NUMERIC, "
+            "actual_final_price NUMERIC, "
+            "pain_index NUMERIC, "
+            "catchable_low_exists INTEGER, "
+            "rca_run_at DATETIME, "
+            "error_category TEXT, "
+            "rca_analysis TEXT)"
+        ),
     ]
     with engine.connect() as conn:
         for stmt in stmts:

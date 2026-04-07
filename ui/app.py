@@ -1033,78 +1033,6 @@ def _inject_css() -> None:
     )
 
 
-# ── History helpers ────────────────────────────────────────────────────────────
-
-def _render_history_entry(historical_routes: List) -> None:
-    """主页底部历史监控入口卡片。"""
-    if not historical_routes:
-        return
-    n = len(historical_routes)
-
-    # 分隔线
-    st.markdown(
-        """
-        <div class="fs-section-header" style="margin-top:1.75rem;">
-            <span class="fs-section-title">历史记录</span>
-            <div class="fs-section-line"></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # 入口卡片（左：图标+文字；右：按钮）
-    col_info, col_btn = st.columns([7, 2])
-    with col_info:
-        st.markdown(
-            f'<div class="fs-history-entry">'
-            f'<span style="font-size:1.3rem;">🕐</span>'
-            f'<div>'
-            f'<div style="font-size:0.875rem;font-weight:700;color:#18191c;">历史监控</div>'
-            f'<div style="font-size:0.75rem;color:#9ca5b4;">{n} 条出行日期已过期的监控路线</div>'
-            f'</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-    with col_btn:
-        if st.button(
-            "查看历史 →",
-            key="btn_view_history",
-            use_container_width=True,
-            help="查看所有出行日期已过期的历史监控路线",
-        ):
-            st.session_state["_page"] = "history"
-            st.rerun()
-
-
-def _render_history_page(
-    historical_routes: List,
-    route_service: RouteService,
-) -> None:
-    """历史监控页：轻量 header + 路线卡片列表。"""
-    n = len(historical_routes)
-
-    # 顶部：返回按钮 + header 条
-    col_back, col_header = st.columns([2, 7])
-    with col_back:
-        if st.button("← 返回主页", key="btn_back_history"):
-            st.session_state["_page"] = "main"
-            st.rerun()
-    with col_header:
-        st.markdown(
-            f'<div class="fs-history-header">'
-            f'<div>'
-            f'<div class="fs-history-header-title">🕐 历史监控</div>'
-            f'<div class="fs-history-header-sub">出行日期已过期的监控路线</div>'
-            f'</div>'
-            f'<span class="fs-chip">{n} 条记录</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-    # 路线列表（复用现有组件）
-    render_route_list(historical_routes, route_service)
-
-
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1118,11 +1046,6 @@ def main() -> None:
     _inject_css()
     _get_monitor()
 
-    # ── Page state init ─────────────────────────────────────────────────
-    if "_page" not in st.session_state:
-        st.session_state["_page"] = "main"
-    current_page = st.session_state["_page"]
-
     # ── Register newly added route with background scheduler ───────────
     if "new_route_id" in st.session_state:
         new_route_id: int = st.session_state.pop("new_route_id")
@@ -1133,30 +1056,29 @@ def main() -> None:
                 session.expunge(new_route)
                 _get_monitor().register_new_route(new_route)
 
-    # ── 主页 header（仅主页显示） ─────────────────────────────────────
-    if current_page == "main":
-        st.markdown(
-            """
-            <div class="fs-header">
-                <div class="fs-header-left">
-                    <div class="fs-header-title">✈️ FlightScanner</div>
-                    <div class="fs-header-sub">实时航班价格监控 · 智能低价提醒</div>
-                </div>
+    # ── 主页 header ─────────────────────────────────────────────────────
+    st.markdown(
+        """
+        <div class="fs-header">
+            <div class="fs-header-left">
+                <div class="fs-header-title">✈️ FlightScanner</div>
+                <div class="fs-header-sub">实时航班价格监控 · 智能低价提醒</div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        _, hd_btn_add, hd_btn_pinned, hd_btn_cookie = st.columns([6, 2, 2, 1])
-        with hd_btn_add:
-            if st.button("＋ 添加监控", type="primary", use_container_width=True):
-                _show_add_route_dialog(get_session_local())
-        with hd_btn_pinned:
-            if st.button("🎯 精准监控", use_container_width=True,
-                         help="按航班号精准追踪指定航班的价格动态"):
-                _show_add_pinned_flight_dialog(get_session_local())
-        with hd_btn_cookie:
-            if st.button("🔑", help="Cookie 管理", use_container_width=True):
-                render_cookie_manager_dialog()
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    _, hd_btn_add, hd_btn_pinned, hd_btn_cookie = st.columns([6, 2, 2, 1])
+    with hd_btn_add:
+        if st.button("＋ 添加监控", type="primary", use_container_width=True):
+            _show_add_route_dialog(get_session_local())
+    with hd_btn_pinned:
+        if st.button("🎯 精准监控", use_container_width=True,
+                     help="按航班号精准追踪指定航班的价格动态"):
+            _show_add_pinned_flight_dialog(get_session_local())
+    with hd_btn_cookie:
+        if st.button("🔑", help="Cookie 管理", use_container_width=True):
+            render_cookie_manager_dialog()
 
     # ── Dashboard data ─────────────────────────────────────────────────
     with get_session() as session:
@@ -1188,13 +1110,19 @@ def main() -> None:
             else:
                 st.error(msg)
 
-        # ── 路由分发 ────────────────────────────────────────────────────
-        if current_page == "history":
-            _render_history_page(historical_routes, svc)
-        else:
-            render_overview_cards(routes)            # 统计卡片：全量路线
-            render_route_list(upcoming_routes, svc)  # 路线列表：仅未来路线
-            _render_history_entry(historical_routes) # 底部历史入口
+        # ── 统计卡片（全量路线）────────────────────────────────────────
+        render_overview_cards(routes)
+
+        # ── 路线标签页 ─────────────────────────────────────────────────
+        n_hist = len(historical_routes)
+        tab_label_hist = f"历史记录（{n_hist}）" if n_hist else "历史记录"
+        tab_current, tab_history = st.tabs(["当前监控", tab_label_hist])
+
+        with tab_current:
+            render_route_list(upcoming_routes, svc)
+
+        with tab_history:
+            render_route_list(historical_routes, svc)
 
 
 if __name__ == "__main__":

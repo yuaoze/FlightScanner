@@ -263,6 +263,9 @@ class PriceMonitorScheduler:
                         "路线 %s 冷却中（上次通知未超 %d 小时且价格未再降 5%%），跳过通知",
                         route.id, settings.notify_cooldown_hours,
                     )
+
+                # ── G1：记录预测（每路线每 12 小时最多一次）────────────────────
+                await self._maybe_log_prediction(session, route, history)
             finally:
                 session.close()
 
@@ -1169,6 +1172,19 @@ class PriceMonitorScheduler:
                 self.scheduler.start()
                 logger.info("APScheduler 已在后台线程启动")
 
+                # ── 每日进化任务：G2 回测 + G3 RCA（UTC 03:00）────────────────
+                try:
+                    from apscheduler.triggers.cron import CronTrigger
+                    self.scheduler.add_job(
+                        self._run_daily_evolution,
+                        CronTrigger(hour=3, minute=0, timezone="UTC"),
+                        id="daily_evolution",
+                        replace_existing=True,
+                    )
+                    logger.info("每日进化任务已注册（UTC 03:00）")
+                except Exception:
+                    logger.exception("每日进化任务注册失败，G2/G3 将不会自动运行")
+
                 # ── 调度所有活跃路线（非关键：失败不阻断主循环） ──────────────
                 try:
                     self.reschedule_all_routes()
@@ -1201,6 +1217,80 @@ class PriceMonitorScheduler:
         )
         self._thread.start()
         logger.info("后台调度线程已启动")
+
+    async def _maybe_log_prediction(
+        self,
+        session: "Session",
+        route: Route,
+        price_history: List[FlightPrice],
+    ) -> None:
+        """G1：若满足条件则记录一次预测（每路线 12 小时冷却）。
+
+        Args:
+            session: 当前数据库会话。
+            route: 路线对象。
+            price_history: 最新价格历史列表。
+        """
+        from flightscanner.analyzers.evolution_engine import log_prediction  # lazy import
+        from ui.components.ai_brief import _should_auto_trigger  # 复用已有逻辑
+
+        try:
+            # 12h 冷却：距上次预测不足 12 小时则跳过
+            route_service = RouteService(session)
+            last_pred = route_service.get_last_prediction_time(route.id)
+            if last_pred is not None:
+                last_pred_aware = last_pred
+                if hasattr(last_pred, "tzinfo") and last_pred.tzinfo is None:
+                    last_pred_aware = last_pred.replace(tzinfo=timezone.utc)
+                elapsed = (datetime.now(timezone.utc) - last_pred_aware).total_seconds()
+                if elapsed < 43200:  # 12 小时
+                    return
+
+            # 仅在满足 auto-trigger 条件时记录
+            should, _ = _should_auto_trigger(price_history)
+            if not should:
+                return
+
+            from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback
+            brief = generate_brief_with_fallback(
+                price_history=price_history,
+                target_date=route.target_date,
+                route_label=f"{route.origin} → {route.destination}",
+                api_key=settings.deepseek_api_key or None,
+                base_url=settings.deepseek_base_url,
+                model=settings.deepseek_model,
+            )
+            current_price = float(min(fp.price for fp in price_history))
+            days_until = (route.target_date - date.today()).days
+            log_prediction(session, route.id, brief, current_price, days_until)
+            logger.info("[G1] 预测已记录 route_id=%d action=%s", route.id, brief.get("action"))
+        except Exception as exc:
+            logger.warning("[G1] 预测记录失败 route_id=%d：%s", route.id, exc)
+
+    async def _run_daily_evolution(self) -> None:
+        """G2 回测 + G3 RCA，每天 UTC 03:00 运行。"""
+        from flightscanner.analyzers.evolution_engine import run_backtesting, run_rca
+
+        logger.info("[Evolution] G2 回测开始")
+        try:
+            n2 = await run_backtesting(self._SessionLocal)
+            logger.info("[Evolution] G2 完成，处理 %d 条", n2)
+        except Exception as exc:
+            logger.error("[Evolution] G2 回测失败：%s", exc, exc_info=True)
+            return
+
+        if settings.deepseek_api_key:
+            logger.info("[Evolution] G3 RCA 开始")
+            try:
+                n3 = await run_rca(
+                    self._SessionLocal,
+                    api_key=settings.deepseek_api_key,
+                    base_url=settings.deepseek_base_url,
+                    model=settings.deepseek_model,
+                )
+                logger.info("[Evolution] G3 完成，处理 %d 条", n3)
+            except Exception as exc:
+                logger.error("[Evolution] G3 RCA 失败：%s", exc, exc_info=True)
 
     def stop(self) -> None:
         """停止调度器并清理所有爬虫资源。"""

@@ -8,7 +8,7 @@ fallback to rule-based analysis) and cached in st.session_state for
 
 from datetime import date, datetime, timezone
 from statistics import median
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 import streamlit as st
 
@@ -44,6 +44,48 @@ _ALERT_LABELS: Dict[str, str] = {
 def _12h_window_id() -> int:
     """Return an integer that increments every 12 hours (UTC)."""
     return int(datetime.now(timezone.utc).timestamp() // (12 * 3600))
+
+
+def _get_session_local():
+    """获取 SessionLocal 工厂（延迟导入避免循环依赖）。"""
+    from ui.utils.db import get_session_local  # lazy import
+    return get_session_local()
+
+
+def _get_credibility(route_id: int) -> Dict[str, Any]:
+    """获取路线信誉数据（G4 辅助）。
+
+    Args:
+        route_id: 路线 ID。
+
+    Returns:
+        信誉字典（win_rate, evaluated_count, consecutive_fatal_losses, circuit_broken）。
+    """
+    try:
+        from flightscanner.analyzers.evolution_engine import get_route_credibility  # lazy
+        SessionLocal = _get_session_local()
+        with SessionLocal() as session:
+            return get_route_credibility(session, route_id)
+    except Exception:
+        return {"win_rate": 0.0, "evaluated_count": 0, "consecutive_fatal_losses": 0, "circuit_broken": False}
+
+
+def _get_evolution_context(route_id: int) -> str:
+    """获取 G4 进化上下文字符串（注入 AI prompt）。
+
+    Args:
+        route_id: 路线 ID。
+
+    Returns:
+        历史预测摘要字符串，空字符串表示无历史数据。
+    """
+    try:
+        from flightscanner.analyzers.evolution_engine import build_evolved_context  # lazy
+        SessionLocal = _get_session_local()
+        with SessionLocal() as session:
+            return build_evolved_context(session, route_id)
+    except Exception:
+        return ""
 
 
 def _should_auto_trigger(price_history: List[FlightPrice]) -> Tuple[bool, str]:
@@ -87,11 +129,43 @@ def _should_auto_trigger(price_history: List[FlightPrice]) -> Tuple[bool, str]:
     return False, ""
 
 
-def _render_brief_card(brief: Dict[str, Any]) -> None:
+def _render_credibility_badge(route_id: int) -> None:
+    """从 DB 读取信誉数据并渲染 badge + circuit breaker 提示。
+
+    仅在有 ≥ MIN_EVALUATED_FOR_CREDIBILITY 条已评估预测时显示。
+
+    Args:
+        route_id: 路线 ID。
+    """
+    from flightscanner.analyzers.evolution_engine import MIN_EVALUATED_FOR_CREDIBILITY  # lazy
+
+    cred = _get_credibility(route_id)
+    if cred["evaluated_count"] < MIN_EVALUATED_FOR_CREDIBILITY:
+        return
+
+    win_rate = cred["win_rate"]
+    if win_rate >= 0.7:
+        color = "#10b981"
+    elif win_rate >= 0.5:
+        color = "#f59e0b"
+    else:
+        color = "#ef4444"
+
+    label = f"AI胜率 {win_rate * 100:.0f}% ({cred['evaluated_count']}次)"
+    st.markdown(
+        f'<span class="fs-chip" style="color:{color};border-color:{color};">{label}</span>',
+        unsafe_allow_html=True,
+    )
+    if cred["circuit_broken"]:
+        st.warning("⚠️ AI 近期连续误判，简报仅供参考")
+
+
+def _render_brief_card(brief: Dict[str, Any], route_id: Optional[int] = None) -> None:
     """Render a formatted AI briefing result card.
 
     Args:
         brief: Dict conforming to the AI output JSON schema.
+        route_id: Route ID used to render the credibility badge (optional).
     """
     trend = brief.get("trend", "稳定")
     confidence = brief.get("confidence", 0.0)
@@ -148,6 +222,10 @@ def _render_brief_card(brief: Dict[str, Any]) -> None:
     label = "DeepSeek AI" if source == "deepseek" else "规则引擎（AI 降级）"
     st.caption(f"分析来源：{label}　·　{date.today()}")
 
+    # ── Credibility badge (G4) ────────────────────────────────────────────────
+    if route_id is not None:
+        _render_credibility_badge(route_id)
+
 
 # ── Main render function ──────────────────────────────────────────────────────
 
@@ -170,9 +248,17 @@ def render_ai_brief(
     cache_key = f"ai_brief_{route.id}_{_12h_window_id()}"
     st.markdown('<p class="fs-section-subtitle">AI 价格简报</p>', unsafe_allow_html=True)
 
+    # ── Circuit breaker guard (G4) ────────────────────────────────────────────
+    cred = _get_credibility(route.id)
+    if cred.get("circuit_broken"):
+        st.warning("⚠️ AI 近期连续误判，已暂停自动分析。如需继续请手动触发。")
+        if not st.button("强制生成", key=f"ai_force_{route.id}"):
+            return
+
     if cache_key not in st.session_state:
         should_trigger, reason = _should_auto_trigger(price_history)
         if should_trigger:
+            evolution_ctx = _get_evolution_context(route.id)
             with st.spinner(f"AI 分析中（{reason}）…"):
                 brief = generate_brief_with_fallback(
                     price_history=price_history,
@@ -181,6 +267,7 @@ def render_ai_brief(
                     api_key=settings.deepseek_api_key or None,
                     base_url=settings.deepseek_base_url,
                     model=settings.deepseek_model,
+                    evolution_context=evolution_ctx,
                 )
             st.session_state[cache_key] = brief
             # fall through to render
@@ -190,6 +277,7 @@ def render_ai_brief(
                 key=f"ai_btn_{route.id}",
                 help="调用 DeepSeek AI 分析价格趋势并给出购票建议（12小时缓存）",
             ):
+                evolution_ctx = _get_evolution_context(route.id)
                 with st.spinner("正在生成 AI 价格分析…"):
                     brief = generate_brief_with_fallback(
                         price_history=price_history,
@@ -198,12 +286,13 @@ def render_ai_brief(
                         api_key=settings.deepseek_api_key or None,
                         base_url=settings.deepseek_base_url,
                         model=settings.deepseek_model,
+                        evolution_context=evolution_ctx,
                     )
                 st.session_state[cache_key] = brief
                 st.rerun()
             return
 
-    _render_brief_card(st.session_state[cache_key])
+    _render_brief_card(st.session_state[cache_key], route_id=route.id)
 
     if st.button(
         "🔄 重新生成",

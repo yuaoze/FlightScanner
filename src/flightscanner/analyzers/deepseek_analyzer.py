@@ -46,7 +46,9 @@ _SYSTEM_PROMPT = """\
   "key_factors": ["影响因素1", "影响因素2"],
   "prediction_7d": "一段中文描述，说明未来7天价格走势",
   "recommendation": "一句话购票建议，例如：立即购买/继续观望/等待节后",
-  "alert_level": "low|medium|high"
+  "alert_level": "low|medium|high",
+  "action": "Buy 或 Wait（基于当前价格和走势的购票建议）",
+  "reason": "一句话说明给出此建议的核心原因"
 }
 """
 
@@ -84,6 +86,7 @@ class DeepSeekBriefingAnalyzer:
         price_history: List[FlightPrice],
         target_date: date,
         route_label: str,
+        evolution_context: str = "",
     ) -> Dict[str, Any]:
         """Call DeepSeek API to generate a price briefing.
 
@@ -91,6 +94,9 @@ class DeepSeekBriefingAnalyzer:
             price_history: Recent price records (should be ≥ 7 for best results).
             target_date:   Target departure date.
             route_label:   Human-readable route string, e.g. "北京 → 东京".
+            evolution_context: Optional G4 evolved context string injected as
+                               system message suffix to incorporate historical
+                               prediction errors.
 
         Returns:
             Parsed JSON dict conforming to the AI output schema.
@@ -119,10 +125,15 @@ class DeepSeekBriefingAnalyzer:
             "请根据以上数据生成价格简报。"
         )
 
+        # ── G4：若有历史失误上下文则追加到 system message ────────────────────
+        system_content = _SYSTEM_PROMPT
+        if evolution_context:
+            system_content = system_content + "\n\n" + evolution_context
+
         response = await self._client.chat.completions.create(
             model=self._model,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
@@ -138,6 +149,7 @@ class DeepSeekBriefingAnalyzer:
         price_history: List[FlightPrice],
         target_date: date,
         route_label: str,
+        evolution_context: str = "",
     ) -> Dict[str, Any]:
         """Synchronous wrapper around :meth:`generate_brief`.
 
@@ -148,11 +160,14 @@ class DeepSeekBriefingAnalyzer:
             price_history: Recent price records.
             target_date:   Target departure date.
             route_label:   Human-readable route string.
+            evolution_context: Optional G4 evolved context string.
 
         Returns:
             Parsed JSON dict.
         """
-        return asyncio.run(self.generate_brief(price_history, target_date, route_label))
+        return asyncio.run(
+            self.generate_brief(price_history, target_date, route_label, evolution_context)
+        )
 
 
 # ── Rule-based fallback brief ─────────────────────────────────────────────────
@@ -202,6 +217,8 @@ def _rule_based_brief(
             else ("等待观望" if trend.direction == "up" else "可继续观望")
         ),
         "alert_level": alert_map.get(trend.direction, "medium"),
+        "action": "Buy" if trend.direction == "down" else "Wait",
+        "reason": "规则引擎：" + trend.recommendation,
         "_source": "rule_based",
     }
 
@@ -213,6 +230,7 @@ def generate_brief_with_fallback(
     api_key: Optional[str] = None,
     base_url: str = "https://api.deepseek.com",
     model: str = "deepseek-chat",
+    evolution_context: str = "",
 ) -> Dict[str, Any]:
     """Generate a price briefing, falling back to rule-based analysis when needed.
 
@@ -228,6 +246,8 @@ def generate_brief_with_fallback(
         api_key:       DeepSeek API key.
         base_url:      API base URL.
         model:         Model name.
+        evolution_context: Optional G4 evolved context string injected into the
+                           system prompt for historical error awareness.
 
     Returns:
         Dict conforming to the AI output schema.  A ``"_source"`` key
@@ -244,7 +264,9 @@ def generate_brief_with_fallback(
         analyzer = DeepSeekBriefingAnalyzer(
             api_key=api_key, base_url=base_url, model=model
         )
-        brief = analyzer.generate_brief_sync(price_history, target_date, route_label)
+        brief = analyzer.generate_brief_sync(
+            price_history, target_date, route_label, evolution_context
+        )
         brief["_source"] = "deepseek"
         return brief
     except Exception as exc:

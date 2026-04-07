@@ -11,7 +11,7 @@ from typing import Optional, List
 from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 
-from flightscanner.models.database import Route, PriceHistory, Flight
+from flightscanner.models.database import Route, PriceHistory, Flight, AIPredictionLog
 from flightscanner.interfaces import FlightPrice
 from flightscanner.utils.city_codes import is_international_route
 
@@ -677,3 +677,78 @@ class RouteService:
         if route:
             route.last_flight_status = status
             self.session.commit()
+
+    # ── AI 进化引擎辅助方法 ────────────────────────────────────────────────
+
+    def log_ai_prediction(
+        self,
+        route_id: int,
+        brief: "Dict[str, Any]",
+        current_price: float,
+        days_until_flight: int,
+    ) -> int:
+        """G1：记录一次 AI 预测，返回新记录 ID。
+
+        Args:
+            route_id: 路线 ID。
+            brief: generate_brief_with_fallback() 返回的简报字典。
+            current_price: 预测时当前最低价。
+            days_until_flight: 距出发天数。
+
+        Returns:
+            新创建的 AIPredictionLog 记录 ID。
+        """
+        from flightscanner.analyzers.evolution_engine import log_prediction  # lazy import
+        log = log_prediction(self.session, route_id, brief, current_price, days_until_flight)
+        return log.id
+
+    def get_last_prediction_time(self, route_id: int) -> "Optional[datetime]":
+        """查询该路线最近一次预测的时间。
+
+        Args:
+            route_id: 路线 ID。
+
+        Returns:
+            最近预测时间（UTC），若无记录则返回 None。
+        """
+        result = (
+            self.session.query(func.max(AIPredictionLog.predicted_at))
+            .filter(AIPredictionLog.route_id == route_id)
+            .scalar()
+        )
+        return result
+
+    def get_pending_predictions_for_backtesting(self) -> "List[AIPredictionLog]":
+        """查询所有已到期但尚未回测的预测记录。
+
+        Returns:
+            outcome_status='pending' 且对应路线 target_date < today 的记录列表。
+        """
+        today = date.today()
+        return (
+            self.session.query(AIPredictionLog)
+            .join(Route, AIPredictionLog.route_id == Route.id)
+            .filter(
+                AIPredictionLog.outcome_status == "pending",
+                Route.target_date < today,
+            )
+            .all()
+        )
+
+    def get_high_pain_predictions_without_rca(self) -> "List[AIPredictionLog]":
+        """查询高痛失误但尚未进行 RCA 的记录。
+
+        Returns:
+            outcome_status='loss'，pain_index > HIGH_PAIN_THRESHOLD，
+            且 rca_run_at IS NULL 的记录列表。
+        """
+        from flightscanner.analyzers.evolution_engine import HIGH_PAIN_THRESHOLD  # lazy import
+        return (
+            self.session.query(AIPredictionLog)
+            .filter(
+                AIPredictionLog.outcome_status == "loss",
+                AIPredictionLog.pain_index > HIGH_PAIN_THRESHOLD,
+                AIPredictionLog.rca_run_at.is_(None),
+            )
+            .all()
+        )
