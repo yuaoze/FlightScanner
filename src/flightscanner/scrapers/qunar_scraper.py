@@ -854,62 +854,20 @@ class QunarScraper(FlightScraper):
     async def _maybe_refresh_and_retry(
         self, params: "SearchParams", page: "Page"
     ) -> "List[FlightPrice]":
-        """交互式提示刷新 Cookie，然后重试搜索（仅限终端交互模式）。
-
-        非终端环境（定时任务、管道输入等）时立即返回空列表。
+        """Cookie 失效时记录警告，立即返回空列表（不弹出交互提示）。
 
         Args:
-            params: 原始搜索参数。
-            page: 当前 Playwright 页面（已打开，用于重试导航）。
+            params: 原始搜索参数（保留签名兼容性，当前实现不使用）。
+            page: 当前 Playwright 页面（保留签名兼容性，当前实现不使用）。
 
         Returns:
-            重试后的航班列表，用户拒绝或失败时返回空列表。
+            空列表。
         """
-        import sys as _sys
-
-        if not _sys.stdin.isatty():
-            return []
-
-        print("\n[去哪儿] 未获取到航班数据，Cookie 可能已失效。")
-        try:
-            answer = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: input(
-                    "[去哪儿] 是否立即打开浏览器重新登录并重试？[Y/n] "
-                ),
-            )
-        except (EOFError, Exception):
-            return []
-
-        if answer.strip().lower() not in ("", "y", "yes"):
-            print("[去哪儿] 已跳过。如需刷新 Cookie，可运行: python scripts/qunar_login.py")
-            return []
-
-        success = await QunarScraper.refresh_cookies_via_login(
-            self.DEFAULT_COOKIES_FILE
+        logger.warning(
+            "[去哪儿] 未获取到航班数据，Cookie 可能已失效。"
+            "如需刷新 Cookie，可运行: python scripts/qunar_login.py"
         )
-        if not success:
-            return []
-
-        # 重新加载并注入新 Cookie
-        self.cookies = self.load_cookies_from_file(self.DEFAULT_COOKIES_FILE)
-        if self.cookies and self._context:
-            await self._context.add_cookies(self.cookies)
-            logger.info(f"[刷新] 已注入 {len(self.cookies)} 条新 Cookie")
-
-        # 用同一个 page 对象重新导航搜索页
-        url = self._build_search_url(params)
-        logger.info(f"[刷新] 重新导航至搜索页: {url}")
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
-            await asyncio.sleep(random.uniform(2, 4))
-            await self._wait_for_results(page)
-            flight_prices = await self._parse_flights(page, params)
-            logger.info(f"[刷新] 重试后获得 {len(flight_prices)} 条航班")
-            return flight_prices
-        except Exception as e:
-            logger.error(f"[刷新] 重试搜索失败: {e}")
-            return []
+        return []
 
     async def _search_via_mobile_api(
         self, params: SearchParams

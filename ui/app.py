@@ -88,10 +88,18 @@ def trigger_immediate_scrape(route_id: int) -> None:
             with st.spinner(f"正在采集 {route.origin} → {route.destination} 的价格…"):
                 asyncio.run(_run())
 
-        st.session_state["_flash"] = (
-            "success",
-            f"{route.origin} → {route.destination} 采集完成，数据已更新。",
-        )
+        if monitor._scrape_warnings:
+            warn_detail = "；".join(monitor._scrape_warnings)
+            st.session_state["_flash"] = (
+                "warning",
+                f"采集完成，但部分平台未返回数据：{warn_detail}。"
+                "如需刷新 Cookie，请运行 python scripts/qunar_login.py 或在 Cookie 管理中重新登录。",
+            )
+        else:
+            st.session_state["_flash"] = (
+                "success",
+                f"{route.origin} → {route.destination} 采集完成，数据已更新。",
+            )
     except Exception as exc:
         st.session_state["_flash"] = ("error", f"采集失败：{exc}")
 
@@ -1107,6 +1115,8 @@ def main() -> None:
             level, msg = st.session_state.pop("_flash")
             if level == "success":
                 st.success(msg)
+            elif level == "warning":
+                st.warning(msg)
             else:
                 st.error(msg)
 

@@ -93,6 +93,7 @@ class PriceMonitorScheduler:
             enable_notifications: 是否启用价格告警推送，默认 False。
         """
         self.headless = headless
+        self._scrape_warnings: List[str] = []  # 最近一次采集的平台级警告（如 Cookie 失效）
 
         # ── 解析爬虫平台列表 ──────────────────────────────────────────────
         platforms = [p.strip() for p in settings.scraper_type.split(",") if p.strip()]
@@ -165,6 +166,7 @@ class PriceMonitorScheduler:
             "开始采集路线 %s：%s → %s（%s）",
             route.id, route.origin, route.destination, route.target_date,
         )
+        self._scrape_warnings = []  # 清空上次采集的平台警告
 
         try:
             # ── 精准航班号监控模式 ─────────────────────────────────────────
@@ -592,11 +594,17 @@ class PriceMonitorScheduler:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_prices: List[FlightPrice] = []
+        _PLATFORM_DISPLAY = {"QunarScraper": "去哪儿", "CtripScraper": "携程"}
         for scraper, result in zip(self.scrapers, results):
             platform = type(scraper).__name__
+            display = _PLATFORM_DISPLAY.get(platform, platform)
             if isinstance(result, Exception):
                 logger.error("%s 采集失败：%s", platform, result)
             elif isinstance(result, list):
+                if not result:
+                    self._scrape_warnings.append(
+                        f"{display} 未获取到数据，Cookie 可能已失效"
+                    )
                 # ── 每平台仅保留最低的前 N 条 ────────────────────────────────
                 limit = getattr(scraper, "max_results", 20)
                 top = sorted(result, key=lambda fp: fp.price)[:limit]
@@ -999,10 +1007,10 @@ class PriceMonitorScheduler:
             try:
                 route_service = RouteService(session)
                 fresh_route = route_service.get_route_by_id(route_id)
-                if fresh_route and fresh_route.is_active:
+                if fresh_route and fresh_route.is_active and fresh_route.target_date >= date.today():
                     await self.scrape_route(fresh_route)
                 else:
-                    logger.info("路线 %s 不存在或已停用，跳过本次采集", route_id)
+                    logger.info("路线 %s 不存在、已停用或已出发，跳过本次采集", route_id)
             finally:
                 session.close()
 
@@ -1075,6 +1083,8 @@ class PriceMonitorScheduler:
             for r in all_routes:
                 if not r.is_active:
                     continue
+                if r.target_date < date.today():
+                    continue  # 历史路线不再调度
 
                 if r.latest_scraped_at:
                     last = r.latest_scraped_at
@@ -1251,8 +1261,8 @@ class PriceMonitorScheduler:
             if not should:
                 return
 
-            from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback
-            brief = generate_brief_with_fallback(
+            from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback_async
+            brief = await generate_brief_with_fallback_async(
                 price_history=price_history,
                 target_date=route.target_date,
                 route_label=f"{route.origin} → {route.destination}",

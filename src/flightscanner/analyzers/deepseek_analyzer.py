@@ -274,3 +274,53 @@ def generate_brief_with_fallback(
         brief = _rule_based_brief(price_history, target_date)
         brief["_source"] = "rule_based"
         return brief
+
+
+async def generate_brief_with_fallback_async(
+    price_history: List[FlightPrice],
+    target_date: date,
+    route_label: str,
+    api_key: Optional[str] = None,
+    base_url: str = "https://api.deepseek.com",
+    model: str = "deepseek-chat",
+    evolution_context: str = "",
+) -> Dict[str, Any]:
+    """Async version of :func:`generate_brief_with_fallback` for use within coroutines.
+
+    Identical logic but awaits the DeepSeek coroutine directly instead of
+    calling ``asyncio.run()``.  Must be used when already inside a running
+    event loop (e.g. APScheduler jobs, async scraper hooks).
+
+    Args:
+        price_history: Historical price records.
+        target_date:   Target departure date.
+        route_label:   Human-readable route string, e.g. "北京 → 东京".
+        api_key:       DeepSeek API key.
+        base_url:      API base URL.
+        model:         Model name.
+        evolution_context: Optional G4 evolved context string.
+
+    Returns:
+        Dict conforming to the AI output schema.
+    """
+    if not api_key or len(price_history) < 7:
+        reason = "api_key 未配置" if not api_key else f"历史记录不足（{len(price_history)} < 7）"
+        logger.info("AI 简报降级到规则引擎：%s", reason)
+        brief = _rule_based_brief(price_history, target_date)
+        brief["_source"] = "rule_based"
+        return brief
+
+    try:
+        analyzer = DeepSeekBriefingAnalyzer(
+            api_key=api_key, base_url=base_url, model=model
+        )
+        brief = await analyzer.generate_brief(
+            price_history, target_date, route_label, evolution_context
+        )
+        brief["_source"] = "deepseek"
+        return brief
+    except Exception as exc:
+        logger.warning("DeepSeek API 调用失败，降级到规则引擎：%s", exc)
+        brief = _rule_based_brief(price_history, target_date)
+        brief["_source"] = "rule_based"
+        return brief

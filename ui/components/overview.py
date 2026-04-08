@@ -369,13 +369,14 @@ def _render_route_card(
                 st.rerun()
 
         with b_scrape:
-            if st.button(
-                "🔄",
-                key=f"scrape_{route.id}",
-                help="立即采集最新价格",
-            ):
-                st.session_state[f"trigger_scrape_{route.id}"] = True
-                st.rerun()
+            if route.target_date >= date.today():
+                if st.button(
+                    "🔄",
+                    key=f"scrape_{route.id}",
+                    help="立即采集最新价格",
+                ):
+                    st.session_state[f"trigger_scrape_{route.id}"] = True
+                    st.rerun()
 
         with b_delete:
             if st.button(

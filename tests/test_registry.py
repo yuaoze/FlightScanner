@@ -461,6 +461,7 @@ class TestScheduleRouteClosureFix:
         fresh_route = MagicMock()
         fresh_route.id = 42
         fresh_route.is_active = True
+        fresh_route.target_date = date.today()
 
         mock_rs = MagicMock()
         mock_rs.get_route_by_id.return_value = fresh_route
