@@ -1126,13 +1126,21 @@ def main() -> None:
         # ── 路线标签页 ─────────────────────────────────────────────────
         n_hist = len(historical_routes)
         tab_label_hist = f"历史记录（{n_hist}）" if n_hist else "历史记录"
-        tab_current, tab_history = st.tabs(["当前监控", tab_label_hist])
+        tab_current, tab_history, tab_radar = st.tabs([
+            "📋 当前监控",
+            f"⏱️ {tab_label_hist}",
+            "🌍 周末灵感雷达",
+        ])
 
         with tab_current:
             render_route_list(upcoming_routes, svc)
 
         with tab_history:
             render_route_list(historical_routes, svc)
+
+        with tab_radar:
+            from ui.components.weekend_radar import render_weekend_radar_tab
+            render_weekend_radar_tab(get_session_local())
 
 
 if __name__ == "__main__":

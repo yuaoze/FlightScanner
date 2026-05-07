@@ -104,16 +104,20 @@ class DeepSeekBriefingAnalyzer:
         Raises:
             Exception: On API error after all retries are exhausted.
         """
-        # ── 构建价格序列 ───────────────────────────────────────────────────────
-        sorted_history = sorted(price_history, key=lambda fp: fp.scraped_at)
+        # ── 构建价格序列（按天聚合取最低价，保证时间跨度覆盖趋势）────────────
+        from collections import defaultdict
+
+        daily_min: dict[str, tuple[float, str, str]] = {}  # date_str → (min_price, time_str, source)
+        for fp in price_history:
+            day_key = fp.scraped_at.strftime("%Y-%m-%d")
+            price_val = float(fp.price)
+            if day_key not in daily_min or price_val < daily_min[day_key][0]:
+                daily_min[day_key] = (price_val, fp.scraped_at.strftime("%Y-%m-%d %H:%M"), fp.source)
+
         price_series = [
-            {
-                "time": fp.scraped_at.strftime("%Y-%m-%d %H:%M"),
-                "price": float(fp.price),
-                "source": fp.source,
-            }
-            for fp in sorted_history[-30:]  # 最多取最近 30 条
-        ]
+            {"time": time_str, "price": price_val, "source": source}
+            for _, (price_val, time_str, source) in sorted(daily_min.items())
+        ][-30:]  # 最多取最近 30 天的每日最低价
 
         days_until = (target_date - date.today()).days
 

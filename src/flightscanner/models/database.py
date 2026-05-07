@@ -320,6 +320,61 @@ class AIPredictionLog(Base):
         )
 
 
+class WeekendRadarCache(Base):
+    """周末低价雷达缓存表。
+
+    存储批量或手动扫描的周末往返航班推荐结果，
+    包含去程/回程基本信息、价格、AI 文案等。
+    """
+
+    __tablename__ = "weekend_radar_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    origin = Column(String(50), nullable=False)
+    destination = Column(String(50), nullable=False)
+    outbound_date = Column(Date, nullable=False)   # 周五
+    return_date = Column(Date, nullable=False)      # 周日
+
+    # 去程信息
+    outbound_flight_no = Column(String(30))
+    outbound_airline = Column(String(50))
+    outbound_dep_time = Column(String(5))    # "HH:MM"
+    outbound_arr_time = Column(String(5))
+    outbound_dep_airport = Column(String(10), nullable=True)
+
+    # 回程信息
+    return_flight_no = Column(String(30))
+    return_airline = Column(String(50))
+    return_dep_time = Column(String(5))
+    return_arr_time = Column(String(5))
+
+    # 价格信息
+    total_price = Column(Numeric(10, 2), nullable=False)
+    currency = Column(String(5), default="CNY")
+    historical_avg = Column(Numeric(10, 2), nullable=True)
+    beat_pct = Column(Integer, nullable=True)    # 击败历史均价%
+
+    # AI 文案（JSON 字符串）
+    ai_brief = Column(Text, nullable=True)
+
+    # 元信息
+    source = Column(String(20))           # "qunar"
+    scan_type = Column(String(20))        # "batch" | "manual"
+    scanned_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
+
+    __table_args__ = (
+        Index("idx_wrc_outbound", "outbound_date"),
+        Index("idx_wrc_dest_date", "destination", "outbound_date"),
+        Index("idx_wrc_scanned", "scanned_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<WeekendRadarCache(id={self.id}, dest='{self.destination}', "
+            f"outbound={self.outbound_date}, price={self.total_price})>"
+        )
+
+
 def _apply_migrations(engine) -> None:
     """幂等地为已存在的表添加新列（SQLite 不支持 IF NOT EXISTS，用 try/except 跳过已存在列）。"""
     stmts = [
@@ -384,6 +439,32 @@ def _apply_migrations(engine) -> None:
             "rca_run_at DATETIME, "
             "error_category TEXT, "
             "rca_analysis TEXT)"
+        ),
+        # 周末低价雷达缓存表（使用 CREATE TABLE IF NOT EXISTS，已有表静默跳过）
+        (
+            "CREATE TABLE IF NOT EXISTS weekend_radar_cache ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "origin TEXT NOT NULL, "
+            "destination TEXT NOT NULL, "
+            "outbound_date DATE NOT NULL, "
+            "return_date DATE NOT NULL, "
+            "outbound_flight_no TEXT, "
+            "outbound_airline TEXT, "
+            "outbound_dep_time TEXT, "
+            "outbound_arr_time TEXT, "
+            "outbound_dep_airport TEXT, "
+            "return_flight_no TEXT, "
+            "return_airline TEXT, "
+            "return_dep_time TEXT, "
+            "return_arr_time TEXT, "
+            "total_price NUMERIC NOT NULL, "
+            "currency TEXT DEFAULT 'CNY', "
+            "historical_avg NUMERIC, "
+            "beat_pct INTEGER, "
+            "ai_brief TEXT, "
+            "source TEXT, "
+            "scan_type TEXT, "
+            "scanned_at DATETIME NOT NULL)"
         ),
     ]
     with engine.connect() as conn:
