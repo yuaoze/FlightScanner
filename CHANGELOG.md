@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.1] - 2026-04-30
+
+### Fixed
+
+- **AI 简报刷新策略**：缓存键从「12 小时时间窗」改为**数据指纹**（最新批次 ID + 时间戳 + 记录数），数据不变则零 token、零 spinner 直接渲染缓存
+- **跨重启持久化**：简报落盘到 `.cache/ai_briefs/route_{id}.json`，Streamlit 冷启动不再每次重算
+- 详见 [feature_log/v1.5.1.md](feature_log/v1.5.1.md)
+
 ## [1.5.0] - 2026-04-30
 
 ### Added

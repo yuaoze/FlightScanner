@@ -56,6 +56,12 @@ dmypy.json
 *.log
 logs/
 
+# AI brief disk cache (regeneratable)
+.cache/
+
+# Claude Code working directory
+.claude/
+
 # Environment variables
 .env
 .env.local
@@ -73,6 +79,7 @@ debug_screenshot.png
 *_debug_*.json
 *_debug_*.html
 *_debug_*.txt
+*_debug_*.bin
 qunar_mobile_api.json
 qunar_mobile_debug.html
 ctrip_batch_search.json
