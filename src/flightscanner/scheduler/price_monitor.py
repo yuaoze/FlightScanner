@@ -23,7 +23,7 @@ from flightscanner.scrapers import ScraperRegistry
 from flightscanner.analyzers import RuleBasedAnalyzer
 from flightscanner.analyzers.rule_based_analyzer import _batch_min_prices
 from flightscanner.notifiers import build_notifiers
-from flightscanner.interfaces import FlightDirection, FlightPrice, FlightScraper, Notifier, PriceTrend, SearchParams
+from flightscanner.interfaces import FlightDirection, FlightInfo, FlightPrice, FlightScraper, Notifier, PriceTrend, SearchParams
 from flightscanner.models.database import init_db
 from flightscanner.utils.config import settings
 
@@ -185,7 +185,7 @@ class PriceMonitorScheduler:
             for scraper in self.scrapers:
                 if hasattr(scraper, "max_results"):
                     scraper.max_results = getattr(route, "max_results", 20)
-            flight_prices = await self._scrape_all_platforms(params)
+            flight_prices = await self._scrape_all_platforms(params, route=route)
 
             if not flight_prices:
                 logger.warning(
@@ -294,8 +294,12 @@ class PriceMonitorScheduler:
         - 机场代码：若路线设置了 dep_airport_code/arr_airport_code，则仅保留
           flight_info.departure_airport_code/arrival_airport_code 匹配的记录。
           若航班无机场代码数据（爬虫未采集到），则放行（宁可放行不可漏掉）。
-        - 时间段：若路线设置了 dep_time_from/dep_time_to，则仅保留
-          起飞时间在该时间段内的航班；arr_time_from/arr_time_to 同理。
+        - 去程时间段：对 direction=DEPARTURE 的记录应用 dep_time_from/to
+          （起飞窗口）和 arr_time_from/to（落地窗口）。
+        - 回程时间段：对 direction=RETURN 的单程记录应用 ret_dep_time_from/to
+          和 ret_arr_time_from/to。若路线没配置回程窗口则 RETURN 记录直接放行。
+        - 组合记录（return_flight_info 非空）：同时检查去程和回程两段都满足
+          各自的时间窗，任一段不合格都剔除。
 
         Args:
             route: 路线配置（含过滤字段）。
@@ -310,45 +314,90 @@ class PriceMonitorScheduler:
         dep_to      = getattr(route, "dep_time_to", None)
         arr_from    = getattr(route, "arr_time_from", None)
         arr_to      = getattr(route, "arr_time_to", None)
+        ret_dep_from = getattr(route, "ret_dep_time_from", None)
+        ret_dep_to   = getattr(route, "ret_dep_time_to", None)
+        ret_arr_from = getattr(route, "ret_arr_time_from", None)
+        ret_arr_to   = getattr(route, "ret_arr_time_to", None)
 
         # 没有任何过滤条件，直接返回
-        if not any([dep_airport, arr_airport, dep_from, dep_to, arr_from, arr_to]):
+        if not any([
+            dep_airport, arr_airport,
+            dep_from, dep_to, arr_from, arr_to,
+            ret_dep_from, ret_dep_to, ret_arr_from, ret_arr_to,
+        ]):
             return prices
 
-        dep_from_min = self._hhmm_to_minutes(dep_from) if dep_from else None
-        dep_to_min   = self._hhmm_to_minutes(dep_to)   if dep_to   else None
-        arr_from_min = self._hhmm_to_minutes(arr_from) if arr_from else None
-        arr_to_min   = self._hhmm_to_minutes(arr_to)   if arr_to   else None
+        # 预计算分钟数
+        def _to_min(v: Optional[str]) -> Optional[int]:
+            return self._hhmm_to_minutes(v) if v else None
+
+        dep_from_min, dep_to_min = _to_min(dep_from), _to_min(dep_to)
+        arr_from_min, arr_to_min = _to_min(arr_from), _to_min(arr_to)
+        ret_dep_from_min, ret_dep_to_min = _to_min(ret_dep_from), _to_min(ret_dep_to)
+        ret_arr_from_min, ret_arr_to_min = _to_min(ret_arr_from), _to_min(ret_arr_to)
+
+        def _check_window(
+            time_str: Optional[str], from_min: Optional[int], to_min: Optional[int]
+        ) -> bool:
+            """True = within window (or no window configured)."""
+            if from_min is None and to_min is None:
+                return True
+            m = self._hhmm_to_minutes(time_str or "00:00")
+            if from_min is not None and m < from_min:
+                return False
+            if to_min is not None and m > to_min:
+                return False
+            return True
+
+        def _check_outbound_leg(fi: FlightInfo) -> bool:
+            """去程 leg：机场 + 去程时间窗。机场信息缺失则放行。"""
+            if dep_airport:
+                fp_dep = fi.departure_airport_code
+                if fp_dep and fp_dep != dep_airport:
+                    return False
+            if arr_airport:
+                fp_arr = fi.arrival_airport_code
+                if fp_arr and fp_arr != arr_airport:
+                    return False
+            if not _check_window(fi.departure_time, dep_from_min, dep_to_min):
+                return False
+            if not _check_window(fi.arrival_time, arr_from_min, arr_to_min):
+                return False
+            return True
+
+        def _check_return_leg(fi: FlightInfo) -> bool:
+            """回程 leg：机场反向（起飞=原到达机场，到达=原出发机场）+ 回程时间窗。"""
+            # 机场反向校验：回程的出发机场 = 原路线的到达机场，反之亦然
+            if arr_airport:
+                fp_dep = fi.departure_airport_code
+                if fp_dep and fp_dep != arr_airport:
+                    return False
+            if dep_airport:
+                fp_arr = fi.arrival_airport_code
+                if fp_arr and fp_arr != dep_airport:
+                    return False
+            if not _check_window(fi.departure_time, ret_dep_from_min, ret_dep_to_min):
+                return False
+            if not _check_window(fi.arrival_time, ret_arr_from_min, ret_arr_to_min):
+                return False
+            return True
 
         result: List[FlightPrice] = []
         for fp in prices:
             fi = fp.flight_info
-
-            # ── 机场过滤（无机场信息的航班放行） ─────────────────────────
-            if dep_airport:
-                fp_dep = fi.departure_airport_code
-                if fp_dep and fp_dep != dep_airport:
+            # 组合记录：两段都必须通过
+            if fp.return_flight_info is not None:
+                if not _check_outbound_leg(fi):
                     continue
-            if arr_airport:
-                fp_arr = fi.arrival_airport_code
-                if fp_arr and fp_arr != arr_airport:
+                if not _check_return_leg(fp.return_flight_info):
                     continue
-
-            # ── 时间段过滤 ────────────────────────────────────────────────
-            if dep_from_min is not None or dep_to_min is not None:
-                dep_min = self._hhmm_to_minutes(fi.departure_time or "00:00")
-                if dep_from_min is not None and dep_min < dep_from_min:
+            elif fi.direction == FlightDirection.RETURN:
+                # 单独的回程记录（Qunar 分程往返在配对前会出现在列表里）
+                if not _check_return_leg(fi):
                     continue
-                if dep_to_min is not None and dep_min > dep_to_min:
+            else:
+                if not _check_outbound_leg(fi):
                     continue
-
-            if arr_from_min is not None or arr_to_min is not None:
-                arr_min = self._hhmm_to_minutes(fi.arrival_time or "00:00")
-                if arr_from_min is not None and arr_min < arr_from_min:
-                    continue
-                if arr_to_min is not None and arr_min > arr_to_min:
-                    continue
-
             result.append(fp)
 
         return result
@@ -554,7 +603,7 @@ class PriceMonitorScheduler:
         return "available"
 
     async def _scrape_all_platforms(
-        self, params: SearchParams
+        self, params: SearchParams, route: Optional[Route] = None,
     ) -> List[FlightPrice]:
         """并发调用所有爬虫并合并去重结果。
 
@@ -567,14 +616,16 @@ class PriceMonitorScheduler:
 
         Args:
             params: 搜索参数，return_date 非空时各爬虫自行处理往返逻辑。
+            route:  路线对象。若提供则在 per-platform top-N 截断前先应用路线
+                    的机场/时间段过滤，避免最便宜的 N 条全部被过滤器剔除。
 
         Returns:
             合并去重后的 FlightPrice 列表，按价格升序排列。
         """
-        return await self._scrape_oneway(params)
+        return await self._scrape_oneway(params, route=route)
 
     async def _scrape_oneway(
-        self, params: SearchParams
+        self, params: SearchParams, route: Optional[Route] = None,
     ) -> List[FlightPrice]:
         """并发调用所有爬虫，合并去重搜索结果。
 
@@ -605,13 +656,52 @@ class PriceMonitorScheduler:
                     self._scrape_warnings.append(
                         f"{display} 未获取到数据，Cookie 可能已失效"
                     )
-                # ── 每平台仅保留最低的前 N 条 ────────────────────────────────
+                # ── 截断前先按路线过滤器筛一遍，避免最便宜的 N 条全被过滤掉 ──
+                # 路线有 dep_time_from=19:00 之类的约束时，"top N 最低价"里
+                # 可能全是清晨/凌晨便宜航班，filter 后一条不剩；先过滤再截
+                # 能保证截到的是"过滤合格集合里最便宜的 N 条"。
+                # _apply_route_filters 内部按方向区分（DEPARTURE 用 dep_*、
+                # RETURN 用 ret_*），回程若无对应配置则放行。
+                if route is not None:
+                    before = len(result)
+                    result = self._apply_route_filters(route, result)
+                    if len(result) != before:
+                        logger.info(
+                            "%s 路线过滤（去程/回程按路线时间窗/机场筛）：%d → %d 条",
+                            platform, before, len(result),
+                        )
+
+                # ── 每平台仅保留最低的前 N 条（方向感知） ────────────────────
+                # 分程往返（Qunar 国内/国际降级）返回 DEPARTURE + RETURN 两组
+                # 单程记录，若混合排序后只切 N 条，可能把一整个方向全切掉，导致
+                # 下游 _combine_roundtrip_prices 无法配对。按方向分别切，保证
+                # 两边都保留。已含 return_flight_info 的组合记录（携程、Qunar
+                # 国际 interroundtrip_compare）只占 DEPARTURE 组，行为不变。
                 limit = getattr(scraper, "max_results", 20)
-                top = sorted(result, key=lambda fp: fp.price)[:limit]
-                logger.info(
-                    "%s 采集到 %d 条结果，保留最低 %d 条",
-                    platform, len(result), len(top),
+                departures = [
+                    fp for fp in result
+                    if fp.flight_info.direction == FlightDirection.DEPARTURE
+                ]
+                returns = [
+                    fp for fp in result
+                    if fp.flight_info.direction == FlightDirection.RETURN
+                ]
+                top = (
+                    sorted(departures, key=lambda fp: fp.price)[:limit]
+                    + sorted(returns, key=lambda fp: fp.price)[:limit]
                 )
+                if returns:
+                    logger.info(
+                        "%s 采集到 %d 条结果（去程 %d / 回程 %d），"
+                        "保留最低 %d 条（去程+回程各最多 %d）",
+                        platform, len(result), len(departures), len(returns),
+                        len(top), limit,
+                    )
+                else:
+                    logger.info(
+                        "%s 采集到 %d 条结果，保留最低 %d 条",
+                        platform, len(result), len(top),
+                    )
                 all_prices.extend(top)
 
         # ── 去重：同平台同航班同舱位保留最低价，不同平台数据独立保留 ────────────
@@ -692,6 +782,10 @@ class PriceMonitorScheduler:
                         scraped_at=out_fp.scraped_at,
                         source=out_fp.source,
                         return_flight_info=ret_fp.flight_info,
+                        # 继承去程的 batch_id —— 调度器在此函数之前已给 single_leg
+                        # 记录打了 batch_id，若不拷贝，合并后的新记录 batch_id=None，
+                        # 存库时就会出现"已保存 N 条"但前端按 batch 分组查不到的假象。
+                        batch_id=out_fp.batch_id,
                     )
                 )
         elif single_leg:
@@ -1195,6 +1289,19 @@ class PriceMonitorScheduler:
                 except Exception:
                     logger.exception("每日进化任务注册失败，G2/G3 将不会自动运行")
 
+                # ── 周末低价雷达批处理：每周二、三 UTC 18:00（北京时间 02:00）──
+                try:
+                    from apscheduler.triggers.cron import CronTrigger as CronTrigger2
+                    self.scheduler.add_job(
+                        self._run_weekend_radar_batch,
+                        CronTrigger2(day_of_week="tue,wed", hour=18, minute=0, timezone="UTC"),
+                        id="weekend_radar_batch",
+                        replace_existing=True,
+                    )
+                    logger.info("周末低价雷达批处理任务已注册（周二/三 UTC 18:00）")
+                except Exception:
+                    logger.exception("周末低价雷达批处理任务注册失败")
+
                 # ── 调度所有活跃路线（非关键：失败不阻断主循环） ──────────────
                 try:
                     self.reschedule_all_routes()
@@ -1301,6 +1408,109 @@ class PriceMonitorScheduler:
                 logger.info("[Evolution] G3 完成，处理 %d 条", n3)
             except Exception as exc:
                 logger.error("[Evolution] G3 RCA 失败：%s", exc, exc_info=True)
+
+    async def _run_weekend_radar_batch(self) -> None:
+        """周末低价雷达批处理任务（每周二/三凌晨执行）。
+
+        扫描未来 4 个周末的全量目的地池，为每条 WeekendDeal 生成 AI 文案，
+        并将结果写入 WeekendRadarCache 表。同时清理超过 7 天的旧缓存记录。
+        """
+        from datetime import timezone
+        from flightscanner.weekend_radar.scanner import WeekendRadarScanner, get_upcoming_weekends
+        from flightscanner.weekend_radar.brief_generator import generate_weekend_brief
+        from flightscanner.weekend_radar.destinations import INTERNATIONAL_DESTINATIONS
+        from flightscanner.models.database import WeekendRadarCache
+
+        logger.info("[WeekendRadar] 开始批处理扫描…")
+        scanner = WeekendRadarScanner(self.scrapers)
+        weekends = get_upcoming_weekends(8)
+        now = datetime.now(timezone.utc)
+
+        for friday, sunday in weekends:
+            logger.info("[WeekendRadar] 扫描周末：%s → %s", friday, sunday)
+            try:
+                deals = await scanner.scan_weekend(
+                    outbound_date=friday,
+                    return_date=sunday,
+                    progress_callback=lambda d: logger.debug("[WeekendRadar] 扫描 %s…", d),
+                )
+            except Exception:
+                logger.exception("[WeekendRadar] 周末 %s 扫描失败，跳过", friday)
+                continue
+
+            for deal in deals:
+                is_intl = deal.destination in INTERNATIONAL_DESTINATIONS
+                api_key = getattr(settings, "deepseek_api_key", None)
+                try:
+                    brief = await generate_weekend_brief(
+                        destination=deal.destination,
+                        outbound_info=deal.outbound_flight,
+                        return_info=deal.return_flight,
+                        total_price=deal.total_price,
+                        historical_avg=deal.historical_avg,
+                        is_international=is_intl,
+                        api_key=api_key,
+                        base_url=getattr(settings, "deepseek_base_url", "https://api.deepseek.com"),
+                        model=getattr(settings, "deepseek_model", "deepseek-chat"),
+                    )
+                except Exception:
+                    logger.warning("[WeekendRadar] AI 文案失败：%s，使用空文案", deal.destination)
+                    brief = None
+
+                import json as _json
+                beat_pct = brief.get("beat_pct") if brief else deal.beat_pct
+
+                session = self._SessionLocal()
+                try:
+                    record = WeekendRadarCache(
+                        origin="上海",
+                        destination=deal.destination,
+                        outbound_date=friday,
+                        return_date=sunday,
+                        outbound_flight_no=deal.outbound_flight.flight_no,
+                        outbound_airline=deal.outbound_flight.airline,
+                        outbound_dep_time=deal.outbound_flight.departure_time,
+                        outbound_arr_time=deal.outbound_flight.arrival_time,
+                        outbound_dep_airport=deal.outbound_flight.departure_airport_code,
+                        return_flight_no=deal.return_flight.flight_no,
+                        return_airline=deal.return_flight.airline,
+                        return_dep_time=deal.return_flight.departure_time,
+                        return_arr_time=deal.return_flight.arrival_time,
+                        total_price=deal.total_price,
+                        currency=deal.currency,
+                        historical_avg=deal.historical_avg,
+                        beat_pct=beat_pct,
+                        ai_brief=_json.dumps(brief, ensure_ascii=False) if brief else None,
+                        source=deal.source,
+                        scan_type="batch",
+                        scanned_at=now,
+                    )
+                    session.add(record)
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    logger.warning("[WeekendRadar] 写入缓存失败：%s", deal.destination, exc_info=True)
+                finally:
+                    session.close()
+
+        # ── 清理超过 7 天的旧记录 ──────────────────────────────────────────────
+        cutoff = now - timedelta(days=7)
+        session = self._SessionLocal()
+        try:
+            deleted = (
+                session.query(WeekendRadarCache)
+                .filter(WeekendRadarCache.scanned_at < cutoff)
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+            logger.info("[WeekendRadar] 清理旧缓存 %d 条（7天前）", deleted)
+        except Exception:
+            session.rollback()
+            logger.warning("[WeekendRadar] 清理旧缓存失败", exc_info=True)
+        finally:
+            session.close()
+
+        logger.info("[WeekendRadar] 批处理扫描完成")
 
     def stop(self) -> None:
         """停止调度器并清理所有爬虫资源。"""

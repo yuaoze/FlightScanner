@@ -62,6 +62,10 @@ class RouteWithLatestPrice:
     dep_time_to: Optional[str] = None
     arr_time_from: Optional[str] = None
     arr_time_to: Optional[str] = None
+    ret_dep_time_from: Optional[str] = None
+    ret_dep_time_to: Optional[str] = None
+    ret_arr_time_from: Optional[str] = None
+    ret_arr_time_to: Optional[str] = None
     last_notified_at: Optional[datetime] = None
     last_notified_price: Optional[Decimal] = None
     max_results: int = 20
@@ -106,6 +110,10 @@ class RouteService:
         dep_time_to: Optional[str] = None,
         arr_time_from: Optional[str] = None,
         arr_time_to: Optional[str] = None,
+        ret_dep_time_from: Optional[str] = None,
+        ret_dep_time_to: Optional[str] = None,
+        ret_arr_time_from: Optional[str] = None,
+        ret_arr_time_to: Optional[str] = None,
         max_results: int = 20,
         monitoring_mode: str = "route",
         outbound_flight_no: Optional[str] = None,
@@ -173,6 +181,10 @@ class RouteService:
             dep_time_to=dep_time_to or None,
             arr_time_from=arr_time_from or None,
             arr_time_to=arr_time_to or None,
+            ret_dep_time_from=ret_dep_time_from or None,
+            ret_dep_time_to=ret_dep_time_to or None,
+            ret_arr_time_from=ret_arr_time_from or None,
+            ret_arr_time_to=ret_arr_time_to or None,
             max_results=max_results,
             monitoring_mode=monitoring_mode,
             outbound_flight_no=outbound_flight_no or None,
@@ -292,6 +304,10 @@ class RouteService:
                 Route.dep_time_to,
                 Route.arr_time_from,
                 Route.arr_time_to,
+                Route.ret_dep_time_from,
+                Route.ret_dep_time_to,
+                Route.ret_arr_time_from,
+                Route.ret_arr_time_to,
                 Route.last_notified_at,
                 Route.last_notified_price,
                 Route.max_results,
@@ -343,6 +359,10 @@ class RouteService:
                     dep_time_to=row.dep_time_to,
                     arr_time_from=row.arr_time_from,
                     arr_time_to=row.arr_time_to,
+                    ret_dep_time_from=row.ret_dep_time_from,
+                    ret_dep_time_to=row.ret_dep_time_to,
+                    ret_arr_time_from=row.ret_arr_time_from,
+                    ret_arr_time_to=row.ret_arr_time_to,
                     last_notified_at=row.last_notified_at,
                     last_notified_price=(
                         Decimal(str(row.last_notified_price))

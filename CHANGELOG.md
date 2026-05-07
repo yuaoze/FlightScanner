@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.4.2] - 2026-04-30
+
+### Fixed
+
+- **去哪儿国内线 DOM 抓取**：国内线 `touchInnerList` 的 `data` 字段是反爬混淆的 scrambled JSON + 内嵌 IIFE，改为从 React 渲染完成后的 `ul.list-content li.list-row.item` DOM 直接取数
+- **国内往返分程采集**：`search_flights()` 增加国内往返分支，复用 `_search_inter_roundtrip_fallback` 分程搜索
+- **方向感知 top-N 截断**：`_scrape_oneway` 按 DEPARTURE/RETURN 分别排序切 top N，避免单侧空导致配对失败
+- **路线过滤器前置**：截断前先按路线时间窗/机场筛，保证截到的是"合规集合的最便宜 N 条"而非"最便宜的 N 条里合规的"
+- **回程时间窗字段**：`routes` 表新增 `ret_dep_time_from/to`、`ret_arr_time_from/to` 4 列；过滤器按记录类型分流校验（组合记录两段都查、RETURN 单程用 `ret_*`、机场反向）
+- **组合记录继承 `batch_id`**：`_combine_roundtrip_prices` 创建新 `FlightPrice` 时漏传 `batch_id`，导致 Qunar 往返数据被 UI 静默过滤
+- **来源映射前缀容错**：`_source_label()` 前缀匹配 `qunar_*` / `ctrip_*`；同时把爬虫内 `qunar_api` / `qunar_mobile` 统一为 `qunar`
+- 详见 [feature_log/v1.4.2.md](feature_log/v1.4.2.md)
+
 ## [1.2.0] - 2026-03-26
 
 ### Added

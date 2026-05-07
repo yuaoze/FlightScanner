@@ -13,6 +13,8 @@ from decimal import Decimal
 from typing import List, Optional, Dict
 from urllib.parse import quote
 
+import httpx
+
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -476,6 +478,18 @@ class QunarScraper(FlightScraper):
             )
             return await self._search_inter_roundtrip_fallback(params)
 
+        # ── 国内往返程：分别搜去程和回程两条单程，方向打 RETURN 让上游配对 ──
+        # 国内线没有 interroundtrip_compare 这种组合 API，单程搜索是唯一路径。
+        # 不做这一步的话，上游 _combine_roundtrip_prices 会只拿到去程，回程 0 条
+        # 导致配对失败。
+        if params.return_date:
+            logger.info(
+                "[往返] 国内往返程: %s→%s, 去程 %s 回程 %s，走分程搜索",
+                params.departure_city, params.arrival_city,
+                params.departure_date, params.return_date,
+            )
+            return await self._search_inter_roundtrip_fallback(params)
+
         page: Optional[Page] = None
         captured_api_responses: List[Dict] = []
 
@@ -659,7 +673,7 @@ class QunarScraper(FlightScraper):
                 )
                 flight_prices = self._parse_api_responses(captured_api_responses, params)
 
-            # If still nothing, try mobile API (requires cookies / login state)
+            # If still nothing, try direct HTTP API first (bypasses fingerprint detection)
             if not flight_prices:
                 import json as _json
                 debug_api_path = "qunar_debug_api_responses.json"
@@ -669,14 +683,20 @@ class QunarScraper(FlightScraper):
                         ensure_ascii=False, indent=2, default=str,
                     )
                 logger.warning(
-                    f"桌面端未获取到航班. 调试文件: qunar_debug_no_flights.png, "
-                    f"qunar_debug_no_flights.html, {debug_api_path} "
+                    f"桌面端未获取到航班. 调试文件: {debug_api_path} "
                     f"({len(captured_api_responses)} 条 API 响应已保存)"
                 )
 
                 if self.cookies:
-                    logger.info("已检测到 Cookie，切换移动端 API 重试...")
-                    flight_prices = await self._search_via_mobile_api(params)
+                    # 优先：HTTP 直连 touchInnerList（绕过 Playwright 指纹检测）
+                    logger.info("已检测到 Cookie，尝试 HTTP 直连 touchInnerList...")
+                    flight_prices = await self._search_domestic_via_http(params)
+
+                    # 降级：Playwright 移动端页面
+                    if not flight_prices:
+                        logger.info("HTTP 直连无结果，切换 Playwright 移动端页面...")
+                        flight_prices = await self._search_via_mobile_api(params)
+
                     if not flight_prices:
                         logger.warning(
                             "移动端 API 也未返回数据。"
@@ -851,6 +871,97 @@ class QunarScraper(FlightScraper):
         )
         return url
 
+    async def _search_domestic_via_http(self, params: SearchParams) -> List[FlightPrice]:
+        """通过 httpx 直接调用 touchInnerList API 获取国内航班数据。
+
+        绕过 Playwright 页面渲染，避免浏览器指纹检测问题。
+        需要有效的登录 Cookie。
+
+        Args:
+            params: 搜索参数。
+
+        Returns:
+            解析得到的 FlightPrice 列表，失败时返回空列表。
+        """
+        if not self.cookies:
+            logger.warning("[HTTP直连] 无 Cookie，跳过 HTTP 直连尝试")
+            return []
+
+        dep_city = params.departure_city
+        arr_city = params.arrival_city
+        go_date = params.departure_date.strftime("%Y-%m-%d")
+
+        # 构造 Cookie 字符串
+        cookie_str = "; ".join(
+            f"{c['name']}={c['value']}" for c in self.cookies
+            if c.get("domain", "").endswith("qunar.com")
+        )
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                "Version/16.0 Mobile/15E148 Safari/604.1"
+            ),
+            "Referer": (
+                f"https://m.flight.qunar.com/ncs/page/flightlist"
+                f"?depCity={quote(dep_city)}&arrCity={quote(arr_city)}"
+                f"&goDate={go_date}"
+            ),
+            "Cookie": cookie_str,
+            "Accept": "application/json, text/plain, */*",
+        }
+
+        # touchInnerList API URL（移动端去哪儿航班列表接口）
+        api_url = (
+            f"https://m.flight.qunar.com/ncs/page/touchInnerList"
+            f"?depCity={quote(dep_city)}&arrCity={quote(arr_city)}"
+            f"&goDate={go_date}&child=0&baby=0&cabinType=0"
+            f"&from=touch_index_search&queryType=0"
+        )
+
+        logger.info("[HTTP直连] 调用 touchInnerList: %s → %s, %s", dep_city, arr_city, go_date)
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                # 首次请求可能返回空 data（搜索中），需要轮询
+                for attempt in range(6):
+                    resp = await client.get(api_url, headers=headers)
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "[HTTP直连] HTTP %d, 响应: %s",
+                            resp.status_code, resp.text[:200],
+                        )
+                        return []
+
+                    data = resp.json()
+                    # 检查是否是有效响应（data 字段非空）
+                    inner = data.get("data", "")
+                    if isinstance(inner, str) and inner.strip():
+                        logger.info("[HTTP直连] 获得有效响应（第%d次请求）", attempt + 1)
+                        return self._parse_touch_inner_list_response(data, params)
+                    if isinstance(inner, dict):
+                        logger.info("[HTTP直连] 获得有效响应 dict（第%d次请求）", attempt + 1)
+                        return self._parse_touch_inner_list_response(data, params)
+
+                    # data 为空字符串 = 搜索中，等待后重试
+                    if data.get("ret") is False:
+                        logger.warning("[HTTP直连] ret=false: %s", data.get("msg", ""))
+                        return []
+
+                    logger.debug("[HTTP直连] 搜索中（data为空），等待 3s 后重试...")
+                    await asyncio.sleep(3)
+
+                logger.warning("[HTTP直连] 轮询 6 次后仍无有效数据")
+                return []
+
+        except httpx.HTTPError as e:
+            logger.warning("[HTTP直连] HTTP 请求异常: %s", e)
+            return []
+        except Exception as e:
+            logger.error("[HTTP直连] 未知异常: %s", e)
+            return []
+
     async def _maybe_refresh_and_retry(
         self, params: "SearchParams", page: "Page"
     ) -> "List[FlightPrice]":
@@ -892,11 +1003,25 @@ class QunarScraper(FlightScraper):
             page = await self._context.new_page()
 
             # ── 拦截 touchInnerList 响应 ───────────────────────────────────
+            _raw_body_counter = {"n": 0}
+
             async def _intercept_touch(route, request):
                 try:
                     resp = await route.fetch()
                     body = await resp.body()
                     import json as _j
+                    # 保存首次拦截的原始 body 到文件，便于离线分析结构
+                    if _raw_body_counter["n"] == 0:
+                        try:
+                            with open("qunar_debug_mobile_raw.bin", "wb") as _bf:
+                                _bf.write(body)
+                            logger.info(
+                                f"[移动端] 原始 body 已保存到 qunar_debug_mobile_raw.bin "
+                                f"(len={len(body)}, 状态码={resp.status})"
+                            )
+                        except Exception as _e:
+                            logger.debug(f"[移动端] 保存原始 body 失败: {_e}")
+                        _raw_body_counter["n"] += 1
                     logger.debug(
                         f"[移动端] 原始响应体 len={len(body)} "
                         f"前200字节={body[:200]!r}"
@@ -937,20 +1062,60 @@ class QunarScraper(FlightScraper):
                 # 页面可能跳转到登录页导致 navigation 异常，属正常情况
                 logger.debug(f"[移动端] goto 异常（可能是登录跳转）: {e}")
 
-            # 等待有效响应（data 字段非空），最多 30 秒
-            # Qunar 移动端是两阶段响应：首次 data="" 表示搜索中，后续 data="..." 才是数据
+            # 等待有效航班数据响应（跳过状态码响应如 "18"），最多 30 秒
+            import json as _poll_json
+
+            def _try_parse_inner(raw: str):
+                """Parse inner `data` string as JSON, tolerating extra trailing data."""
+                try:
+                    return _poll_json.loads(raw)
+                except (_poll_json.JSONDecodeError, ValueError):
+                    try:
+                        dec = _poll_json.JSONDecoder()
+                        parsed, _ = dec.raw_decode(raw.strip())
+                        return parsed
+                    except Exception:
+                        return None
+
+            # 航班列表的候选 key 名（国际线用 flights；国内线可能用其他名称如
+            # innerFlights / list / results — 全部接受以提升兼容性）。
+            _FLIGHT_LIST_KEYS = ("flights", "innerFlights", "list", "results", "data")
+
+            def _extract_flight_list(parsed) -> Optional[list]:
+                """Return a non-empty flight list from parsed inner JSON, or None."""
+                if not isinstance(parsed, dict):
+                    return None
+                for k in _FLIGHT_LIST_KEYS:
+                    v = parsed.get(k)
+                    if isinstance(v, list) and v:
+                        return v
+                return None
+
             def _has_valid_response() -> bool:
                 for resp in intercepted:
                     raw = resp.get("data", {}).get("data", "")
-                    if isinstance(raw, str) and raw.strip():
+                    if not isinstance(raw, str) or len(raw) < 50:
+                        continue
+                    parsed = _try_parse_inner(raw)
+                    if _extract_flight_list(parsed) is not None:
                         return True
-                    if isinstance(raw, dict):
+                    # 放宽兜底：任何 ≥ 10 KB 的可解析 dict 都视为有效，
+                    # 由下游 parser 处理具体结构差异（国内外线路可能不同）。
+                    if isinstance(parsed, dict) and len(raw) >= 10_000:
                         return True
                 return False
 
             for _poll_i in range(60):  # 最多等 30 秒（每次 0.5s）
                 if _has_valid_response():
                     logger.info(f"[移动端] 有效响应已就绪，轮询退出（第{_poll_i+1}次）")
+                    break
+                # 若已有响应但 data 字段无法解析（很可能是国内线反爬混淆），
+                # 再等下去也是徒劳——提前退出去走 DOM 路径。
+                if _poll_i >= 6 and intercepted:
+                    logger.info(
+                        "[移动端] 已捕获响应但无法识别为 JSON（疑似反爬混淆），"
+                        "提前切换 DOM 解析路径"
+                    )
                     break
                 if _poll_i % 10 == 0:  # 每 5 秒打一条进度日志
                     logger.info(
@@ -959,26 +1124,98 @@ class QunarScraper(FlightScraper):
                     )
                 await asyncio.sleep(0.5)
             else:
-                logger.warning("[移动端] 等待 30 秒后仍无有效响应，超时退出")
+                logger.warning("[移动端] 等待 30 秒后仍无有效响应，切换 DOM 解析路径")
+
+            # ── 国内线兜底：从浏览器渲染完成的 DOM 里抓数据 ─────────────────
+            # 去哪儿国内线对 touchInnerList 的 data 字段做了反爬混淆（scrambled
+            # JSON 片段 + 尾部 IIFE 由浏览器 eval 重组），Python 端无法直接解析。
+            # 但 React 会在页面上渲染真实的航班列表 <li class="list-row item">，
+            # 所以改从 DOM 取数。国际线能继续走 API 路径（data 字段本身就是有效
+            # JSON），DOM 解析作为兜底，两路都试。
+            dom_results = await self._parse_mobile_dom(page, params)
+            if dom_results:
+                logger.info(f"[移动端] DOM 解析成功 {len(dom_results)} 条航班")
+                return dom_results
+            else:
+                logger.info("[移动端] DOM 未解析到航班，回退到 API 响应路径")
 
             if not intercepted:
                 logger.warning("[移动端] 未捕获到 touchInnerList 响应")
                 return []
 
-            # 取第一条有效（非空 data）的响应
+            # ── 选择有效响应：跳过 status code / 空响应，取真正的航班 JSON ──
+            # 首个 touchInnerList 调用可能返回 data: "18"（状态码），
+            # 真正的航班数据在后续调用中（3MB JSON blob）。
+            # 保存所有拦截响应以便排查（含首块原始内容 + 顶层 keys）。
+            _mobile_debug_path = "qunar_debug_mobile_responses.json"
+            try:
+                _debug_entries = []
+                for r in intercepted:
+                    raw = r.get("data", {}).get("data", "")
+                    raw_str = raw if isinstance(raw, str) else ""
+                    _parsed_preview = _try_parse_inner(raw_str) if raw_str else None
+                    _top_keys = (
+                        list(_parsed_preview.keys())[:20]
+                        if isinstance(_parsed_preview, dict) else None
+                    )
+                    _debug_entries.append({
+                        "url": r["url"],
+                        "ret": r.get("data", {}).get("ret"),
+                        "code": r.get("data", {}).get("code"),
+                        "data_len": len(raw_str),
+                        "data_head": raw_str[:2000] if raw_str else "",
+                        "data_tail": raw_str[-2000:] if raw_str else "",
+                        "parsed_top_keys": _top_keys,
+                    })
+                with open(_mobile_debug_path, "w", encoding="utf-8") as _fd:
+                    _poll_json.dump(_debug_entries, _fd, ensure_ascii=False, indent=2, default=str)
+                # 同时把第一个响应的完整 data 字段写入独立文件，方便离线 grep
+                if intercepted:
+                    first_raw = intercepted[0].get("data", {}).get("data", "")
+                    if isinstance(first_raw, str):
+                        with open("qunar_debug_mobile_data_full.txt", "w", encoding="utf-8") as _ff:
+                            _ff.write(first_raw)
+                        logger.info(
+                            f"[移动端] 完整 data 字段已写入 qunar_debug_mobile_data_full.txt "
+                            f"(len={len(first_raw)})"
+                        )
+            except Exception as _dbg_e:
+                logger.debug(f"[移动端] 写入调试文件失败: {_dbg_e}")
+
+            # 优先选中含已知航班列表 key 的响应；否则退回"最大的可解析 dict"。
             target = None
+            best_fallback = None
+            best_fallback_len = 0
             for resp in intercepted:
                 raw = resp.get("data", {}).get("data", "")
-                if isinstance(raw, str) and raw.strip():
+                if not isinstance(raw, str) or len(raw) < 50:
+                    continue
+                parsed = _try_parse_inner(raw)
+                if parsed is None:
+                    continue
+                fl = _extract_flight_list(parsed)
+                if fl is not None:
                     target = resp["data"]
+                    logger.info(
+                        "[移动端] 选中有效航班响应: data_len=%d, 列表=%d 条, keys=%s",
+                        len(raw), len(fl),
+                        list(parsed.keys())[:10] if isinstance(parsed, dict) else None,
+                    )
                     break
-                if isinstance(raw, dict):
-                    target = resp["data"]
-                    break
+                if isinstance(parsed, dict) and len(raw) > best_fallback_len:
+                    best_fallback = resp["data"]
+                    best_fallback_len = len(raw)
+
+            if target is None and best_fallback is not None:
+                target = best_fallback
+                logger.warning(
+                    "[移动端] 未找到已知航班列表 key，退回最大响应（len=%d）交由 parser 处理",
+                    best_fallback_len,
+                )
 
             if target is None:
                 logger.warning(
-                    f"[移动端] 所有 {len(intercepted)} 条响应 data 字段均为空，"
+                    f"[移动端] 所有 {len(intercepted)} 条响应均无有效航班数据，"
                     "可能 Cookie 已失效或需要重新登录"
                 )
                 return []
@@ -993,6 +1230,179 @@ class QunarScraper(FlightScraper):
         finally:
             if page:
                 await page.close()
+
+    async def _parse_mobile_dom(
+        self, page: Page, params: SearchParams
+    ) -> List[FlightPrice]:
+        """从移动端页面渲染后的 DOM 抓取航班列表。
+
+        去哪儿国内线对 touchInnerList API 的 data 字段做了反爬混淆（scrambled
+        JSON 片段 + 尾部混淆 JS 重组），Python 端无法直接解析，但浏览器渲染完
+        成后真实数据会落到 ``<ul class="list-content"><li class="list-row item">``
+        元素里，直接从 DOM 提取即可。
+
+        DOM 结构（2026-04 实测）::
+
+            <li class="list-row item">
+              <div class="list-info">
+                <div class="airpot-info">
+                  <div class="from-info">
+                    <p class="from-time">07:55</p>
+                    <p class="from-place">浦东T2</p>
+                  </div>
+                  <div class="time-info">
+                    <p class="howlong"><span class="time">2时30分</span></p>
+                    <p><span class="stop-city"></span></p>   <!-- 空=直飞 -->
+                  </div>
+                  <div class="to-info">
+                    <span class="add-day"></span>            <!-- +1天标记 -->
+                    <p class="to-time">10:25</p>
+                    <p class="to-place">白云T1</p>
+                  </div>
+                </div>
+                <div class="company-info">
+                  <span class="company1">国航CA8327 空客321(中)</span>
+                </div>
+              </div>
+              <div class="price1">
+                <p class="price-info"><span class="price-icon"></span><span>420</span></p>
+              </div>
+            </li>
+
+        Args:
+            page:   Playwright 页面对象（已导航到移动端搜索页）。
+            params: 搜索参数。
+
+        Returns:
+            解析得到的 FlightPrice 列表，DOM 未加载或无航班时返回空列表。
+        """
+        import re as _re
+
+        results: List[FlightPrice] = []
+
+        # 等待航班列表渲染完成（React 会在数据就绪后填充 li.list-row.item）
+        try:
+            await page.wait_for_selector(
+                "ul.list-content li.list-row.item", timeout=20000
+            )
+        except Exception as e:
+            logger.debug(f"[移动端 DOM] 等待航班 li 超时: {e}")
+            return results
+
+        # 额外给一点时间让 list 完全渲染（有时 React 会增量补齐）
+        await asyncio.sleep(1.5)
+
+        try:
+            rows = await page.query_selector_all("ul.list-content li.list-row.item")
+        except Exception as e:
+            logger.warning(f"[移动端 DOM] 枚举航班行失败: {e}")
+            return results
+
+        logger.info(f"[移动端 DOM] 发现 {len(rows)} 个航班行，开始解析")
+
+        for row in rows:
+            try:
+                # ── 起飞/到达时间 + 机场 ───────────────────────────────────
+                dep_time_el = await row.query_selector(".from-info .from-time")
+                arr_time_el = await row.query_selector(".to-info .to-time")
+                dep_place_el = await row.query_selector(".from-info .from-place")
+                arr_place_el = await row.query_selector(".to-info .to-place")
+
+                dep_time = (await dep_time_el.inner_text()).strip() if dep_time_el else ""
+                arr_time = (await arr_time_el.inner_text()).strip() if arr_time_el else ""
+                dep_place = (await dep_place_el.inner_text()).strip() if dep_place_el else ""
+                arr_place = (await arr_place_el.inner_text()).strip() if arr_place_el else ""
+
+                if not dep_time or not arr_time:
+                    continue
+
+                # ── 中转城市（空=直飞） ───────────────────────────────────
+                stop_el = await row.query_selector(".stop-city")
+                stop_text = (await stop_el.inner_text()).strip() if stop_el else ""
+                if stop_text:
+                    # 只抓直飞，跳过中转（中转机票通常是两段组合，不适合追价）
+                    continue
+
+                # ── 航司 + 航班号 + 机型 ───────────────────────────────────
+                company_el = await row.query_selector(".company-info .company1")
+                if not company_el:
+                    continue
+                company_text = (await company_el.inner_text()).strip()
+                # 典型格式: "国航CA8327 空客321(中)"；代号共享格式:
+                # "东航MU5307\n南航CZ8519" — 取第一行（实际承运）
+                company_first = company_text.split("\n")[0].strip()
+
+                # 提取航班号（2字母+3~4数字）
+                m = _re.search(r"([A-Z0-9]{2})(\d{3,4})", company_first)
+                if not m:
+                    continue
+                flight_no = m.group(0)
+                airline = company_first[: m.start()].strip() or "未知航空"
+
+                # ── 价格：.price1 .price-info 里的最后一个 <span> ─────────
+                price_spans = await row.query_selector_all(".price1 .price-info span")
+                price: Optional[Decimal] = None
+                for sp in price_spans:
+                    txt = (await sp.inner_text()).strip()
+                    if not txt:
+                        continue
+                    digits = "".join(c for c in txt if c.isdigit() or c == ".")
+                    if digits:
+                        try:
+                            price = Decimal(digits)
+                        except Exception:
+                            continue
+                if price is None or price <= 0:
+                    continue
+
+                # ── 跨日判断：.add-day 非空即 +N天 ────────────────────────
+                add_day_el = await row.query_selector(".add-day")
+                add_day_text = (await add_day_el.inner_text()).strip() if add_day_el else ""
+                arrival_date = params.departure_date
+                if add_day_text:
+                    # 文本形如 "+1天"、"+2天"；也兜底处理未给数字的情况
+                    dm = _re.search(r"\+(\d+)", add_day_text)
+                    extra_days = int(dm.group(1)) if dm else 1
+                    arrival_date = QunarScraper._compute_arrival_date(
+                        params.departure_date, dep_time, arr_time
+                    )
+                    # 若基于时刻计算的结果跨日数小于 add-day 标注，强制用标注值
+                    from datetime import timedelta as _td
+                    expected = params.departure_date + _td(days=extra_days)
+                    if arrival_date < expected:
+                        arrival_date = expected
+                else:
+                    arrival_date = QunarScraper._compute_arrival_date(
+                        params.departure_date, dep_time, arr_time
+                    )
+
+                flight_info = FlightInfo(
+                    flight_no=flight_no,
+                    airline=airline,
+                    departure_city=params.departure_city,
+                    arrival_city=params.arrival_city,
+                    departure_time=dep_time[:5],
+                    arrival_time=arr_time[:5],
+                    departure_date=params.departure_date,
+                    direction=FlightDirection.DEPARTURE,
+                    departure_airport=dep_place or None,
+                    arrival_airport=arr_place or None,
+                    arrival_date=arrival_date,
+                )
+                results.append(FlightPrice(
+                    flight_info=flight_info,
+                    price=price,
+                    currency="CNY",
+                    seat_class="经济舱",
+                    available_seats=None,
+                    scraped_at=datetime.now(timezone.utc),
+                    source="qunar",
+                ))
+            except Exception as e:
+                logger.debug(f"[移动端 DOM] 单行解析异常: {e}")
+                continue
+
+        return results
 
     def _parse_touch_inner_list_response(
         self, data: Dict, params: SearchParams
@@ -1099,14 +1509,36 @@ class QunarScraper(FlightScraper):
             return results
 
         # ── 取航班列表 ─────────────────────────────────────────────────────
-        flight_list = inner.get("flights") or []
-        if not isinstance(flight_list, list) or not flight_list:
+        # 国际线使用 "flights"；国内线可能使用不同 key（innerFlights / list /
+        # results）。按优先级遍历并选中首个非空列表。
+        flight_list: List = []
+        matched_key: Optional[str] = None
+        for _fl_key in ("flights", "innerFlights", "list", "results"):
+            v = inner.get(_fl_key)
+            if isinstance(v, list) and v:
+                flight_list = v
+                matched_key = _fl_key
+                break
+
+        if not flight_list:
+            # 再兜底：任何 value 是 list 且元素是 dict 的顶层字段，取最大的一个
+            best_key, best_list = None, []
+            for k, v in inner.items():
+                if isinstance(v, list) and v and isinstance(v[0], dict) and len(v) > len(best_list):
+                    best_key, best_list = k, v
+            if best_list:
+                flight_list = best_list
+                matched_key = f"{best_key}(fallback)"
+
+        if not flight_list:
             logger.warning(
-                f"[移动端] 航班列表为空，inner keys={list(inner.keys())[:10]}"
+                f"[移动端] 航班列表为空，inner keys={list(inner.keys())[:15]}"
             )
             return results
 
-        logger.info(f"[移动端] 找到 {len(flight_list)} 条原始记录")
+        logger.info(
+            f"[移动端] 找到 {len(flight_list)} 条原始记录（key={matched_key}）"
+        )
 
         for record in flight_list:
             if not isinstance(record, dict):
@@ -1157,7 +1589,7 @@ class QunarScraper(FlightScraper):
                     seat_class="经济舱",
                     available_seats=None,
                     scraped_at=datetime.now(timezone.utc),
-                    source="qunar_mobile",
+                    source="qunar",
                 ))
             except Exception as e:
                 logger.debug(f"[移动端] 记录解析异常: {e}")
@@ -1830,10 +2262,13 @@ class QunarScraper(FlightScraper):
     async def _search_inter_roundtrip_fallback(
         self, params: SearchParams
     ) -> List[FlightPrice]:
-        """interroundtrip_compare.htm 无数据时的降级方案：分别搜索去程和回程单程。
+        """分程搜索：把往返拆成两次单程搜索，上游合并去回程配对。
 
-        对 ``interroundtrip_compare.htm`` 无法返回组合价格的国际航线，
-        通过各搜一次单程来模拟往返：
+        适用场景：
+        - 国际往返：``interroundtrip_compare.htm`` 无数据时降级
+        - 国内往返：没有专用组合接口，分程是唯一路径
+
+        搜索分两次：
         - 去程：departure_city→arrival_city，departure_date，方向 DEPARTURE
         - 回程：arrival_city→departure_city，return_date，方向 RETURN
 
@@ -1859,7 +2294,7 @@ class QunarScraper(FlightScraper):
         )
 
         logger.info(
-            "[往返降级] 搜去程 %s→%s %s",
+            "[分程往返] 搜去程 %s→%s %s",
             outbound_params.departure_city,
             outbound_params.arrival_city,
             outbound_params.departure_date,
@@ -1867,7 +2302,7 @@ class QunarScraper(FlightScraper):
         outbound_prices = await self.search_flights(outbound_params)
 
         logger.info(
-            "[往返降级] 搜回程 %s→%s %s",
+            "[分程往返] 搜回程 %s→%s %s",
             return_params.departure_city,
             return_params.arrival_city,
             return_params.departure_date,
@@ -1893,7 +2328,7 @@ class QunarScraper(FlightScraper):
             )
 
         logger.info(
-            "[往返降级] 去程 %d 条，回程 %d 条",
+            "[分程往返] 去程 %d 条，回程 %d 条",
             len(outbound_prices), len(return_prices),
         )
         return outbound_prices + return_prices
@@ -2266,7 +2701,7 @@ class QunarScraper(FlightScraper):
                                 seat_class="经济舱",
                                 available_seats=None,
                                 scraped_at=datetime.now(timezone.utc),
-                                source="qunar_api",
+                                source="qunar",
                             ))
                         except Exception as e:
                             logger.debug(f"wbdflightlist record parse error: {e}")
@@ -2318,7 +2753,7 @@ class QunarScraper(FlightScraper):
                             seat_class="经济舱",
                             available_seats=None,
                             scraped_at=datetime.now(timezone.utc),
-                            source="qunar_api",
+                            source="qunar",
                         ))
                     except Exception as e:
                         logger.debug(f"API record parse error: {e}")

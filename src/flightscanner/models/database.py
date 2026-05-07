@@ -148,6 +148,12 @@ class Route(Base):
     arr_time_from = Column(String(10), nullable=True)   # 落地时间段开始
     arr_time_to   = Column(String(10), nullable=True)   # 落地时间段结束
 
+    # 回程时间段过滤（仅 roundtrip 使用；格式 "HH:MM"）
+    ret_dep_time_from = Column(String(10), nullable=True)   # 回程起飞时间段开始
+    ret_dep_time_to   = Column(String(10), nullable=True)   # 回程起飞时间段结束
+    ret_arr_time_from = Column(String(10), nullable=True)   # 回程落地时间段开始
+    ret_arr_time_to   = Column(String(10), nullable=True)   # 回程落地时间段结束
+
     # 通知防骚扰字段（通过迁移添加）
     last_notified_at    = Column(DateTime, nullable=True)           # 上次通知时间（UTC）
     last_notified_price = Column(Numeric(10, 2), nullable=True)     # 上次通知时的价格
@@ -334,6 +340,11 @@ def _apply_migrations(engine) -> None:
         "ALTER TABLE routes ADD COLUMN dep_time_to TEXT",
         "ALTER TABLE routes ADD COLUMN arr_time_from TEXT",
         "ALTER TABLE routes ADD COLUMN arr_time_to TEXT",
+        # 回程时间段过滤字段（仅 roundtrip 使用）
+        "ALTER TABLE routes ADD COLUMN ret_dep_time_from TEXT",
+        "ALTER TABLE routes ADD COLUMN ret_dep_time_to TEXT",
+        "ALTER TABLE routes ADD COLUMN ret_arr_time_from TEXT",
+        "ALTER TABLE routes ADD COLUMN ret_arr_time_to TEXT",
         # 通知防骚扰字段
         "ALTER TABLE routes ADD COLUMN last_notified_at DATETIME",
         "ALTER TABLE routes ADD COLUMN last_notified_price NUMERIC",

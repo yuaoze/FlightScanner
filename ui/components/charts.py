@@ -27,8 +27,21 @@ _BEIJING = ZoneInfo("Asia/Shanghai")
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _source_label(source: str) -> str:
-    """Return human-readable platform name."""
-    return _SOURCE_LABELS.get(source.lower(), source)
+    """Return human-readable platform name.
+
+    Tolerates legacy sub-path suffixes (e.g. 'qunar_api', 'qunar_mobile')
+    that older DB records may still carry — prefix-match to the canonical
+    display name.
+    """
+    if not source:
+        return source
+    key = source.lower()
+    if key in _SOURCE_LABELS:
+        return _SOURCE_LABELS[key]
+    for prefix, label in _SOURCE_LABELS.items():
+        if key.startswith(prefix):
+            return label
+    return source
 
 
 def _to_beijing(dt: datetime) -> datetime:
