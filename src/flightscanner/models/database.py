@@ -160,6 +160,11 @@ class Route(Base):
     notify_threshold_pct = Column(Numeric(5, 2), nullable=True)    # 用户自定义低于均价 N% 时通知（None=使用全局默认）
     max_results = Column(Integer, default=20, nullable=False)
 
+    # 通知智能化字段（v1.6.0 新增）
+    recent_3d_low         = Column(Numeric(10, 2), nullable=True)   # 最近3天最低价
+    recent_3d_low_at      = Column(DateTime, nullable=True)          # 最近3天低点时间（UTC）
+    last_notified_reason  = Column(String(50), nullable=True)        # 上次通知的触发原因
+
     # 精准航班号监控字段（通过迁移添加）
     monitoring_mode       = Column(String(20), default="route", nullable=False)  # 'route' | 'flight'
     outbound_flight_no    = Column(String(20), nullable=True)   # 指定去程航班号，如 "CA953"
@@ -466,6 +471,10 @@ def _apply_migrations(engine) -> None:
             "scan_type TEXT, "
             "scanned_at DATETIME NOT NULL)"
         ),
+        # v1.6.0 通知智能化字段
+        "ALTER TABLE routes ADD COLUMN recent_3d_low NUMERIC",
+        "ALTER TABLE routes ADD COLUMN recent_3d_low_at DATETIME",
+        "ALTER TABLE routes ADD COLUMN last_notified_reason TEXT",
     ]
     with engine.connect() as conn:
         for stmt in stmts:

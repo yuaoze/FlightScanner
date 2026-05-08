@@ -416,15 +416,18 @@ async def _run_single_rca(
         "请分析此次预测失误的根本原因。"
     )
 
-    response = await client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": _RCA_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.3,
-    )
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _RCA_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+    finally:
+        await client.close()
 
     content = response.choices[0].message.content or "{}"
     result = json.loads(content)

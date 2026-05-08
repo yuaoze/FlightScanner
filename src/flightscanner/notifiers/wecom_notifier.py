@@ -106,6 +106,9 @@ class WeComNotifier(Notifier):
                 "target_hit": "已达目标价 🎯",
                 "near_30d_low": "接近30天最低价 📉",
                 "below_avg": "显著低于均价 💡",
+                "rebound_warning": "价格反弹预警 ⚠️",
+                "departure_approaching": "出发临近提醒 🔔",
+                "trend_down": "趋势加速下降 📊",
             }
             reason_label = reason_labels.get(
                 ctx.get("trigger_reason", ""), ctx.get("trigger_reason", "")
@@ -117,6 +120,22 @@ class WeComNotifier(Notifier):
                 f"> **触发原因**：{reason_label}\n"
                 f"> **买点建议**：<font color=\"warning\">{ctx.get('recommendation', '')}</font>\n"
             )
+
+            # 场景化附加信息
+            trigger = ctx.get("trigger_reason", "")
+            if trigger == "departure_approaching" and ctx.get("days_until_departure") is not None:
+                extra += f"> ⏰ 距出发仅剩 **{ctx['days_until_departure']}** 天\n"
+            elif trigger == "rebound_warning" and ctx.get("rebound_pct"):
+                extra += (
+                    f"> ⚠️ 从近期低点 ¥{ctx.get('recent_low', 0):.0f} "
+                    f"反弹 {ctx['rebound_pct']:.1f}%\n"
+                )
+            elif trigger == "trend_down" and ctx.get("trend_batches"):
+                extra += f"> 📊 连续 {ctx['trend_batches']} 次采集价格持续下降\n"
+
+            # AI 简报
+            if ctx.get("ai_reason"):
+                extra += f"> 🤖 AI：{ctx['ai_reason']}\n"
 
         return (
             f"## ✈️ 机票价格提醒\n\n"

@@ -165,16 +165,19 @@ async def generate_weekend_brief(
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _WEEKEND_BRIEF_SYSTEM},
-                {"role": "user", "content": user_msg},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.8,
-            max_tokens=400,
-        )
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _WEEKEND_BRIEF_SYSTEM},
+                    {"role": "user", "content": user_msg},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.8,
+                max_tokens=400,
+            )
+        finally:
+            await client.close()
         raw = response.choices[0].message.content or "{}"
         result = json.loads(raw)
         # 注入计算出的 beat_pct（如果 AI 返回的是 null）

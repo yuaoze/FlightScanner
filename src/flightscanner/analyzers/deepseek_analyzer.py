@@ -278,6 +278,17 @@ def generate_brief_with_fallback(
         brief = _rule_based_brief(price_history, target_date)
         brief["_source"] = "rule_based"
         return brief
+    finally:
+        if "analyzer" in locals():
+            import asyncio as _asyncio
+            try:
+                loop = _asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(analyzer._client.close())
+                else:
+                    loop.run_until_complete(analyzer._client.close())
+            except RuntimeError:
+                pass
 
 
 async def generate_brief_with_fallback_async(
@@ -328,3 +339,6 @@ async def generate_brief_with_fallback_async(
         brief = _rule_based_brief(price_history, target_date)
         brief["_source"] = "rule_based"
         return brief
+    finally:
+        if "analyzer" in locals():
+            await analyzer._client.close()

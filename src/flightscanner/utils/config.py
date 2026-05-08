@@ -107,10 +107,54 @@ class Settings(BaseSettings):
 
     # Notification anti-spam configuration
     notify_cooldown_hours: int = Field(
-        default=24, description="Minimum hours between repeat notifications for the same route"
+        default=24, description="Fallback cooldown hours (used when trigger reason not in tier map)"
     )
     notify_below_avg_threshold: float = Field(
         default=10.0, description="Notify when price is N% below the 30-day average"
+    )
+
+    # Tiered cooldown (hours per trigger reason)
+    notify_cooldown_target_hit: float = Field(
+        default=4.0, description="Cooldown hours after target_hit notification"
+    )
+    notify_cooldown_near_30d_low: float = Field(
+        default=8.0, description="Cooldown hours after near_30d_low notification"
+    )
+    notify_cooldown_rebound_warning: float = Field(
+        default=8.0, description="Cooldown hours after rebound_warning notification"
+    )
+    notify_cooldown_below_avg: float = Field(
+        default=12.0, description="Cooldown hours after below_avg notification"
+    )
+    notify_cooldown_trend_down: float = Field(
+        default=12.0, description="Cooldown hours after trend_down notification"
+    )
+    notify_cooldown_departure_approaching: float = Field(
+        default=2.0, description="Cooldown hours for departure_approaching (very urgent)"
+    )
+
+    # Rebound detection
+    notify_rebound_pct: float = Field(
+        default=10.0, description="Percentage rebound from recent low to trigger rebound alert"
+    )
+    notify_rebound_lookback_days: int = Field(
+        default=3, description="Days to look back for recent low calculation"
+    )
+
+    # Departure approaching thresholds
+    notify_departure_warn_days: int = Field(
+        default=7, description="Days before departure to start departure-approaching alerts"
+    )
+    notify_departure_urgent_days: int = Field(
+        default=3, description="Days before departure for urgent alerts"
+    )
+
+    # Trend detection
+    notify_trend_min_batches: int = Field(
+        default=3, description="Minimum consecutive declining batches to trigger trend_down"
+    )
+    notify_trend_lookback_batches: int = Field(
+        default=5, description="Number of recent batches to examine for trend detection"
     )
 
     @field_validator("scraper_type")

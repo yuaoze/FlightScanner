@@ -54,8 +54,8 @@ class NotifyContext:
     min_30d: float           # 30天最低价
     max_30d: float           # 30天最高价
     price_count: int         # 历史记录数
-    trigger_reason: str      # "target_hit" | "near_30d_low" | "below_avg"
-    recommendation: str      # "立即购买" | "建议购买" | "可以考虑"
+    trigger_reason: str      # "target_hit" | "near_30d_low" | "below_avg" | "rebound_warning" | "departure_approaching" | "trend_down"
+    recommendation: str      # "立即购买" | "建议购买" | "尽快购买" | "可以考虑" | "建议观望"
     pct_vs_avg: float        # 当前价相比均价的百分比差（负=低于均价）
     pct_vs_target: float     # 当前价相比目标价的百分比差（负=低于目标）
     source: str
@@ -63,6 +63,16 @@ class NotifyContext:
     airline: str
     departure_time: str
     arrival_time: str
+    # v1.6.0 新增字段
+    days_until_departure: Optional[int] = None     # 距出发天数
+    recent_low: Optional[float] = None             # 最近3天低点
+    rebound_pct: Optional[float] = None            # 反弹幅度百分比
+    trend_batches: Optional[int] = None            # 连续下降批次数
+    urgency_level: Optional[str] = None            # "critical" / "high" / "medium" / "low"
+    ai_action: Optional[str] = None                # AI 简报建议: "Buy" / "Wait"
+    ai_reason: Optional[str] = None                # AI 简报给出该建议的原因
+    ai_confidence: Optional[float] = None          # AI 简报置信度 0~1
+    ai_prediction_7d: Optional[str] = None         # AI 对未来7天的预测描述
 
 
 class PriceMonitorScheduler:
@@ -246,24 +256,58 @@ class PriceMonitorScheduler:
                 # 2. 本次采集最低价记录
                 best_fp = min(flight_prices, key=lambda fp: fp.price)
 
-                # 3. 判断触发条件 + 防骚扰冷却
-                should_notify, reason = self._should_notify(
-                    route, best_fp.price, stats, price_count
+                # 3. 计算扩展通知参数
+                days_until_departure = (route.target_date - date.today()).days
+                recent_3d_low = self._compute_recent_3d_low(history)
+                consecutive_declining = self._compute_consecutive_declining_batches(
+                    history, lookback=settings.notify_trend_lookback_batches
                 )
-                if should_notify and not self._is_cooldown_active(route, best_fp.price):
-                    if self.notifiers and history:
+
+                # 更新路线近期最低价记录
+                current_min = float(best_fp.price)
+                stored_low = getattr(route, "recent_3d_low", None)
+                if stored_low is None or current_min < float(stored_low):
+                    self._update_route_recent_low(route.id, current_min)
+
+                # 4. 判断触发条件（含新场景）
+                should_notify, reason = self._should_notify(
+                    route, best_fp.price, stats, price_count,
+                    days_until_departure=days_until_departure,
+                    recent_3d_low=recent_3d_low,
+                    consecutive_declining_batches=consecutive_declining,
+                )
+
+                # 5. 冷却检查（分级冷却）
+                if should_notify and not self._is_cooldown_active(
+                    route, best_fp.price, trigger_reason=reason
+                ):
+                    # 6. AI 简报辅助决策
+                    ai_brief = await self._get_ai_brief_for_notify(history, route)
+                    if self._ai_should_suppress(reason, ai_brief):
+                        logger.info(
+                            "路线 %s AI 简报建议 Wait（置信度 %.2f），抑制 %s 通知",
+                            route.id,
+                            ai_brief.get("confidence", 0) if ai_brief else 0,
+                            reason,
+                        )
+                    elif self.notifiers and history:
                         trend = self.analyzer.predict_trend(history, route.target_date)
                         ctx = self._build_notify_context(
-                            route, best_fp, stats, reason, price_count
+                            route, best_fp, stats, reason, price_count,
+                            days_until_departure=days_until_departure,
+                            recent_3d_low=recent_3d_low,
+                            consecutive_declining_batches=consecutive_declining,
+                            ai_brief=ai_brief,
                         )
                         message_json = self._build_alert_message_data(ctx)
                         await self._send_alert(best_fp, trend, message_json)
-                    # 记录本次通知时间和价格（即使无通知渠道也记录，防止反复触发判断）
-                    self._update_route_notification_state(route.id, best_fp.price)
+                        self._update_route_notification_state(route.id, best_fp.price, reason)
+                    else:
+                        self._update_route_notification_state(route.id, best_fp.price, reason)
                 elif should_notify:
                     logger.info(
-                        "路线 %s 冷却中（上次通知未超 %d 小时且价格未再降 5%%），跳过通知",
-                        route.id, settings.notify_cooldown_hours,
+                        "路线 %s 冷却中（%s 级别），跳过通知",
+                        route.id, reason,
                     )
 
                 # ── G1：记录预测（每路线每 12 小时最多一次）────────────────────
@@ -509,16 +553,46 @@ class PriceMonitorScheduler:
             stats = self._compute_price_stats(history)
             price_count = int(stats.get("batch_count", len(history)))
             best_fp = min(prices_to_save, key=lambda fp: fp.price)
-            should_notify, reason = self._should_notify(
-                route, best_fp.price, stats, price_count
+
+            days_until_departure = (route.target_date - date.today()).days
+            recent_3d_low = self._compute_recent_3d_low(history)
+            consecutive_declining = self._compute_consecutive_declining_batches(
+                history, lookback=settings.notify_trend_lookback_batches
             )
-            if should_notify and not self._is_cooldown_active(route, best_fp.price):
-                if self.notifiers and history:
+
+            current_min = float(best_fp.price)
+            stored_low = getattr(route, "recent_3d_low", None)
+            if stored_low is None or current_min < float(stored_low):
+                self._update_route_recent_low(route.id, current_min)
+
+            should_notify, reason = self._should_notify(
+                route, best_fp.price, stats, price_count,
+                days_until_departure=days_until_departure,
+                recent_3d_low=recent_3d_low,
+                consecutive_declining_batches=consecutive_declining,
+            )
+            if should_notify and not self._is_cooldown_active(
+                route, best_fp.price, trigger_reason=reason
+            ):
+                ai_brief = await self._get_ai_brief_for_notify(history, route)
+                if self._ai_should_suppress(reason, ai_brief):
+                    logger.info(
+                        "路线 %s AI 抑制 %s 通知", route.id, reason
+                    )
+                elif self.notifiers and history:
                     trend = self.analyzer.predict_trend(history, route.target_date)
-                    ctx = self._build_notify_context(route, best_fp, stats, reason, price_count)
+                    ctx = self._build_notify_context(
+                        route, best_fp, stats, reason, price_count,
+                        days_until_departure=days_until_departure,
+                        recent_3d_low=recent_3d_low,
+                        consecutive_declining_batches=consecutive_declining,
+                        ai_brief=ai_brief,
+                    )
                     message_json = self._build_alert_message_data(ctx)
                     await self._send_alert(best_fp, trend, message_json)
-                self._update_route_notification_state(route.id, best_fp.price)
+                    self._update_route_notification_state(route.id, best_fp.price, reason)
+                else:
+                    self._update_route_notification_state(route.id, best_fp.price, reason)
         finally:
             session.close()
 
@@ -857,37 +931,70 @@ class PriceMonitorScheduler:
         current_price: Decimal,
         stats: Dict[str, float],
         price_count: int,
+        *,
+        days_until_departure: Optional[int] = None,
+        recent_3d_low: Optional[float] = None,
+        consecutive_declining_batches: int = 0,
     ) -> Tuple[bool, str]:
-        """判断是否应该触发价格通知。
+        """判断是否应该触发价格通知（多条件优先级判断）。
 
-        满足以下任一条件即触发（优先级由高到低）：
-          1. target_hit:   current_price <= route.target_price
-          2. near_30d_low: current_price <= min_30d * 1.05（接近30天最低，误差5%内）
-          3. below_avg:    current_price < avg_30d * (1 - threshold/100)
-                           且 price_count >= 7（数据量充足）
+        优先级由高到低：
+          1. departure_approaching: 距出发 ≤ warn_days 且价格 ≤ 目标价×1.10
+          2. target_hit:            price <= target_price
+          3. rebound_warning:       price > recent_3d_low × (1 + rebound_pct/100)
+          4. near_30d_low:          price <= min_30d × 1.05
+          5. trend_down:            连续 ≥ min_batches 批次最低价递减
+          6. below_avg:             price < avg_30d × (1 - threshold/100) 且 count ≥ 7
 
         Args:
             route: 路线配置对象（含 target_price）。
             current_price: 本次采集最低价。
             stats: 30天统计字典（avg_30d, min_30d, max_30d）。
             price_count: 历史价格记录数量。
+            days_until_departure: 距出发天数（None=不检查）。
+            recent_3d_low: 近3天最低价（None=不检查反弹）。
+            consecutive_declining_batches: 连续下降批次数。
 
         Returns:
             (should_notify, trigger_reason) 元组。
         """
-        # 条件 1：达到目标价
+        # 条件 1：出发临近 + 价格接近目标
+        if (
+            days_until_departure is not None
+            and days_until_departure <= settings.notify_departure_warn_days
+            and float(current_price) <= float(route.target_price) * 1.10
+        ):
+            return True, "departure_approaching"
+
+        # 条件 2：达到目标价
         if current_price <= route.target_price:
             return True, "target_hit"
 
         avg_30d = stats["avg_30d"]
         min_30d = stats["min_30d"]
 
-        # 条件 2：接近30天最低价（在5%误差内）
+        # 条件 3：价格反弹预警
+        if recent_3d_low and recent_3d_low > 0:
+            rebound_threshold = recent_3d_low * (1 + settings.notify_rebound_pct / 100)
+            if float(current_price) > rebound_threshold:
+                return True, "rebound_warning"
+
+        # 条件 4：接近30天最低价（在5%误差内）
         if min_30d > 0 and float(current_price) <= min_30d * 1.05:
             return True, "near_30d_low"
 
-        # 条件 3：显著低于30天均价
+        # 条件 5：趋势加速下降
+        if consecutive_declining_batches >= settings.notify_trend_min_batches:
+            return True, "trend_down"
+
+        # 条件 6：显著低于30天均价
         threshold = settings.notify_below_avg_threshold
+        per_route_threshold = getattr(route, "notify_threshold_pct", None)
+        if per_route_threshold is not None:
+            try:
+                threshold = float(per_route_threshold)
+            except (TypeError, ValueError):
+                pass
         if (
             avg_30d > 0
             and price_count >= 7
@@ -897,14 +1004,25 @@ class PriceMonitorScheduler:
 
         return False, ""
 
-    def _is_cooldown_active(self, route: Route, current_price: Decimal) -> bool:
-        """检查通知防骚扰冷却是否仍在生效。
+    def _is_cooldown_active(
+        self, route: Route, current_price: Decimal, trigger_reason: str = ""
+    ) -> bool:
+        """分级冷却检查：不同触发原因使用不同冷却窗口。
 
-        在冷却小时数内，若价格未再下降 ≥5%，则静默。
+        冷却窗口：
+          - departure_approaching: 2h（极紧迫）
+          - target_hit:            4h
+          - near_30d_low:          8h
+          - rebound_warning:       8h
+          - below_avg:             12h
+          - trend_down:            12h
+
+        冷却打破条件：价格较上次通知再降 ≥5%。
 
         Args:
             route: 路线配置对象（含 last_notified_at 和 last_notified_price）。
             current_price: 当前最低价格。
+            trigger_reason: 当前触发原因（决定冷却时长）。
 
         Returns:
             True 表示冷却中（应静默），False 表示可以通知。
@@ -921,7 +1039,18 @@ class PriceMonitorScheduler:
             datetime.now(timezone.utc) - last_notified_at
         ).total_seconds() / 3600
 
-        if hours_since >= settings.notify_cooldown_hours:
+        # 按当前触发原因确定冷却时长
+        cooldown_map = {
+            "target_hit": settings.notify_cooldown_target_hit,
+            "near_30d_low": settings.notify_cooldown_near_30d_low,
+            "rebound_warning": settings.notify_cooldown_rebound_warning,
+            "below_avg": settings.notify_cooldown_below_avg,
+            "trend_down": settings.notify_cooldown_trend_down,
+            "departure_approaching": settings.notify_cooldown_departure_approaching,
+        }
+        cooldown_hours = cooldown_map.get(trigger_reason, settings.notify_cooldown_hours)
+
+        if hours_since >= cooldown_hours:
             return False
 
         # 冷却期内：若价格又降了 ≥5%，打破冷却
@@ -935,6 +1064,148 @@ class PriceMonitorScheduler:
 
         return True
 
+    # ── v1.6.0 新增辅助方法 ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_consecutive_declining_batches(
+        history: List[FlightPrice], lookback: int = 5
+    ) -> int:
+        """计算最近 N 批次中连续最低价递减的次数（从最新往回数）。
+
+        按 batch_id 分组，每组取最低价，按时间排序后从末尾向前检测连续下降。
+
+        Args:
+            history: 价格历史列表。
+            lookback: 观察最近多少个批次。
+
+        Returns:
+            连续下降的批次对数（如 3 表示最近 4 个批次中后 3 个逐步比前一个低）。
+        """
+        batches: Dict[str, Tuple[float, datetime]] = {}
+        for fp in history:
+            key = fp.batch_id if fp.batch_id else fp.scraped_at.isoformat()
+            price = float(fp.price)
+            if key not in batches or price < batches[key][0]:
+                batches[key] = (price, fp.scraped_at)
+
+        if len(batches) < 2:
+            return 0
+
+        sorted_batches = sorted(batches.values(), key=lambda x: x[1])
+        recent = sorted_batches[-lookback:]
+
+        count = 0
+        for i in range(len(recent) - 1, 0, -1):
+            if recent[i][0] < recent[i - 1][0]:
+                count += 1
+            else:
+                break
+        return count
+
+    def _compute_recent_3d_low(self, history: List[FlightPrice]) -> Optional[float]:
+        """计算最近 N 天内的最低价格。
+
+        Args:
+            history: 价格历史列表。
+
+        Returns:
+            近 N 天最低价，历史为空返回 None。
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=settings.notify_rebound_lookback_days
+        )
+        recent_prices = [
+            float(fp.price)
+            for fp in history
+            if fp.scraped_at and fp.scraped_at >= cutoff
+        ]
+        return min(recent_prices) if recent_prices else None
+
+    def _update_route_recent_low(self, route_id: int, low_price: float) -> None:
+        """更新路线的近期最低价记录。
+
+        Args:
+            route_id: 路线 ID。
+            low_price: 新的低点价格。
+        """
+        session = self._SessionLocal()
+        try:
+            route = session.query(Route).filter(Route.id == route_id).first()
+            if route:
+                route.recent_3d_low = Decimal(str(low_price))
+                route.recent_3d_low_at = datetime.now(timezone.utc)
+                session.commit()
+        finally:
+            session.close()
+
+    async def _get_ai_brief_for_notify(
+        self,
+        price_history: List[FlightPrice],
+        route: Route,
+    ) -> Optional[Dict]:
+        """获取 AI 简报用于辅助通知决策。
+
+        无 API Key、历史不足或 API 失败时返回 None（不阻塞通知流程）。
+
+        Args:
+            price_history: 价格历史列表。
+            route: 路线对象。
+
+        Returns:
+            AI 简报 dict 或 None。
+        """
+        from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback_async
+
+        try:
+            brief = await generate_brief_with_fallback_async(
+                price_history=price_history,
+                target_date=route.target_date,
+                route_label=f"{route.origin} → {route.destination}",
+                api_key=settings.deepseek_api_key or None,
+                base_url=settings.deepseek_base_url,
+                model=settings.deepseek_model,
+            )
+            return brief
+        except Exception as exc:
+            logger.warning("AI 简报获取失败（通知流程继续）：%s", exc)
+            return None
+
+    @staticmethod
+    def _ai_should_suppress(reason: str, ai_brief: Optional[Dict]) -> bool:
+        """根据 AI 简报判断是否应抑制本次通知。
+
+        抑制条件：
+          - AI 明确建议 Wait 且置信度 > 0.7
+          - 仅对低优先级触发原因生效（below_avg / trend_down）
+          - target_hit / departure_approaching / rebound_warning 不受抑制
+
+        Args:
+            reason: 规则触发的原因。
+            ai_brief: AI 简报 dict（可为 None）。
+
+        Returns:
+            True 表示应抑制通知。
+        """
+        if ai_brief is None:
+            return False
+
+        # 硬条件不受 AI 抑制
+        if reason in ("target_hit", "departure_approaching", "rebound_warning", "near_30d_low"):
+            return False
+
+        action = ai_brief.get("action", "").strip()
+        confidence = ai_brief.get("confidence", 0.0)
+        if isinstance(confidence, str):
+            try:
+                confidence = float(confidence)
+            except (ValueError, TypeError):
+                confidence = 0.0
+
+        if action == "Wait" and confidence > 0.7:
+            return True
+
+        return False
+
     def _build_notify_context(
         self,
         route: Route,
@@ -942,6 +1213,11 @@ class PriceMonitorScheduler:
         stats: Dict[str, float],
         reason: str,
         price_count: int,
+        *,
+        days_until_departure: Optional[int] = None,
+        recent_3d_low: Optional[float] = None,
+        consecutive_declining_batches: int = 0,
+        ai_brief: Optional[Dict] = None,
     ) -> NotifyContext:
         """构建通知上下文对象。
 
@@ -951,6 +1227,10 @@ class PriceMonitorScheduler:
             stats: 30天统计字典（avg_30d, min_30d, max_30d）。
             reason: 触发原因字符串。
             price_count: 历史价格记录数量。
+            days_until_departure: 距出发天数。
+            recent_3d_low: 近3天最低价。
+            consecutive_declining_batches: 连续下降批次数。
+            ai_brief: AI 简报 dict（可为 None）。
 
         Returns:
             填充完整的 NotifyContext 实例。
@@ -970,9 +1250,31 @@ class PriceMonitorScheduler:
 
         recommendation_map = {
             "target_hit": "立即购买",
+            "departure_approaching": "立即购买",
+            "rebound_warning": "尽快购买",
             "near_30d_low": "建议购买",
+            "trend_down": "建议观望",
             "below_avg": "可以考虑",
         }
+
+        urgency_map = {
+            "target_hit": "critical",
+            "departure_approaching": "critical",
+            "rebound_warning": "high",
+            "near_30d_low": "high",
+            "trend_down": "medium",
+            "below_avg": "low",
+        }
+
+        # AI 增强：若 AI 也说 Buy，升级低优先级建议
+        recommendation = recommendation_map.get(reason, "–")
+        if ai_brief and ai_brief.get("action") == "Buy" and reason in ("below_avg", "trend_down"):
+            recommendation = "建议购买"
+
+        # 反弹百分比
+        rebound_pct = None
+        if recent_3d_low and recent_3d_low > 0:
+            rebound_pct = (current_price - recent_3d_low) / recent_3d_low * 100
 
         fi = best_fp.flight_info
         return NotifyContext(
@@ -987,7 +1289,7 @@ class PriceMonitorScheduler:
             max_30d=stats["max_30d"],
             price_count=price_count,
             trigger_reason=reason,
-            recommendation=recommendation_map.get(reason, "–"),
+            recommendation=recommendation,
             pct_vs_avg=pct_vs_avg,
             pct_vs_target=pct_vs_target,
             source=best_fp.source,
@@ -995,6 +1297,15 @@ class PriceMonitorScheduler:
             airline=fi.airline,
             departure_time=fi.departure_time,
             arrival_time=fi.arrival_time,
+            days_until_departure=days_until_departure,
+            recent_low=recent_3d_low,
+            rebound_pct=rebound_pct,
+            trend_batches=consecutive_declining_batches if reason == "trend_down" else None,
+            urgency_level=urgency_map.get(reason, "low"),
+            ai_action=ai_brief.get("action") if ai_brief else None,
+            ai_reason=ai_brief.get("reason") if ai_brief else None,
+            ai_confidence=ai_brief.get("confidence") if ai_brief else None,
+            ai_prediction_7d=ai_brief.get("prediction_7d") if ai_brief else None,
         )
 
     @staticmethod
@@ -1024,18 +1335,29 @@ class PriceMonitorScheduler:
                 "departure_time": ctx.departure_time,
                 "arrival_time": ctx.arrival_time,
                 "source": ctx.source,
+                # v1.6.0 新增
+                "days_until_departure": ctx.days_until_departure,
+                "recent_low": ctx.recent_low,
+                "rebound_pct": ctx.rebound_pct,
+                "trend_batches": ctx.trend_batches,
+                "urgency_level": ctx.urgency_level,
+                "ai_action": ctx.ai_action,
+                "ai_reason": ctx.ai_reason,
+                "ai_confidence": ctx.ai_confidence,
+                "ai_prediction_7d": ctx.ai_prediction_7d,
             },
             ensure_ascii=False,
         )
 
     def _update_route_notification_state(
-        self, route_id: int, price: Decimal
+        self, route_id: int, price: Decimal, reason: str = ""
     ) -> None:
-        """更新路线的上次通知时间和价格。
+        """更新路线的上次通知时间、价格和触发原因。
 
         Args:
             route_id: 路线 ID。
             price: 本次通知时的价格。
+            reason: 本次通知的触发原因。
         """
         session = self._SessionLocal()
         try:
@@ -1043,6 +1365,10 @@ class PriceMonitorScheduler:
             route_service.update_notification_state(
                 route_id, datetime.now(timezone.utc), price
             )
+            route = session.query(Route).filter(Route.id == route_id).first()
+            if route:
+                route.last_notified_reason = reason
+                session.commit()
         finally:
             session.close()
 

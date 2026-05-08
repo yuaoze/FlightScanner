@@ -127,8 +127,123 @@ class FeiShuNotifier(Notifier):
             "target_hit": "green",
             "near_30d_low": "orange",
             "below_avg": "blue",
+            "rebound_warning": "red",
+            "departure_approaching": "red",
+            "trend_down": "turquoise",
         }
         header_color = color_map.get(ctx.get("trigger_reason", ""), "blue")
+
+        # 基础字段
+        elements = [
+            {
+                "tag": "div",
+                "fields": [
+                    {
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**当前价格**\n¥{ctx['current_price']:.0f}",
+                        },
+                    },
+                    {
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**目标价格**\n¥{ctx['target_price']:.0f}",
+                        },
+                    },
+                    {
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**30天均价**\n¥{ctx['avg_30d']:.0f}",
+                        },
+                    },
+                    {
+                        "is_short": True,
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"**30天最低**\n¥{ctx['min_30d']:.0f}",
+                        },
+                    },
+                ],
+            },
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"**出发日期**：{ctx['target_date']}\n"
+                        f"**航班**：{ctx['flight_no']} {ctx['airline']}  "
+                        f"{ctx['departure_time']} → {ctx['arrival_time']}\n"
+                        f"**来源**：{ctx['source']}\n"
+                        f"**触发原因**："
+                        f"{self._reason_label(ctx['trigger_reason'])}\n"
+                        f"**买点建议**：{ctx.get('recommendation', '–')}"
+                    ),
+                },
+            },
+        ]
+
+        # 场景化附加信息
+        trigger = ctx.get("trigger_reason", "")
+        if trigger == "departure_approaching" and ctx.get("days_until_departure") is not None:
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"⏰ **距出发仅剩 {ctx['days_until_departure']} 天**，当前价格接近目标价，建议尽快购买！",
+                },
+            })
+
+        if trigger == "rebound_warning" and ctx.get("rebound_pct"):
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": (
+                        f"⚠️ 价格已从近期低点 ¥{ctx.get('recent_low', 0):.0f} "
+                        f"反弹 {ctx['rebound_pct']:.1f}%，购买窗口可能正在关闭"
+                    ),
+                },
+            })
+
+        if trigger == "trend_down" and ctx.get("trend_batches"):
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"📊 连续 {ctx['trend_batches']} 次采集价格持续下降，良好买点正在形成",
+                },
+            })
+
+        # AI 简报建议（若有）
+        ai_reason = ctx.get("ai_reason")
+        ai_prediction = ctx.get("ai_prediction_7d")
+        if ai_reason or ai_prediction:
+            ai_text = "🤖 **AI 分析**："
+            if ai_reason:
+                ai_text += ai_reason
+            if ai_prediction:
+                ai_text += f"\n📈 未来7天：{ai_prediction}"
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": ai_text},
+            })
+
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "note",
+            "elements": [
+                {
+                    "tag": "plain_text",
+                    "content": (
+                        f"低于均价 {abs(ctx.get('pct_vs_avg', 0)):.1f}%"
+                        f"  ·  低于目标价 {abs(ctx.get('pct_vs_target', 0)):.1f}%"
+                    ),
+                }
+            ],
+        })
 
         return {
             "msg_type": "interactive",
@@ -140,69 +255,7 @@ class FeiShuNotifier(Notifier):
                     },
                     "template": header_color,
                 },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "fields": [
-                            {
-                                "is_short": True,
-                                "text": {
-                                    "tag": "lark_md",
-                                    "content": f"**当前价格**\n¥{ctx['current_price']:.0f}",
-                                },
-                            },
-                            {
-                                "is_short": True,
-                                "text": {
-                                    "tag": "lark_md",
-                                    "content": f"**目标价格**\n¥{ctx['target_price']:.0f}",
-                                },
-                            },
-                            {
-                                "is_short": True,
-                                "text": {
-                                    "tag": "lark_md",
-                                    "content": f"**30天均价**\n¥{ctx['avg_30d']:.0f}",
-                                },
-                            },
-                            {
-                                "is_short": True,
-                                "text": {
-                                    "tag": "lark_md",
-                                    "content": f"**30天最低**\n¥{ctx['min_30d']:.0f}",
-                                },
-                            },
-                        ],
-                    },
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": (
-                                f"**出发日期**：{ctx['target_date']}\n"
-                                f"**航班**：{ctx['flight_no']} {ctx['airline']}  "
-                                f"{ctx['departure_time']} → {ctx['arrival_time']}\n"
-                                f"**来源**：{ctx['source']}\n"
-                                f"**触发原因**："
-                                f"{self._reason_label(ctx['trigger_reason'])}\n"
-                                f"**买点建议**：{ctx.get('recommendation', '–')}"
-                            ),
-                        },
-                    },
-                    {"tag": "hr"},
-                    {
-                        "tag": "note",
-                        "elements": [
-                            {
-                                "tag": "plain_text",
-                                "content": (
-                                    f"低于均价 {abs(ctx.get('pct_vs_avg', 0)):.1f}%"
-                                    f"  ·  低于目标价 {abs(ctx.get('pct_vs_target', 0)):.1f}%"
-                                ),
-                            }
-                        ],
-                    },
-                ],
+                "elements": elements,
             },
         }
 
@@ -219,6 +272,9 @@ class FeiShuNotifier(Notifier):
             "target_hit": "已达目标价 🎯",
             "near_30d_low": "接近30天最低价 📉",
             "below_avg": "显著低于均价 💡",
+            "rebound_warning": "价格反弹预警 ⚠️",
+            "departure_approaching": "出发临近提醒 🔔",
+            "trend_down": "趋势加速下降 📊",
         }.get(reason, reason)
 
     def _parse_message(self, message: str) -> dict:

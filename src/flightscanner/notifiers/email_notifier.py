@@ -130,14 +130,32 @@ class EmailNotifier(Notifier):
         # 买点增强信息（仅在解析成功时展示）
         extra = ""
         if ctx.get("avg_30d", 0) > 0:
+            reason_labels = {
+                "target_hit": "已达目标价 🎯",
+                "near_30d_low": "接近30天最低价 📉",
+                "below_avg": "显著低于均价 💡",
+                "rebound_warning": "价格反弹预警 ⚠️",
+                "departure_approaching": "出发临近提醒 🔔",
+                "trend_down": "趋势加速下降 📊",
+            }
+            reason_label = reason_labels.get(ctx.get("trigger_reason", ""), ctx.get("trigger_reason", ""))
             extra = (
                 f"\n买点分析:\n"
                 f"  30天均价: ¥{ctx['avg_30d']:.0f}\n"
                 f"  30天最低: ¥{ctx['min_30d']:.0f}\n"
                 f"  低于均价: {abs(ctx.get('pct_vs_avg', 0)):.1f}%\n"
-                f"  触发原因: {ctx.get('trigger_reason', '')}\n"
+                f"  触发原因: {reason_label}\n"
                 f"  买点建议: {ctx.get('recommendation', '')}\n"
             )
+            trigger = ctx.get("trigger_reason", "")
+            if trigger == "departure_approaching" and ctx.get("days_until_departure") is not None:
+                extra += f"  ⏰ 距出发仅剩 {ctx['days_until_departure']} 天\n"
+            elif trigger == "rebound_warning" and ctx.get("rebound_pct"):
+                extra += f"  ⚠️ 从近期低点 ¥{ctx.get('recent_low', 0):.0f} 反弹 {ctx['rebound_pct']:.1f}%\n"
+            elif trigger == "trend_down" and ctx.get("trend_batches"):
+                extra += f"  📊 连续 {ctx['trend_batches']} 次采集价格持续下降\n"
+            if ctx.get("ai_reason"):
+                extra += f"  🤖 AI: {ctx['ai_reason']}\n"
 
         body = f"""
 FlightScanner 价格提醒
@@ -193,8 +211,28 @@ FlightScanner 价格提醒
                 "target_hit": "已达目标价 🎯",
                 "near_30d_low": "接近30天最低价 📉",
                 "below_avg": "显著低于均价 💡",
+                "rebound_warning": "价格反弹预警 ⚠️",
+                "departure_approaching": "出发临近提醒 🔔",
+                "trend_down": "趋势加速下降 📊",
             }
             reason_label = reason_labels.get(ctx.get("trigger_reason", ""), ctx.get("trigger_reason", ""))
+
+            # 场景化附加段落
+            scenario_html = ""
+            trigger = ctx.get("trigger_reason", "")
+            if trigger == "departure_approaching" and ctx.get("days_until_departure") is not None:
+                scenario_html = f'<p style="color:#dc3545;">⏰ 距出发仅剩 <strong>{ctx["days_until_departure"]}</strong> 天，建议尽快购买！</p>'
+            elif trigger == "rebound_warning" and ctx.get("rebound_pct"):
+                scenario_html = f'<p style="color:#dc3545;">⚠️ 从近期低点 ¥{ctx.get("recent_low", 0):.0f} 反弹 {ctx["rebound_pct"]:.1f}%，购买窗口可能正在关闭</p>'
+            elif trigger == "trend_down" and ctx.get("trend_batches"):
+                scenario_html = f'<p style="color:#17a2b8;">📊 连续 {ctx["trend_batches"]} 次采集价格持续下降，良好买点正在形成</p>'
+
+            ai_html = ""
+            if ctx.get("ai_reason"):
+                ai_html = f'<p>🤖 <strong>AI 分析：</strong>{ctx["ai_reason"]}</p>'
+                if ctx.get("ai_prediction_7d"):
+                    ai_html += f'<p>📈 未来7天：{ctx["ai_prediction_7d"]}</p>'
+
             extra_html = f"""
             <div class="flight-info">
                 <h2>买点分析</h2>
@@ -214,6 +252,8 @@ FlightScanner 价格提醒
                 </table>
                 <p><strong>触发原因：</strong>{reason_label}</p>
                 <p><strong>买点建议：</strong><span style="color:#28a745; font-weight:bold;">{ctx.get('recommendation', '')}</span></p>
+                {scenario_html}
+                {ai_html}
             </div>"""
 
         html = f"""
