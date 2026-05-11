@@ -300,7 +300,7 @@ class PriceMonitorScheduler:
                             ai_brief=ai_brief,
                         )
                         message_json = self._build_alert_message_data(ctx)
-                        await self._send_alert(best_fp, trend, message_json)
+                        await self._send_alert(best_fp, trend, message_json, route_id=route.id, trigger_reason=reason)
                         self._update_route_notification_state(route.id, best_fp.price, reason)
                     else:
                         self._update_route_notification_state(route.id, best_fp.price, reason)
@@ -876,6 +876,8 @@ class PriceMonitorScheduler:
         flight_price: FlightPrice,
         trend: PriceTrend,
         message: str,
+        route_id: Optional[int] = None,
+        trigger_reason: Optional[str] = None,
     ) -> None:
         """并行调用所有通知渠道发送价格提醒。
 
@@ -883,6 +885,8 @@ class PriceMonitorScheduler:
             flight_price: 触发通知的航班价格记录（最低价）。
             trend: 价格趋势分析结果。
             message: 已序列化为 JSON 字符串的 NotifyContext 数据。
+            route_id: 关联的路线 ID（用于通知日志）。
+            trigger_reason: 通知触发原因（用于通知日志）。
         """
         try:
             results = await asyncio.gather(
@@ -894,12 +898,49 @@ class PriceMonitorScheduler:
                     logger.error(
                         "%s 推送失败：%s", type(notifier).__name__, result
                     )
+                # 写入通知日志
+                if route_id is not None:
+                    self._log_notification(
+                        route_id=route_id,
+                        price=float(flight_price.price),
+                        trigger_reason=trigger_reason or "unknown",
+                        channel=type(notifier).__name__.replace("Notifier", "").lower(),
+                        status="failed" if isinstance(result, Exception) else "success",
+                    )
             logger.info(
                 "价格提醒已通过 %d 个渠道发送（航班 %s）",
                 len(self.notifiers), flight_price.flight_info.flight_no,
             )
         except Exception as exc:
             logger.error("发送价格提醒时出错：%s", exc, exc_info=True)
+
+    def _log_notification(
+        self,
+        route_id: int,
+        price: float,
+        trigger_reason: str,
+        channel: str,
+        status: str,
+    ) -> None:
+        """Write a notification event to the NotificationLog table."""
+        try:
+            from flightscanner.models.database import NotificationLog
+            _, SessionLocal = init_db()
+            session = SessionLocal()
+            try:
+                log = NotificationLog(
+                    route_id=route_id,
+                    price=price,
+                    trigger_reason=trigger_reason,
+                    channel=channel,
+                    status=status,
+                )
+                session.add(log)
+                session.commit()
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.warning("写入通知日志失败：%s", exc)
 
     # ── 通知触发逻辑辅助方法 ────────────────────────────────────────────────
 
@@ -1114,11 +1155,15 @@ class PriceMonitorScheduler:
         cutoff = datetime.now(timezone.utc) - timedelta(
             days=settings.notify_rebound_lookback_days
         )
-        recent_prices = [
-            float(fp.price)
-            for fp in history
-            if fp.scraped_at and fp.scraped_at >= cutoff
-        ]
+        recent_prices: list[float] = []
+        for fp in history:
+            if not fp.scraped_at:
+                continue
+            scraped = fp.scraped_at
+            if scraped.tzinfo is None:
+                scraped = scraped.replace(tzinfo=timezone.utc)
+            if scraped >= cutoff:
+                recent_prices.append(float(fp.price))
         return min(recent_prices) if recent_prices else None
 
     def _update_route_recent_low(self, route_id: int, low_price: float) -> None:
@@ -1763,6 +1808,35 @@ class PriceMonitorScheduler:
             except Exception:
                 logger.exception("[WeekendRadar] 周末 %s 扫描失败，跳过", friday)
                 continue
+
+            # 若本次扫描未取到任何结果（多因 Cookie 失效或爬虫超时），保留旧缓存不动
+            if not deals:
+                logger.warning(
+                    "[WeekendRadar] 周末 %s 扫描无结果，保留既有缓存不清理", friday
+                )
+                continue
+
+            logger.info("[WeekendRadar] 周末 %s 扫得 %d 条，准备写入", friday, len(deals))
+
+            # ── 删除该周末的旧扫描结果，避免重复堆积 ──────────────────────────
+            cleanup_session = self._SessionLocal()
+            try:
+                deleted = (
+                    cleanup_session.query(WeekendRadarCache)
+                    .filter(
+                        WeekendRadarCache.outbound_date == friday,
+                        WeekendRadarCache.return_date == sunday,
+                    )
+                    .delete(synchronize_session=False)
+                )
+                cleanup_session.commit()
+                if deleted:
+                    logger.info("[WeekendRadar] 周末 %s 清理旧记录 %d 条", friday, deleted)
+            except Exception:
+                cleanup_session.rollback()
+                logger.warning("[WeekendRadar] 清理周末 %s 旧记录失败", friday, exc_info=True)
+            finally:
+                cleanup_session.close()
 
             for deal in deals:
                 is_intl = deal.destination in INTERNATIONAL_DESTINATIONS

@@ -75,6 +75,10 @@ debug_screenshot.png
 *.png
 *.jpg
 *.jpeg
+# Brand assets — keep tracked
+!logo.png
+!frontend/public/*.png
+!frontend/src/assets/*.png
 # Scraper debug output & captured API responses
 *_debug_*.json
 *_debug_*.html
@@ -94,3 +98,9 @@ Thumbs.db
 # Distribution
 *.tar.gz
 *.zip
+
+# Frontend (Node)
+node_modules/
+frontend/dist/
+.eslintcache
+*.tsbuildinfo

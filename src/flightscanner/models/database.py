@@ -22,7 +22,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.orm import backref, relationship, sessionmaker
 
 Base = declarative_base()
 
@@ -380,6 +380,39 @@ class WeekendRadarCache(Base):
         )
 
 
+class NotificationLog(Base):
+    """Notification history log table.
+
+    Records every notification sent (or failed) for audit and display purposes.
+    """
+
+    __tablename__ = "notification_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    route_id = Column(Integer, ForeignKey("routes.id"), nullable=False)
+    notified_at = Column(DateTime, default=utcnow, nullable=False)
+    price = Column(Numeric(10, 2), nullable=False)
+    trigger_reason = Column(String(50), nullable=False)
+    channel = Column(String(50), nullable=False)
+    status = Column(String(20), nullable=False)
+    message_summary = Column(Text, nullable=True)
+
+    route = relationship(
+        "Route",
+        backref=backref("notification_logs", cascade="all, delete-orphan"),
+    )
+
+    __table_args__ = (
+        Index("ix_notif_route_time", "route_id", "notified_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<NotificationLog(id={self.id}, route={self.route_id}, "
+            f"reason='{self.trigger_reason}', status='{self.status}')>"
+        )
+
+
 def _apply_migrations(engine) -> None:
     """幂等地为已存在的表添加新列（SQLite 不支持 IF NOT EXISTS，用 try/except 跳过已存在列）。"""
     stmts = [
@@ -504,6 +537,17 @@ def init_db(db_url: str = "sqlite:///flightscanner.db"):
         with engine.connect() as conn:
             conn.execute(text("PRAGMA journal_mode=WAL"))
             conn.commit()
+
+        # 强制 SQLite 开启外键约束。SQLite 默认 OFF，需在每个 connection 上设置；
+        # 不开启会出现这种孤儿写入：协程在路由删除后落库 price_history，
+        # 后续创建的同 ID 路由会"继承"老数据。
+        from sqlalchemy import event
+
+        @event.listens_for(engine, "connect")
+        def _enable_sqlite_fk(dbapi_conn, _connection_record) -> None:
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
 
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine)

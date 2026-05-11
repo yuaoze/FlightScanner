@@ -57,6 +57,10 @@ dependencies = [
     # Scheduler
     "apscheduler>=3.10.0",
 
+    # REST API
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+
     # Notifications (optional, can be added as needed)
     # "notify-py>=0.3.0",  # Desktop notifications
     # "python-telegram-bot>=21.0",  # Telegram notifications
