@@ -366,14 +366,20 @@ pytest tests/test_qunar_scraper.py -q
 
 复制 `.env.example` 为 `.env` 后按需填写：
 
+> ⚠️ python-dotenv 不会剥掉**值后面**的内联 `# 注释`，会被当成值的一部分进而触发 pydantic 校验失败。
+> 注释要么独占一行（推荐），要么把值用引号包起来 `KEY="value"  # comment`。
+
 ```ini
 # ── 数据库 ─────────────────────────────────────────────────────────
 DATABASE_URL=sqlite:///flightscanner.db
 
 # ── 爬虫设置 ───────────────────────────────────────────────────────
-SCRAPER_TYPE=qunar,ctrip      # 启用的爬虫，逗号分隔（qunar / ctrip）
-SCRAPER_HEADLESS=true         # false = 显示浏览器窗口（调试用）
-SCRAPER_TIMEOUT=30000         # 页面等待超时（毫秒）
+# 启用的爬虫，逗号分隔（qunar / ctrip）
+SCRAPER_TYPE=qunar,ctrip
+# false = 显示浏览器窗口（调试用），生产必须 true
+SCRAPER_HEADLESS=true
+# 页面等待超时（毫秒）
+SCRAPER_TIMEOUT=30000
 SCRAPER_RETRY_COUNT=3
 
 # ── AI 趋势分析（可选）─────────────────────────────────────────────
@@ -387,15 +393,16 @@ DEEPSEEK_MODEL=deepseek-chat
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=your@gmail.com
-SMTP_PASSWORD=your-app-password  # Gmail 需使用"应用专用密码"
+# Gmail 需使用「应用专用密码」
+SMTP_PASSWORD=your-app-password
 
-# Telegram
+# Telegram（chat_id 通过 @userinfobot 获取）
 TELEGRAM_BOT_TOKEN=123456:ABC-xxx
-TELEGRAM_CHAT_ID=your-chat-id    # 通过 @userinfobot 获取
+TELEGRAM_CHAT_ID=your-chat-id
 
-# 飞书群机器人
+# 飞书群机器人（FEISHU_WEBHOOK_SECRET 可选，启用安全设置时才填）
 FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
-FEISHU_WEBHOOK_SECRET=           # 可选，飞书安全设置中开启时填写
+FEISHU_WEBHOOK_SECRET=
 
 # 企业微信群机器人
 WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
