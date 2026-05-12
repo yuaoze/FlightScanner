@@ -132,7 +132,12 @@ def get_routes(
                 )
 
         status, ai_reason, ai_confidence = resolve_status(
-            db, route.id, trend.direction, price_vs_avg_pct
+            db,
+            route.id,
+            trend.direction,
+            price_vs_avg_pct,
+            latest_price=float(route.latest_price) if route.latest_price else None,
+            target_price=float(route.target_price) if route.target_price else None,
         )
         prediction_text = ai_reason or trend.recommendation
         confidence = ai_confidence if ai_confidence is not None else trend.confidence
@@ -366,7 +371,12 @@ def get_route_detail(
             )
 
     status, ai_reason, ai_confidence = resolve_status(
-        db, route.id, trend.direction, price_vs_avg_pct
+        db,
+        route.id,
+        trend.direction,
+        price_vs_avg_pct,
+        latest_price=latest_price,
+        target_price=float(route.target_price) if route.target_price else None,
     )
     prediction_text = ai_reason or trend.recommendation
     confidence = ai_confidence if ai_confidence is not None else trend.confidence

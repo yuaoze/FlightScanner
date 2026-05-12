@@ -867,8 +867,16 @@ class PriceMonitorScheduler:
 
         all_combined = combined_existing + newly_combined
         if not all_combined:
-            # 完全无法配对时原样返回，避免丢失数据
-            return prices
+            # 这条路径只在 roundtrip 路线下被调用（见 scrape_route line 229）。
+            # 单程记录是分程搜索的中间产物，不能当作"往返总价"入库 —— 否则
+            # 单程 ¥390 会被前端展示为「上海→大连 往返 ¥390」（实际往返 ≥¥780）。
+            # 宁可这次采集 0 条留待下次重试，也不污染 DB。
+            if single_leg:
+                logger.warning(
+                    "往返路线配对失败 + 无组合记录 — 丢弃 %d 条单程中间数据，避免单程价格污染往返价格",
+                    len(single_leg),
+                )
+            return []
         return sorted(all_combined, key=lambda fp: fp.price)
 
     async def _send_alert(

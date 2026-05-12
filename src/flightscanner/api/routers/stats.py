@@ -54,7 +54,12 @@ def get_stats(db: Session = Depends(get_db)) -> StatsResponse:
                 )
 
         status, _reason, _conf = resolve_status(
-            db, route.id, trend.direction, price_vs_avg_pct
+            db,
+            route.id,
+            trend.direction,
+            price_vs_avg_pct,
+            latest_price=float(route.latest_price) if route.latest_price else None,
+            target_price=float(route.target_price) if route.target_price else None,
         )
 
         if status == "建议购买":
