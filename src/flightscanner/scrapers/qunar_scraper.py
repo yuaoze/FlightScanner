@@ -92,17 +92,68 @@ class QunarScraper(FlightScraper):
         #   1. 显式传入的 cookies 列表
         #   2. cookies_file 指定的文件
         #   3. 工作目录下的 qunar_cookies.json（若存在）
+        # _cookies_path / _cookies_mtime 记录文件来源，使 reload_cookies_if_changed
+        # 能在文件被外部更新（如 UI 扫码刷新）后热重载，无需重启服务。
+        self._cookies_path: Optional[str] = None
+        self._cookies_mtime: Optional[float] = None
         if cookies:
             self.cookies = cookies
         else:
             path = cookies_file or self.DEFAULT_COOKIES_FILE
+            self._cookies_path = path
             self.cookies = self.load_cookies_from_file(path)
+            self._cookies_mtime = self._get_cookies_mtime()
             if self.cookies:
                 logger.info(f"从 {path} 加载了 {len(self.cookies)} 条 Cookie")
 
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
+
+    def _get_cookies_mtime(self) -> Optional[float]:
+        """Return mtime of the cookie file, or None if path unset / file missing."""
+        if not self._cookies_path:
+            return None
+        try:
+            import os as _os
+            return _os.path.getmtime(self._cookies_path)
+        except OSError:
+            return None
+
+    async def reload_cookies_if_changed(self) -> bool:
+        """检查 cookie 文件 mtime，发现变化时重读并关闭旧 context。
+
+        被两处调用：
+        - search_flights() 开头：周期性自检，覆盖外部修改文件的所有路径
+        - /api/cookies/{platform}/upload 成功后：UI 扫码刷新立即生效
+
+        Returns:
+            True = 重新加载了 cookie；False = 没变化或没 path 来源。
+        """
+        if not self._cookies_path:
+            return False
+        current_mtime = self._get_cookies_mtime()
+        if current_mtime is None:
+            return False
+        if self._cookies_mtime is not None and current_mtime <= self._cookies_mtime:
+            return False
+
+        new_cookies = self.load_cookies_from_file(self._cookies_path)
+        self.cookies = new_cookies
+        self._cookies_mtime = current_mtime
+        logger.info(
+            "[去哪儿] 检测到 cookie 文件已更新，已重新加载 %d 条；下次采集将使用新 cookie",
+            len(new_cookies),
+        )
+
+        # 关闭当前 context — 下次 _ensure_browser 会重建并注入新 cookies
+        if self._context is not None:
+            try:
+                await self._context.close()
+            except Exception:
+                logger.exception("[去哪儿] 关闭旧 browser context 失败（已忽略）")
+            self._context = None
+        return True
 
     @staticmethod
     def load_cookies_from_file(path: str) -> List[Dict]:
@@ -455,6 +506,9 @@ class QunarScraper(FlightScraper):
             AntiCrawlerDetectedError: When anti-crawler mechanism blocks access.
             LoginRequiredError: When login is required and no cookies provided.
         """
+        # 文件 mtime 变了就在这里重新加载 cookie 并 close 旧 context；
+        # _ensure_browser 接着会用新 cookie 重建。
+        await self.reload_cookies_if_changed()
         await self._ensure_browser()
 
         # ── 国际往返程：使用专用接口，直接获取组合价格 ─────────────────────

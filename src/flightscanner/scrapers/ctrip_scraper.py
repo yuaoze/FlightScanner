@@ -97,17 +97,61 @@ class CtripScraper(FlightScraper):
         #   1. 显式传入的 cookies 列表
         #   2. cookies_file 指定的文件
         #   3. 工作目录下的 ctrip_cookies.json（若存在）
+        # _cookies_path / _cookies_mtime 用于 reload_cookies_if_changed 热重载。
+        self._cookies_path: Optional[str] = None
+        self._cookies_mtime: Optional[float] = None
         if cookies:
             self.cookies = cookies
         else:
             path = cookies_file or self.DEFAULT_COOKIES_FILE
+            self._cookies_path = path
             self.cookies = self.load_cookies_from_file(path)
+            self._cookies_mtime = self._get_cookies_mtime()
             if self.cookies:
                 logger.info("从 %s 加载了 %d 条携程 Cookie", path, len(self.cookies))
 
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
+
+    def _get_cookies_mtime(self) -> Optional[float]:
+        """Return mtime of the cookie file, or None if path unset / file missing."""
+        if not self._cookies_path:
+            return None
+        try:
+            import os as _os
+            return _os.path.getmtime(self._cookies_path)
+        except OSError:
+            return None
+
+    async def reload_cookies_if_changed(self) -> bool:
+        """检查 cookie 文件 mtime，发现变化时重读并关闭旧 context。
+
+        与 QunarScraper.reload_cookies_if_changed 同语义 —— 详见该处注释。
+        """
+        if not self._cookies_path:
+            return False
+        current_mtime = self._get_cookies_mtime()
+        if current_mtime is None:
+            return False
+        if self._cookies_mtime is not None and current_mtime <= self._cookies_mtime:
+            return False
+
+        new_cookies = self.load_cookies_from_file(self._cookies_path)
+        self.cookies = new_cookies
+        self._cookies_mtime = current_mtime
+        logger.info(
+            "[携程] 检测到 cookie 文件已更新，已重新加载 %d 条；下次采集将使用新 cookie",
+            len(new_cookies),
+        )
+
+        if self._context is not None:
+            try:
+                await self._context.close()
+            except Exception:
+                logger.exception("[携程] 关闭旧 browser context 失败（已忽略）")
+            self._context = None
+        return True
 
     @staticmethod
     def load_cookies_from_file(path: str) -> List[Dict]:
@@ -289,6 +333,8 @@ class CtripScraper(FlightScraper):
             AntiCrawlerDetectedError: 检测到反爬机制（CAPTCHA 等）。
             ParseError: 数据解析失败。
         """
+        # 文件 mtime 变了就重读 cookie 并关闭旧 context；下次 _ensure_browser 重建。
+        await self.reload_cookies_if_changed()
         await self._ensure_browser()
 
         page: Optional[Page] = None

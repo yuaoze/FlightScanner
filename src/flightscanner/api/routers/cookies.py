@@ -184,11 +184,43 @@ def upload_cookies(platform: str, body: UploadCookieRequest) -> UploadCookieResp
 
     path = _COOKIE_FILES[platform]
     path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 主动通知正在运行的 scraper 立即热重载，无需等下一轮采集
+    _notify_scrapers_reload(platform)
+
     return UploadCookieResponse(
         platform=platform,
         count=len(cookies),
         message=f"已保存 {len(cookies)} 条 Cookie 到 {path.name}",
     )
+
+
+def _notify_scrapers_reload(platform: str) -> None:
+    """Trigger reload_cookies_if_changed on the live scraper instance.
+
+    Only called from cookies upload / login-success / delete endpoints.
+    No-op when scheduler is disabled or scrapers haven't been initialized yet.
+    """
+    import asyncio
+    try:
+        from flightscanner.api import main as api_main
+
+        monitor = api_main._monitor
+        if monitor is None:
+            return
+        loop = getattr(monitor, "_loop", None)
+        if not loop or not loop.is_running():
+            return
+        # 把 reload 调度到调度器自己的事件循环里跑，避免线程安全问题
+        for scraper in getattr(monitor, "scrapers", []):
+            cls_name = type(scraper).__name__.lower()
+            if platform in cls_name and hasattr(scraper, "reload_cookies_if_changed"):
+                asyncio.run_coroutine_threadsafe(
+                    scraper.reload_cookies_if_changed(), loop
+                )
+    except Exception:
+        # 通知失败不影响 cookie 保存本身；下次 search_flights 自检也会兜底。
+        pass
 
 
 # ── Delete endpoint ───────────────────────────────────────────────────────
@@ -200,6 +232,8 @@ def delete_cookies(platform: str) -> None:
     path = _COOKIE_FILES[platform]
     if path.exists():
         path.unlink()
+    # 通知 scraper 清空旧 cookies（mtime 变化会触发，但删除场景文件 mtime 不存在 → 让 scraper 自己处理）
+    _notify_scrapers_reload(platform)
 
 
 # ── QR login background manager ───────────────────────────────────────────
@@ -259,6 +293,9 @@ def _start_login_thread(platform: str) -> None:
             state.success = success
             state.status = "success" if success else "error"
             state.message = "Cookie 已更新" if success else "登录失败或超时"
+            if success:
+                # 扫码登录成功后通知 scraper 立即重载新 cookie
+                _notify_scrapers_reload(platform)
         except Exception as exc:
             state.status = "error"
             state.message = f"出错：{exc}"
