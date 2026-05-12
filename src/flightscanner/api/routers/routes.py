@@ -239,12 +239,49 @@ def create_route(
         )
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
+
+    # 通知后台调度器：注册定时任务 + 立即采集一次。
+    # 不做这一步的话，新路线只能等 uvicorn 重启时 reschedule_all_routes() 才会被调度。
+    _register_route_with_scheduler(route)
+
     return CreateRouteResponse(id=route.id, message="监控创建成功")
+
+
+def _get_live_monitor():
+    """Return the running PriceMonitorScheduler, or None if scheduler is disabled."""
+    try:
+        from flightscanner.api import main as api_main
+
+        return api_main._monitor
+    except Exception:
+        return None
+
+
+def _register_route_with_scheduler(route) -> None:
+    """让调度器接管该路线（注册 cron job + 立即采集一次）。"""
+    monitor = _get_live_monitor()
+    if monitor is None:
+        return  # 调度器未启用（如测试模式 FLIGHTSCANNER_DISABLE_SCHEDULER=1）
+    try:
+        monitor.register_new_route(route)
+    except Exception:
+        # register 失败不影响 DB 写入，路线仍然存在；下次重启时 reschedule_all_routes 会兜底
+        import logging
+        logging.getLogger(__name__).exception("调度器注册路线 %s 失败", route.id)
 
 
 @router.delete("/routes/{route_id}", status_code=204)
 def delete_route(route_id: int, db: Session = Depends(get_db)) -> None:
     """Delete a monitored route."""
+    # 先从调度器移除，再删 DB —— 避免删除瞬间后台 job 触发采集时路线已不存在
+    monitor = _get_live_monitor()
+    if monitor is not None:
+        try:
+            monitor.unschedule_route(route_id)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("调度器移除路线 %s 失败", route_id)
+
     service = RouteService(db)
     deleted = service.delete_route(route_id)
     if not deleted:
@@ -404,6 +441,12 @@ def update_route(
 
     payload = body.model_dump(exclude_unset=True)
 
+    interval_changed = (
+        "scrape_interval" in payload and payload["scrape_interval"] is not None
+        and payload["scrape_interval"] != route.scrape_interval
+    )
+    active_changed = "is_active" in payload and payload["is_active"] is not None
+
     if "target_price" in payload and payload["target_price"] is not None:
         route.target_price = Decimal(str(payload["target_price"]))
     if "scrape_interval" in payload and payload["scrape_interval"] is not None:
@@ -422,6 +465,23 @@ def update_route(
             setattr(route, f, v if v else None)
 
     db.commit()
+    db.refresh(route)
+
+    # 同步给调度器：间隔变了重新调度；is_active 切换时按状态注册/移除。
+    monitor = _get_live_monitor()
+    if monitor is not None:
+        try:
+            if active_changed:
+                if route.is_active:
+                    monitor.schedule_route(route)
+                else:
+                    monitor.unschedule_route(route_id)
+            elif interval_changed and route.is_active:
+                monitor.schedule_route(route)   # schedule_route 内部会先 remove 旧 job
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("PATCH 同步调度器失败 route=%s", route_id)
+
     return {"message": "更新成功"}
 
 

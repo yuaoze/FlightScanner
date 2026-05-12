@@ -1523,6 +1523,28 @@ class PriceMonitorScheduler:
                 "后台事件循环未就绪，路线 %s 将在第一次定时触发时采集", route.id
             )
 
+    def unschedule_route(self, route_id: int) -> bool:
+        """从调度器移除路线对应的定时任务。
+
+        在 API 删除路线 / 暂停路线时调用，防止调度器后续仍按该 ID 触发采集
+        （早期的 SQLite ID 复用 bug 也是因为孤儿 job 残留）。
+
+        Args:
+            route_id: 路线 ID。
+
+        Returns:
+            True = 找到并移除；False = 该 job 不存在（无需告警）。
+        """
+        job_id = f"scrape_route_{route_id}"
+        try:
+            if self.scheduler.get_job(job_id):
+                self.scheduler.remove_job(job_id)
+                logger.info("路线 %s 的定时任务已从调度器移除", route_id)
+                return True
+        except Exception:
+            logger.exception("移除路线 %s 的定时任务失败", route_id)
+        return False
+
     def reschedule_all_routes(self) -> None:
         """重新调度所有活跃路线，确保首次触发时间与上次采集时间对齐。
 

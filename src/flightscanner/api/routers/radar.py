@@ -365,16 +365,16 @@ def lock_deal_as_route(
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
-    # Fire-and-forget immediate scrape via the background scheduler if available.
+    # 注册到调度器：定时任务 + 立即采集一次（一步到位）
     scrape_triggered = False
     try:
         from flightscanner.api import main as api_main
 
         monitor = api_main._monitor
-        loop = getattr(monitor, "_loop", None) if monitor else None
-        if monitor and loop and loop.is_running():
-            asyncio.run_coroutine_threadsafe(monitor.scrape_route(route), loop)
-            scrape_triggered = True
+        if monitor is not None:
+            monitor.register_new_route(route)
+            loop = getattr(monitor, "_loop", None)
+            scrape_triggered = bool(loop and loop.is_running())
     except Exception:
         pass
 
