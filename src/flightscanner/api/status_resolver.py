@@ -112,3 +112,21 @@ def resolve_status(
     if ai and _ai_is_stale(ai, latest_price):
         fallback_reason = "AI 预测已过时（价格变化较大），按当前数据评估"
     return (STATUS_MAP.get(trend_direction, "建议观望"), fallback_reason, None)
+
+
+def is_ai_prediction_stale(
+    db: Session, route_id: int, latest_price: Optional[float]
+) -> bool:
+    """Public helper: does this route's latest AI prediction need refreshing?
+
+    Used by API endpoints that compute status — if True, they enqueue an async
+    re-prediction so the next read returns up-to-date AI commentary.
+    Returns False when there's no AI record (nothing to refresh) or current
+    price is unknown.
+    """
+    if latest_price is None:
+        return False
+    ai = get_latest_ai_prediction(db, route_id)
+    if ai is None:
+        return False
+    return _ai_is_stale(ai, latest_price)

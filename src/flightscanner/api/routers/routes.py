@@ -26,7 +26,12 @@ from flightscanner.api.schemas import (
 )
 from flightscanner.analyzers.rule_based_analyzer import RuleBasedAnalyzer
 from flightscanner.api.route_filter import filter_history_by_route
-from flightscanner.api.status_resolver import STATUS_MAP, STATUS_PRIORITY, resolve_status
+from flightscanner.api.status_resolver import (
+    STATUS_MAP,
+    STATUS_PRIORITY,
+    is_ai_prediction_stale,
+    resolve_status,
+)
 from flightscanner.api.time_utils import fmt_cst, iso_utc
 from flightscanner.core.services.route_service import RouteService
 from flightscanner.interfaces import FlightPrice
@@ -139,6 +144,8 @@ def get_routes(
             latest_price=float(route.latest_price) if route.latest_price else None,
             target_price=float(route.target_price) if route.target_price else None,
         )
+        # 检测 AI 是否已过时；过时则异步触发重预测（带去重，不会重复打 API）
+        _enqueue_repredict_if_stale(db, route.id, route.latest_price)
         prediction_text = ai_reason or trend.recommendation
         confidence = ai_confidence if ai_confidence is not None else trend.confidence
 
@@ -275,6 +282,32 @@ def _register_route_with_scheduler(route) -> None:
         logging.getLogger(__name__).exception("调度器注册路线 %s 失败", route.id)
 
 
+def _enqueue_repredict_if_stale(db, route_id: int, latest_price) -> None:
+    """如果该路线的 AI 预测已过时，异步触发重预测。
+
+    在 GET 端点（list / detail）里调用 — 检测到过时就把重预测协程
+    扔进调度器的事件循环，本次请求不阻塞。重预测自带进程级去重，
+    dashboard 频繁轮询不会重复打 DeepSeek API。
+    """
+    if latest_price is None:
+        return
+    monitor = _get_live_monitor()
+    if monitor is None:
+        return
+    loop = getattr(monitor, "_loop", None)
+    if not (loop and loop.is_running()):
+        return
+    try:
+        if is_ai_prediction_stale(db, route_id, float(latest_price)):
+            import asyncio
+            asyncio.run_coroutine_threadsafe(
+                monitor.refresh_prediction_for_route(route_id), loop
+            )
+    except Exception:
+        # 失败不影响读路径；下次还会再次检测
+        pass
+
+
 @router.delete("/routes/{route_id}", status_code=204)
 def delete_route(route_id: int, db: Session = Depends(get_db)) -> None:
     """Delete a monitored route."""
@@ -378,6 +411,7 @@ def get_route_detail(
         latest_price=latest_price,
         target_price=float(route.target_price) if route.target_price else None,
     )
+    _enqueue_repredict_if_stale(db, route.id, latest_price)
     prediction_text = ai_reason or trend.recommendation
     confidence = ai_confidence if ai_confidence is not None else trend.confidence
 

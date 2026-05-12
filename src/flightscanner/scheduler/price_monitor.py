@@ -12,12 +12,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from statistics import median
-from typing import Dict, List, Optional, Set, Tuple
+from typing import ClassVar, Dict, List, Optional, Set, Tuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from flightscanner.models.database import Route
+from flightscanner.models.database import PriceHistory, Route
 from flightscanner.core.services import RouteService
 from flightscanner.scrapers import ScraperRegistry
 from flightscanner.analyzers import RuleBasedAnalyzer
@@ -242,6 +242,27 @@ class PriceMonitorScheduler:
             # ── 存库 ─────────────────────────────────────────────────────
             session = self._SessionLocal()
             try:
+                # 往返路线在保存前清理孤儿单程记录：之前版本的 _combine_roundtrip_prices
+                # 在配对失败时会原样返回单程列表，导致 ¥390 单程被当成"往返价"入库。
+                # 现在每次采集前主动清理 route_id 下 return_flight_id IS NULL 的脏数据，
+                # 让前端 latest_price 不再被旧的单程残留污染。
+                if trip_type == "roundtrip":
+                    from sqlalchemy import and_ as _and
+                    cleaned = (
+                        session.query(PriceHistory)
+                        .filter(_and(
+                            PriceHistory.route_id == route.id,
+                            PriceHistory.return_flight_id.is_(None),
+                        ))
+                        .delete(synchronize_session=False)
+                    )
+                    if cleaned:
+                        session.commit()
+                        logger.info(
+                            "路线 %s 清理 %d 条孤儿单程记录（roundtrip 路线下 return_flight_id IS NULL）",
+                            route.id, cleaned,
+                        )
+
                 route_service = RouteService(session)
                 for fp in flight_prices:
                     route_service.save_price_for_route(route.id, fp)
@@ -1784,6 +1805,63 @@ class PriceMonitorScheduler:
             logger.info("[G1] 预测已记录 route_id=%d action=%s", route.id, brief.get("action"))
         except Exception as exc:
             logger.warning("[G1] 预测记录失败 route_id=%d：%s", route.id, exc)
+
+    # ── Forced re-prediction (bypass 12h cooldown) ────────────────────────
+    # 进程内防抖：同一路线只允许一个 in-flight 重预测，避免 dashboard 频繁
+    # 轮询时反复触发 DeepSeek API 调用。
+    _REPREDICT_INFLIGHT: ClassVar[Set[int]] = set()
+    _REPREDICT_LOCK: ClassVar[threading.Lock] = threading.Lock()
+
+    async def refresh_prediction_for_route(self, route_id: int) -> None:
+        """绕过 12h 冷却，强制为指定路线重新生成 AI 预测。
+
+        被 routes API 在检测到 AI 预测过时（价格漂移 >15%）时通过
+        run_coroutine_threadsafe 调用。同一路线短时间内只跑一次，
+        无视 dashboard 反复 GET 触发的多次请求。
+        """
+        with self._REPREDICT_LOCK:
+            if route_id in self._REPREDICT_INFLIGHT:
+                return
+            self._REPREDICT_INFLIGHT.add(route_id)
+
+        try:
+            session = self._SessionLocal()
+            try:
+                route = session.query(Route).filter(Route.id == route_id).first()
+                if route is None or not route.is_active:
+                    return
+
+                route_service = RouteService(session)
+                history = route_service.get_route_price_history(route_id, days=30)
+                if len(history) < 7:
+                    logger.info("[G1-refresh] 路线 %s 历史不足 7 条，跳过 AI 重预测", route_id)
+                    return
+
+                from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback_async
+                from flightscanner.analyzers.evolution_engine import log_prediction
+
+                brief = await generate_brief_with_fallback_async(
+                    price_history=history,
+                    target_date=route.target_date,
+                    route_label=f"{route.origin} → {route.destination}",
+                    api_key=settings.deepseek_api_key or None,
+                    base_url=settings.deepseek_base_url,
+                    model=settings.deepseek_model,
+                )
+                current_price = float(min(fp.price for fp in history))
+                days_until = (route.target_date - date.today()).days
+                log_prediction(session, route_id, brief, current_price, days_until)
+                logger.info(
+                    "[G1-refresh] 路线 %s 因价格漂移触发的强制重预测完成 action=%s",
+                    route_id, brief.get("action"),
+                )
+            finally:
+                session.close()
+        except Exception:
+            logger.exception("[G1-refresh] 路线 %s 强制重预测失败", route_id)
+        finally:
+            with self._REPREDICT_LOCK:
+                self._REPREDICT_INFLIGHT.discard(route_id)
 
     async def _run_daily_evolution(self) -> None:
         """G2 回测 + G3 RCA，每天 UTC 03:00 运行。"""
