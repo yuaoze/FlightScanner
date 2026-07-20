@@ -8,7 +8,7 @@ import asyncio
 import logging
 import random
 import base64
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List, Optional, Dict
 from urllib.parse import quote
@@ -769,6 +769,13 @@ class QunarScraper(FlightScraper):
                     )
 
             logger.info(f"Found {len(flight_prices)} flights")
+
+            # International single-leg fallback: wwwsearch returned 0, try interroundtrip_compare
+            if not flight_prices and is_international_route(
+                params.departure_city, params.arrival_city
+            ):
+                flight_prices = await self._search_inter_single_via_roundtrip(params)
+
             return flight_prices
 
         except asyncio.TimeoutError as e:
@@ -2184,6 +2191,58 @@ class QunarScraper(FlightScraper):
                 continue
         logger.warning("[往返] 未找到价格排序按钮，将对采集结果自行排序")
         return False
+
+    async def _search_inter_single_via_roundtrip(
+        self, params: SearchParams
+    ) -> List[FlightPrice]:
+        """国际单程降级搜索：通过 interroundtrip_compare.htm 获取航班数据。
+
+        当 oneway_list_inter.htm 的 wwwsearch API 返回空数据时（常见于会话被风控），
+        构造一个假往返请求（回程 = 去程日期 + 3 天），使用 interroundtrip_compare.htm
+        的不同后端 API 端点获取航班数据，只取去程单腿价格返回。
+
+        注：返回的 price 是往返总价（含税），比单程价略高，但对于周末雷达
+        的价格排序和筛选来说足够用。
+
+        Args:
+            params: 单程搜索参数。
+
+        Returns:
+            去程单腿 FlightPrice 列表，失败时返回空列表。
+        """
+        return_date = params.departure_date + timedelta(days=3)
+        fake_roundtrip_params = SearchParams(
+            departure_city=params.departure_city,
+            arrival_city=params.arrival_city,
+            departure_date=params.departure_date,
+            return_date=return_date,
+        )
+        logger.info(
+            "[国际单程降级] 构造假往返 %s→%s, 去程 %s 回程 %s",
+            params.departure_city, params.arrival_city,
+            params.departure_date, return_date,
+        )
+        roundtrip_results = await self._search_inter_roundtrip(fake_roundtrip_params)
+        if not roundtrip_results:
+            logger.warning("[国际单程降级] interroundtrip_compare 也未返回数据")
+            return []
+
+        # 只取去程（trips[0]）信息，price 是往返含税总价
+        outbound_only: List[FlightPrice] = []
+        for fp in roundtrip_results:
+            outbound_only.append(
+                FlightPrice(
+                    flight_info=fp.flight_info,
+                    price=fp.price,
+                    currency=fp.currency,
+                    seat_class=fp.seat_class,
+                    available_seats=fp.available_seats,
+                    scraped_at=fp.scraped_at,
+                    source=fp.source,
+                )
+            )
+        logger.info("[国际单程降级] 获取到 %d 条去程航班（价格=往返总价）", len(outbound_only))
+        return outbound_only
 
     async def _search_inter_roundtrip(self, params: SearchParams) -> List[FlightPrice]:
         """通过 interroundtrip_compare.htm 页面采集国际往返航班价格。

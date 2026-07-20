@@ -234,14 +234,18 @@ def get_radar_deals(
     db: Session = Depends(get_db),
 ) -> RadarDealsResponse:
     """Return cached weekend deals + weekend options for UI filters."""
-    today = date.today()
-
-    # Collect all weekends that have at least one deal from today onward.
-    # Count DISTINCT destinations (not rows) so that re-scanned weekends don't
-    # double-count the chip badge.
     from sqlalchemy import func
 
-    all_weekends = (
+    from flightscanner.weekend_radar.scanner import get_upcoming_weekends
+
+    today = date.today()
+
+    # Build the full 8-weekend list first, so the UI always shows every upcoming
+    # weekend even when some haven't been scanned yet (deal_count = 0).
+    upcoming = get_upcoming_weekends(8)
+
+    # Existing deal counts from cache, keyed by (outbound_date, return_date).
+    deal_count_rows = (
         db.query(
             WeekendRadarCache.outbound_date,
             WeekendRadarCache.return_date,
@@ -249,17 +253,18 @@ def get_radar_deals(
         )
         .filter(WeekendRadarCache.outbound_date >= today)
         .group_by(WeekendRadarCache.outbound_date, WeekendRadarCache.return_date)
-        .order_by(WeekendRadarCache.outbound_date)
         .all()
     )
+    deal_counts = {(row[0], row[1]): row[2] for row in deal_count_rows}
+
     weekends = [
         WeekendOption(
-            outbound_date=row.outbound_date,
-            return_date=row.return_date,
-            label=f"{row.outbound_date.strftime('%m-%d')} 周五 / {row.return_date.strftime('%m-%d')} 周日",
-            deal_count=row.cnt,
+            outbound_date=friday,
+            return_date=sunday,
+            label=f"{friday.strftime('%m-%d')} 周五 / {sunday.strftime('%m-%d')} 周日",
+            deal_count=deal_counts.get((friday, sunday), 0),
         )
-        for row in all_weekends
+        for friday, sunday in upcoming
     ]
 
     # Deals for the chosen weekend (or all upcoming if none).

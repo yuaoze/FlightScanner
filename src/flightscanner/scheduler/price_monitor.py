@@ -7,6 +7,7 @@ and sends alerts when prices drop below target thresholds.
 import asyncio
 import json
 import logging
+import random
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -1907,6 +1908,22 @@ class PriceMonitorScheduler:
 
         for friday, sunday in weekends:
             logger.info("[WeekendRadar] 扫描周末：%s → %s", friday, sunday)
+
+            # 每个周末扫描前重置 scraper 的浏览器状态，避免上一个周末
+            # 扫描 39 个目的地的 78 次搜索累积的内存/页签/Bella 指纹
+            # 压力导致浏览器崩溃后后续周末全部失败。
+            for scraper in self.scrapers:
+                try:
+                    await scraper.close()
+                except Exception:
+                    pass
+
+            # 周末之间冷却 40-90 秒，模拟人类操作节奏，避免连续密集搜索触发风控
+            if friday != weekends[0][0]:
+                cool = random.uniform(40, 90)
+                logger.info("[WeekendRadar] 冷却 %.0fs 后进入下一周末…", cool)
+                await asyncio.sleep(cool)
+
             try:
                 deals = await scanner.scan_weekend(
                     outbound_date=friday,

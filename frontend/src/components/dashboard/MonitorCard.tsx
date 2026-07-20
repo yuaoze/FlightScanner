@@ -49,6 +49,11 @@ export function MonitorCard({ route }: MonitorCardProps) {
         <div>
           <h3 className="text-base font-semibold text-gray-900">
             {route.origin} → {route.destination}
+            {route.monitoring_mode === 'flight' && route.outbound_flight_no && (
+              <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-[11px] font-mono font-medium bg-orange-50 text-orange-700 border border-orange-200">
+                {route.outbound_flight_no}
+              </span>
+            )}
           </h3>
           <p className="text-xs text-gray-400 mt-0.5">
             {formatDateRange(route.target_date, route.return_date)}

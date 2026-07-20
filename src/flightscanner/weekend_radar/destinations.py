@@ -24,8 +24,12 @@ DOMESTIC_DESTINATIONS: List[str] = [
 
 # ── 国际/港澳台目的地池（飞行≤4小时）────────────────────────────────────────
 INTERNATIONAL_DESTINATIONS: List[str] = [
-    "东京", "大阪", "首尔", "济州", "香港", "澳门",
-    "曼谷", "新加坡", "吉隆坡", "普吉岛",
+    "东京", "大阪", "福冈", "名古屋", "冲绳",
+    "首尔", "济州", "釜山",
+    "香港", "澳门",
+    "曼谷", "普吉岛", "清迈",
+    "新加坡", "吉隆坡",
+    "河内", "胡志明市", "岘港",
 ]
 
 # ── 过滤后的目的地完整池 ───────────────────────────────────────────────────────
@@ -40,11 +44,19 @@ VISA_INFO: Dict[str, Dict[str, str]] = {
     "澳门":    {"status": "免签",   "label": "🆓 港澳通行证直接走"},
     "东京":    {"status": "需签证", "label": "📋 需提前办好日本签证"},
     "大阪":    {"status": "需签证", "label": "📋 需提前办好日本签证"},
+    "福冈":    {"status": "需签证", "label": "📋 需提前办好日本签证"},
+    "名古屋":  {"status": "需签证", "label": "📋 需提前办好日本签证"},
+    "冲绳":    {"status": "需签证", "label": "📋 需提前办好日本签证"},
     "首尔":    {"status": "需申请", "label": "ℹ️ 需韩签或K-ETA在线申请"},
+    "釜山":    {"status": "需申请", "label": "ℹ️ 需韩签或K-ETA在线申请"},
     "曼谷":    {"status": "落地签", "label": "✅ 落地签，护照直接走"},
+    "普吉岛":  {"status": "落地签", "label": "✅ 落地签可办"},
+    "清迈":    {"status": "落地签", "label": "✅ 落地签可办"},
     "新加坡":  {"status": "免签",   "label": "🆓 免签30天"},
     "吉隆坡":  {"status": "免签",   "label": "🆓 免签30天"},
-    "普吉岛":  {"status": "落地签", "label": "✅ 落地签可办"},
+    "河内":    {"status": "落地签", "label": "✅ 落地签/电子签，方便快捷"},
+    "胡志明市":{"status": "落地签", "label": "✅ 落地签/电子签，方便快捷"},
+    "岘港":    {"status": "落地签", "label": "✅ 落地签/电子签，方便快捷"},
 }
 
 # ── 目的地 Emoji 映射 ──────────────────────────────────────────────────────────
@@ -55,9 +67,11 @@ DESTINATION_EMOJI: Dict[str, str] = {
     "沈阳": "🏙️",   "哈尔滨": "❄️", "长沙": "🍜",   "武汉": "🌉",
     "广州": "🏙️",   "深圳": "🌆",   "南宁": "🌴",   "张家界": "🗻",
     "西双版纳": "🦋",
-    "东京": "⛩️",   "大阪": "🦐",   "首尔": "🌃",   "济州": "🍊",
-    "香港": "🏙️",   "澳门": "🎰",   "曼谷": "🛕",
-    "新加坡": "🦁", "吉隆坡": "🗼", "普吉岛": "🏝️",
+    "东京": "⛩️",   "大阪": "🦐",   "福冈": "🍜",   "名古屋": "🏯",
+    "冲绳": "🏖️",   "首尔": "🌃",   "济州": "🍊",
+    "釜山": "🌊",   "香港": "🏙️",   "澳门": "🎰",   "曼谷": "🛕",
+    "普吉岛": "🏝️", "清迈": "🛕",   "新加坡": "🦁", "吉隆坡": "🗼",
+    "河内": "🛵",   "胡志明市": "🌆", "岘港": "🏖️",
     "_default": "✈️",
 }
 
@@ -86,14 +100,22 @@ DESTINATION_GRADIENT: Dict[str, str] = {
     "西双版纳":"linear-gradient(135deg, #a3e635, #65a30d)",
     "东京":    "linear-gradient(135deg, #f43f5e, #e11d48)",
     "大阪":    "linear-gradient(135deg, #fb923c, #ea580c)",
+    "福冈":    "linear-gradient(135deg, #f472b6, #db2777)",
+    "名古屋":  "linear-gradient(135deg, #c084fc, #9333ea)",
+    "冲绳":    "linear-gradient(135deg, #22d3ee, #0891b2)",
     "首尔":    "linear-gradient(135deg, #8b5cf6, #7c3aed)",
     "济州":    "linear-gradient(135deg, #10b981, #059669)",
+    "釜山":    "linear-gradient(135deg, #60a5fa, #2563eb)",
     "香港":    "linear-gradient(135deg, #f97316, #ea580c)",
     "澳门":    "linear-gradient(135deg, #facc15, #ca8a04)",
     "曼谷":    "linear-gradient(135deg, #eab308, #ca8a04)",
+    "普吉岛":  "linear-gradient(135deg, #f472b6, #be185d)",
+    "清迈":    "linear-gradient(135deg, #34d399, #059669)",
     "新加坡":  "linear-gradient(135deg, #ef4444, #b91c1c)",
     "吉隆坡":  "linear-gradient(135deg, #14b8a6, #0f766e)",
-    "普吉岛":  "linear-gradient(135deg, #f472b6, #be185d)",
+    "河内":    "linear-gradient(135deg, #fbbf24, #d97706)",
+    "胡志明市":"linear-gradient(135deg, #fb923c, #ea580c)",
+    "岘港":    "linear-gradient(135deg, #38bdf8, #0284c7)",
     "_default": "linear-gradient(135deg, #64748b, #475569)",
 }
 
@@ -131,5 +153,13 @@ DESTINATION_IMAGE: Dict[str, str] = {
     "新加坡":    "https://images.unsplash.com/photo-1599917858303-0c3c47ccece3?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxTaW5nYXBvcmUlMjBNYXJpbmElMjBCYXklMjBuaWdodHxlbnwwfDB8fHwxNzc2MjE4MjYzfDA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
     "吉隆坡":    "https://images.unsplash.com/photo-1533118673680-d7eaa85beb24?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxLdWFsYSUyMEx1bXB1ciUyMFBldHJvbmFzJTIwVG93ZXJzfGVufDB8MHx8fDE3NzYyMTgyNjV8MA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
     "普吉岛":    "https://images.unsplash.com/photo-1704549931312-432d26dd53c3?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxQaHVrZXQlMjBiZWFjaCUyMFRoYWlsYW5kfGVufDB8MHx8fDE3NzYyMTgyNjZ8MA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
+    "清迈":    "https://images.unsplash.com/photo-1598935898639-81586f7d2129?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxDaGlhbmclMjBNYWklMjBUaGFpbGFuZCUyMHRlbXBsZXxlbnwwfDB8fHwxNzc2MjE4MjY3fDA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
+    "福冈":    "https://images.unsplash.com/photo-1578469645742-988e4d1b1dc3?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxGdWt1b2thJTIwSmFwYW4lMjBjaXR5fGVufDB8MHx8fDE3NzYyMTgyNjh8MA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
+    "名古屋":  "https://images.unsplash.com/photo-1578271887552-5ac3a72752bc?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxOYWdveWElMjBKYXBhbiUyMGNhc3RsZXxlbnwwfDB8fHwxNzc2MjE4MjcwfDA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
+    "冲绳":    "https://images.unsplash.com/photo-1607880584240-036b158fd3b3?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxPa2luYXdhJTIwSmFwYW4lMjBiZWFjaHxlbnwwfDB8fHwxNzc2MjE4MjcyfDA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
+    "釜山":    "https://images.unsplash.com/photo-1635266124717-2e795b6e3e96?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxCdXNhbiUyMEtvcmVhJTIwY2l0eXxlbnwwfDB8fHwxNzc2MjE4MjczfDA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
+    "河内":    "https://images.unsplash.com/photo-1509030450996-dd1a26dda5e4?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxIYW5vaSUyMFZpZXRuYW0lMjBvbGQlMjBxdWFydGVyfGVufDB8MHx8fDE3NzYyMTgyNzV8MA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
+    "胡志明市":"https://images.unsplash.com/photo-1583417319070-4a69db38a482?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxTYWlnb24lMjBWaWV0bmFtJTIwY2l0eXxlbnwwfDB8fHwxNzc2MjE4Mjc2fDA&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
+    "岘港":    "https://images.unsplash.com/photo-1559592413-7cec4d0cae2b?ixid=M3w5MjUyMzl8MHwxfHNlYXJjaHwxfHxEYSUyME5hbmclMjBWaWV0bmFtJTIwYmVhY2h8ZW58MHwwfHx8MTc3NjIxODI3N3ww&ixlib=rb-4.1.0&w=800&h=500&fit=crop&q=80",
     "_default": "https://picsum.photos/seed/travel-sky/400/220",
 }

@@ -333,8 +333,8 @@ class TestCombineRoundtripPrices:
         prices = sorted(r.price for r in result)
         assert prices == [Decimal("1100"), Decimal("1150")]
 
-    def test_no_pairable_records_returns_original(self):
-        """If no combined records and no return leg, return prices unchanged."""
+    def test_no_pairable_records_returns_empty(self):
+        """If no combined records and no return leg, drop orphan single-leg data."""
         out_fp = _make_rt_price("CA953", 600, direction=FlightDirection.DEPARTURE)
         result = PriceMonitorScheduler._combine_roundtrip_prices([out_fp])
-        assert result == [out_fp]
+        assert result == []

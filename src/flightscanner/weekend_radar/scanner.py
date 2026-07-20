@@ -5,6 +5,7 @@
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
@@ -183,6 +184,53 @@ class WeekendRadarScanner:
     def __init__(self, scrapers: List[FlightScraper]) -> None:
         self.scrapers = scrapers
 
+    async def _search_with_fallback(
+        self,
+        params: SearchParams,
+        destination: str,
+    ) -> Optional[List[FlightPrice]]:
+        """依次尝试所有 scraper，返回第一个有结果的。
+
+        Args:
+            params: 搜索参数。
+            destination: 目的地名称（用于日志）。
+
+        Returns:
+            搜索结果列表，所有 scraper 都失败时返回 None。
+        """
+        for i, scraper in enumerate(self.scrapers):
+            scraper_name = scraper.__class__.__name__
+            try:
+                logger.debug(
+                    "尝试 scraper %d/%d (%s): %s → %s",
+                    i + 1, len(self.scrapers), scraper_name,
+                    params.departure_city, params.arrival_city,
+                )
+                results = await scraper.search_flights(params)
+                if results:
+                    logger.info(
+                        "%s 搜索成功：%s → %s, 找到 %d 条结果",
+                        scraper_name, params.departure_city, params.arrival_city, len(results),
+                    )
+                    return results
+                else:
+                    logger.debug(
+                        "%s 返回空结果：%s → %s",
+                        scraper_name, params.departure_city, params.arrival_city,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "%s 搜索异常：%s → %s, 错误: %s",
+                    scraper_name, params.departure_city, params.arrival_city, str(e),
+                )
+
+        # 所有 scraper 都失败
+        logger.warning(
+            "所有 scraper 均未能获取数据：目的地 %s",
+            destination,
+        )
+        return None
+
     async def scan_weekend(
         self,
         outbound_date: date,
@@ -213,8 +261,7 @@ class WeekendRadarScanner:
                     results.append(deal)
             except Exception:
                 logger.warning("扫描目的地 %s 失败，跳过", dest, exc_info=True)
-            # 避免频繁请求
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(random.uniform(2, 5))
 
         results.sort(key=lambda d: d.total_price)
         return results
@@ -245,30 +292,24 @@ class WeekendRadarScanner:
         if not self.scrapers:
             return None
 
-        scraper = self.scrapers[0]
+        outbound_params = SearchParams(
+            departure_city=_ORIGIN,
+            arrival_city=destination,
+            departure_date=outbound_date,
+        )
+        return_params = SearchParams(
+            departure_city=destination,
+            arrival_city=_ORIGIN,
+            departure_date=return_date,
+        )
 
-        # ── 搜索去程（单程，仅用于获取单腿价格和航班信息）─────────────────────
-        try:
-            outbound_params = SearchParams(
-                departure_city=_ORIGIN,
-                arrival_city=destination,
-                departure_date=outbound_date,
-            )
-            outbound_prices: List[FlightPrice] = await scraper.search_flights(outbound_params)
-        except Exception:
-            logger.warning("去程搜索失败：%s → %s", _ORIGIN, destination, exc_info=True)
+        outbound_prices = await self._search_with_fallback(outbound_params, destination)
+        if not outbound_prices:
             return None
 
-        # ── 搜索回程（单程）──────────────────────────────────────────────────
-        try:
-            return_params = SearchParams(
-                departure_city=destination,
-                arrival_city=_ORIGIN,
-                departure_date=return_date,
-            )
-            return_prices: List[FlightPrice] = await scraper.search_flights(return_params)
-        except Exception:
-            logger.warning("回程搜索失败：%s → %s", destination, _ORIGIN, exc_info=True)
+        await asyncio.sleep(random.uniform(3, 7))
+        return_prices = await self._search_with_fallback(return_params, destination)
+        if not return_prices:
             return None
 
         # ── 去程过滤：直飞 + 周五19:00后 + 周六02:00前到达 + 城市校验 ────────────

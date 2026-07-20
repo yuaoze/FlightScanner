@@ -93,6 +93,7 @@ export function AddMonitorPage() {
   const queryClient = useQueryClient();
   const { data: cities = [] } = useCities();
 
+  const [monitoringMode, setMonitoringMode] = useState<'route' | 'flight'>('route');
   const [origin, setOrigin] = useState('');
   const [destination, setDestination] = useState('');
   const [targetDate, setTargetDate] = useState('');
@@ -105,6 +106,11 @@ export function AddMonitorPage() {
   const [depTimeTo, setDepTimeTo] = useState('');
   const [depAirport, setDepAirport] = useState('');
   const [arrAirport, setArrAirport] = useState('');
+
+  // Pinned flight fields
+  const [outboundFlightNo, setOutboundFlightNo] = useState('');
+  const [inboundFlightNo, setInboundFlightNo] = useState('');
+  const [pinnedSeatClass, setPinnedSeatClass] = useState('');
 
   const createMutation = useMutation({
     mutationFn: async () => {
@@ -121,6 +127,15 @@ export function AddMonitorPage() {
       if (depTimeTo) body.dep_time_to = depTimeTo;
       if (depAirport) body.dep_airport_code = depAirport;
       if (arrAirport) body.arr_airport_code = arrAirport;
+
+      // Pinned flight fields
+      if (monitoringMode === 'flight') {
+        body.monitoring_mode = 'flight';
+        body.outbound_flight_no = outboundFlightNo;
+        if (isRoundTrip && inboundFlightNo) body.inbound_flight_no = inboundFlightNo;
+        if (pinnedSeatClass) body.pinned_seat_class = pinnedSeatClass;
+      }
+
       const { data } = await apiClient.post('/routes', body);
       return data;
     },
@@ -131,7 +146,8 @@ export function AddMonitorPage() {
     },
   });
 
-  const canSubmit = origin && destination && targetDate && targetPrice;
+  const canSubmit = origin && destination && targetDate && targetPrice
+    && (monitoringMode === 'route' || outboundFlightNo);
 
   return (
     <div className="max-w-2xl">
@@ -141,6 +157,40 @@ export function AddMonitorPage() {
       </div>
 
       <div className="bg-white rounded-xl border border-gray-100 p-6 space-y-5">
+        {/* Monitoring Mode Toggle */}
+        <div>
+          <label className="block text-xs font-medium text-gray-500 mb-2">监控模式</label>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setMonitoringMode('route')}
+              className={`flex-1 px-4 py-2 text-sm font-medium rounded-lg border transition-colors ${
+                monitoringMode === 'route'
+                  ? 'bg-blue-50 border-blue-300 text-blue-700'
+                  : 'bg-white border-gray-200 text-gray-500 hover:bg-gray-50'
+              }`}
+            >
+              路线监控
+            </button>
+            <button
+              type="button"
+              onClick={() => setMonitoringMode('flight')}
+              className={`flex-1 px-4 py-2 text-sm font-medium rounded-lg border transition-colors ${
+                monitoringMode === 'flight'
+                  ? 'bg-blue-50 border-blue-300 text-blue-700'
+                  : 'bg-white border-gray-200 text-gray-500 hover:bg-gray-50'
+              }`}
+            >
+              精准航班监控
+            </button>
+          </div>
+          {monitoringMode === 'flight' && (
+            <p className="text-xs text-gray-400 mt-1.5">
+              按航班号精确追踪指定航班的价格与状态
+            </p>
+          )}
+        </div>
+
         {/* Cities */}
         <div className="grid grid-cols-2 gap-4">
           <div>
@@ -197,6 +247,56 @@ export function AddMonitorPage() {
           </div>
         </div>
 
+        {/* Pinned Flight Fields */}
+        {monitoringMode === 'flight' && (
+          <div className="space-y-4 p-4 bg-blue-50 rounded-lg border border-blue-200">
+            <p className="text-xs font-medium text-blue-700">精准航班信息</p>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                  去程航班号 <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={outboundFlightNo}
+                  onChange={(e) => setOutboundFlightNo(e.target.value.toUpperCase())}
+                  placeholder="如：CA953"
+                  maxLength={10}
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-100 font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1.5">舱位</label>
+                <select
+                  value={pinnedSeatClass}
+                  onChange={(e) => setPinnedSeatClass(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-100"
+                >
+                  <option value="">不限</option>
+                  <option value="经济舱">经济舱</option>
+                  <option value="商务舱">商务舱</option>
+                  <option value="头等舱">头等舱</option>
+                </select>
+              </div>
+            </div>
+            {isRoundTrip && (
+              <div>
+                <label className="block text-xs font-medium text-gray-500 mb-1.5">
+                  回程航班号
+                </label>
+                <input
+                  type="text"
+                  value={inboundFlightNo}
+                  onChange={(e) => setInboundFlightNo(e.target.value.toUpperCase())}
+                  placeholder="如：CA952（选填）"
+                  maxLength={10}
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-100 font-mono"
+                />
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Price & Interval */}
         <div className="grid grid-cols-2 gap-4">
           <div>
@@ -204,7 +304,7 @@ export function AddMonitorPage() {
             <input
               type="number"
               value={targetPrice}
-              onChange={(e) => setTargetPrice(e.target.value)}
+              onInput={(e) => setTargetPrice((e.target as HTMLInputElement).value)}
               placeholder="如：800"
               className="w-full px-3 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-400"
             />

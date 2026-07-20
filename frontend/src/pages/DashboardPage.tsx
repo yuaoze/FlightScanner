@@ -1,15 +1,36 @@
 import { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import type { MonitorStatus } from '../types';
 import { useRoutes } from '../hooks/useRoutes';
 import { useStats } from '../hooks/useStats';
 import { KpiCards } from '../components/dashboard/KpiCards';
 import { FilterTabs } from '../components/dashboard/FilterTabs';
 import { MonitorCardGrid } from '../components/dashboard/MonitorCardGrid';
+import { AddMonitorDialog } from '../components/dashboard/AddMonitorDialog';
+import { apiClient } from '../api/client';
+
+interface CityItem {
+  name: string;
+  code: string;
+}
+
+function useCities() {
+  return useQuery({
+    queryKey: ['cities'],
+    queryFn: async (): Promise<CityItem[]> => {
+      const { data } = await apiClient.get<CityItem[]>('/cities');
+      return data;
+    },
+    staleTime: Infinity,
+  });
+}
 
 export function DashboardPage() {
   const [activeTab, setActiveTab] = useState<MonitorStatus | '全部'>('全部');
+  const [showAddDialog, setShowAddDialog] = useState(false);
   const { data: routes, isLoading: routesLoading } = useRoutes();
   const { data: stats, isLoading: statsLoading } = useStats();
+  const { data: cities = [] } = useCities();
 
   const counts = {
     total: routes?.length ?? 0,
@@ -29,11 +50,21 @@ export function DashboardPage() {
           </p>
         </div>
         <div className="flex items-center gap-3">
-          <button className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition-colors font-medium">
+          <button
+            onClick={() => setShowAddDialog(true)}
+            className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition-colors font-medium"
+          >
             ＋ 添加监控
           </button>
         </div>
       </div>
+
+      {/* Add Monitor Dialog */}
+      <AddMonitorDialog
+        open={showAddDialog}
+        onClose={() => setShowAddDialog(false)}
+        cities={cities}
+      />
 
       {/* KPI Cards */}
       <KpiCards stats={stats} isLoading={statsLoading} />

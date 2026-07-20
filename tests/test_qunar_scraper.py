@@ -446,7 +446,7 @@ class TestParseApiResponses:
         assert fp.price == Decimal("680")
         assert fp.flight_info.flight_no == "MU5132"
         assert fp.flight_info.airline == "中国东方航空"
-        assert fp.source == "qunar_api"
+        assert fp.source == "qunar"
         assert fp.currency == "CNY"
 
     def test_extracts_multiple_flights(self, scraper: QunarScraper, params):

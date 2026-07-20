@@ -282,6 +282,14 @@ def _start_login_thread(platform: str) -> None:
 
     def _runner() -> None:
         try:
+            # 确保项目根目录在 sys.path 中，解决从 frontend/ 目录启动时找不到
+            # scripts 模块的问题。
+            import sys
+            from pathlib import Path as _Path
+            _root = str(_Path(__file__).resolve().parents[4])
+            if _root not in sys.path:
+                sys.path.insert(0, _root)
+
             if platform == "qunar":
                 from scripts.qunar_login import qr_login
             else:

@@ -136,7 +136,7 @@ export function ConfigTab({ routeId, route }: Props) {
             <input
               type="number"
               value={targetPrice}
-              onChange={(e) => setTargetPrice(e.target.value)}
+              onInput={(e) => setTargetPrice((e.target as HTMLInputElement).value)}
               className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-100"
             />
           </div>

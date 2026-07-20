@@ -37,7 +37,9 @@ export interface RouteResponse {
   is_active: boolean;
   monitoring_mode: string;
   outbound_flight_no: string | null;
+  inbound_flight_no: string | null;
   seat_class: string | null;
+  last_flight_status: string | null;
   latest_scraped_at: string | null;
   scrape_interval: number;
 }

@@ -4,7 +4,6 @@ import { NavLink, useLocation } from 'react-router-dom';
 const NAV_ITEMS = [
   { icon: '📊', label: '监控总览', path: '/' },
   { icon: '🛰️', label: '周末雷达', path: '/radar', accent: true },
-  { icon: '＋', label: '添加监控', path: '/add' },
   { icon: '📅', label: '价格日历', path: '/calendar' },
   { icon: '🔔', label: '提醒记录', path: '/alerts' },
   { icon: '📈', label: '数据分析', path: '/analytics' },
