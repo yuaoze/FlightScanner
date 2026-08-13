@@ -3,6 +3,7 @@ import { NavLink, useLocation } from 'react-router-dom';
 
 const NAV_ITEMS = [
   { icon: '📊', label: '监控总览', path: '/' },
+  { icon: '💰', label: '买入记录', path: '/purchases' },
   { icon: '🛰️', label: '周末雷达', path: '/radar', accent: true },
   { icon: '📅', label: '价格日历', path: '/calendar' },
   { icon: '🔔', label: '提醒记录', path: '/alerts' },
@@ -55,7 +56,7 @@ export function Sidebar() {
       </nav>
 
       <div className="px-5 py-4 border-t border-gray-50">
-        <p className="text-xs text-gray-300">v2.0.0</p>
+        <p className="text-xs text-gray-300">v2.2.0</p>
       </div>
     </aside>
   );

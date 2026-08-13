@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from flightscanner.api.routers import analytics, cookies, notifications, radar, routes, settings, stats
+from flightscanner.api.routers import analytics, cookies, notifications, purchases, radar, routes, settings, stats
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="FlightScanner API",
     description="Flight price monitoring dashboard API",
-    version="2.0.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -77,3 +77,4 @@ app.include_router(notifications.router, prefix="/api")
 app.include_router(analytics.router, prefix="/api")
 app.include_router(cookies.router, prefix="/api")
 app.include_router(radar.router, prefix="/api")
+app.include_router(purchases.router, prefix="/api")

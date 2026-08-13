@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 from flightscanner.interfaces import FlightDirection, FlightInfo, FlightPrice
 from flightscanner.scheduler.price_monitor import PriceMonitorScheduler
+from flightscanner.utils.config import settings
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -235,7 +236,10 @@ class TestCooldownActive:
         route = _make_route(last_notified_at=datetime.now(timezone.utc) - timedelta(hours=3))
         assert s._is_cooldown_active(route, Decimal("900"), "departure_approaching") is False
 
-    def test_below_avg_12h_cooldown(self):
+    def test_below_avg_12h_cooldown(self, monkeypatch):
+        # This test verifies the documented default, regardless of a local
+        # operator override loaded from .env.
+        monkeypatch.setattr(settings, "notify_cooldown_below_avg", 12)
         s = self._make_scheduler()
         route = _make_route(last_notified_at=datetime.now(timezone.utc) - timedelta(hours=10))
         assert s._is_cooldown_active(route, Decimal("900"), "below_avg") is True

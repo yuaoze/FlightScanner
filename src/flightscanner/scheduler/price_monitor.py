@@ -17,6 +17,7 @@ from typing import ClassVar, Dict, List, Optional, Set, Tuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy.orm import Session
 
 from flightscanner.models.database import PriceHistory, Route
 from flightscanner.core.services import RouteService
@@ -212,7 +213,6 @@ class PriceMonitorScheduler:
             # 用于标记这一次采集的所有记录，确保同一批次的数据被统一处理
             import hashlib
             from datetime import datetime
-            from decimal import Decimal
 
             batch_timestamp = datetime.now(timezone.utc).isoformat()
             # 计算哈希值：使用路由 ID、来源平台、采集时间戳
@@ -322,10 +322,27 @@ class PriceMonitorScheduler:
                             ai_brief=ai_brief,
                         )
                         message_json = self._build_alert_message_data(ctx)
-                        await self._send_alert(best_fp, trend, message_json, route_id=route.id, trigger_reason=reason)
-                        self._update_route_notification_state(route.id, best_fp.price, reason)
+                        sent = await self._send_alert(
+                            best_fp,
+                            trend,
+                            message_json,
+                            route_id=route.id,
+                            trigger_reason=reason,
+                        )
+                        if sent:
+                            self._update_route_notification_state(
+                                route.id, best_fp.price, reason
+                            )
+                        else:
+                            logger.warning(
+                                "路线 %s 通知全渠道失败，不进入冷却以便下次重试",
+                                route.id,
+                            )
                     else:
-                        self._update_route_notification_state(route.id, best_fp.price, reason)
+                        logger.warning(
+                            "路线 %s 命中通知条件但未配置通知渠道，不进入冷却",
+                            route.id,
+                        )
                 elif should_notify:
                     logger.info(
                         "路线 %s 冷却中（%s 级别），跳过通知",
@@ -334,6 +351,14 @@ class PriceMonitorScheduler:
 
                 # ── G1：记录预测（每路线每 12 小时最多一次）────────────────────
                 await self._maybe_log_prediction(session, route, history)
+
+                # ── 买入计划触发检查（价格达标或到期）─────────────────────
+                await self._check_buy_plans(
+                    session, route, best_fp, history, stats, price_count,
+                    days_until_departure=days_until_departure,
+                    recent_3d_low=recent_3d_low,
+                    consecutive_declining=consecutive_declining,
+                )
             finally:
                 session.close()
 
@@ -611,10 +636,39 @@ class PriceMonitorScheduler:
                         ai_brief=ai_brief,
                     )
                     message_json = self._build_alert_message_data(ctx)
-                    await self._send_alert(best_fp, trend, message_json)
-                    self._update_route_notification_state(route.id, best_fp.price, reason)
+                    sent = await self._send_alert(
+                        best_fp,
+                        trend,
+                        message_json,
+                        route_id=route.id,
+                        trigger_reason=reason,
+                    )
+                    if sent:
+                        self._update_route_notification_state(route.id, best_fp.price, reason)
+                    else:
+                        logger.warning(
+                            "路线 %s 通知全渠道失败，不进入冷却以便下次重试",
+                            route.id,
+                        )
                 else:
-                    self._update_route_notification_state(route.id, best_fp.price, reason)
+                    logger.warning(
+                        "路线 %s 命中通知条件但未配置通知渠道，不进入冷却",
+                        route.id,
+                    )
+
+            # 精准航班模式也必须推进买入计划状态机。此前这里只执行价格告警，
+            # 导致同一计划在 route 模式能触发、切换到 flight 模式后却永久 pending。
+            await self._check_buy_plans(
+                session,
+                route,
+                best_fp,
+                history,
+                stats,
+                price_count,
+                days_until_departure=days_until_departure,
+                recent_3d_low=recent_3d_low,
+                consecutive_declining=consecutive_declining,
+            )
         finally:
             session.close()
 
@@ -908,7 +962,7 @@ class PriceMonitorScheduler:
         message: str,
         route_id: Optional[int] = None,
         trigger_reason: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """并行调用所有通知渠道发送价格提醒。
 
         Args:
@@ -923,11 +977,15 @@ class PriceMonitorScheduler:
                 *[n.send_alert(flight_price, trend, message) for n in self.notifiers],
                 return_exceptions=True,
             )
+            any_success = False
             for notifier, result in zip(self.notifiers, results):
-                if isinstance(result, Exception):
+                failed = isinstance(result, Exception) or result is False
+                if failed:
                     logger.error(
                         "%s 推送失败：%s", type(notifier).__name__, result
                     )
+                else:
+                    any_success = True
                 # 写入通知日志
                 if route_id is not None:
                     self._log_notification(
@@ -935,14 +993,16 @@ class PriceMonitorScheduler:
                         price=float(flight_price.price),
                         trigger_reason=trigger_reason or "unknown",
                         channel=type(notifier).__name__.replace("Notifier", "").lower(),
-                        status="failed" if isinstance(result, Exception) else "success",
+                        status="failed" if failed else "success",
                     )
             logger.info(
                 "价格提醒已通过 %d 个渠道发送（航班 %s）",
                 len(self.notifiers), flight_price.flight_info.flight_no,
             )
+            return any_success
         except Exception as exc:
             logger.error("发送价格提醒时出错：%s", exc, exc_info=True)
+            return False
 
     def _log_notification(
         self,
@@ -955,8 +1015,7 @@ class PriceMonitorScheduler:
         """Write a notification event to the NotificationLog table."""
         try:
             from flightscanner.models.database import NotificationLog
-            _, SessionLocal = init_db()
-            session = SessionLocal()
+            session = self._SessionLocal()
             try:
                 log = NotificationLog(
                     route_id=route_id,
@@ -995,6 +1054,16 @@ class PriceMonitorScheduler:
             "max_30d": max(prices),
             "batch_count": float(len(batch_mins)),
         }
+
+    @staticmethod
+    def _latest_batch_records(history: List[FlightPrice]) -> List[FlightPrice]:
+        """Return only records belonging to the newest real scrape batch."""
+        if not history:
+            return []
+        newest = max(history, key=lambda fp: fp.scraped_at)
+        if newest.batch_id:
+            return [fp for fp in history if fp.batch_id == newest.batch_id]
+        return [fp for fp in history if fp.scraped_at == newest.scraped_at]
 
     @staticmethod
     def _should_notify(
@@ -1230,8 +1299,14 @@ class PriceMonitorScheduler:
             AI 简报 dict 或 None。
         """
         from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback_async
+        from flightscanner.core.services import build_experience_context
 
         try:
+            session = self._SessionLocal()
+            try:
+                experience_ctx = build_experience_context(session, route)
+            finally:
+                session.close()
             brief = await generate_brief_with_fallback_async(
                 price_history=price_history,
                 target_date=route.target_date,
@@ -1239,6 +1314,7 @@ class PriceMonitorScheduler:
                 api_key=settings.deepseek_api_key or None,
                 base_url=settings.deepseek_base_url,
                 model=settings.deepseek_model,
+                experience_context=experience_ctx,
             )
             return brief
         except Exception as exc:
@@ -1792,6 +1868,9 @@ class PriceMonitorScheduler:
                 return
 
             from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback_async
+            from flightscanner.core.services import build_experience_context
+
+            experience_ctx = build_experience_context(session, route)
             brief = await generate_brief_with_fallback_async(
                 price_history=price_history,
                 target_date=route.target_date,
@@ -1799,6 +1878,7 @@ class PriceMonitorScheduler:
                 api_key=settings.deepseek_api_key or None,
                 base_url=settings.deepseek_base_url,
                 model=settings.deepseek_model,
+                experience_context=experience_ctx,
             )
             current_price = float(min(fp.price for fp in price_history))
             days_until = (route.target_date - date.today()).days
@@ -1840,7 +1920,9 @@ class PriceMonitorScheduler:
 
                 from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback_async
                 from flightscanner.analyzers.evolution_engine import log_prediction
+                from flightscanner.core.services import build_experience_context
 
+                experience_ctx = build_experience_context(session, route)
                 brief = await generate_brief_with_fallback_async(
                     price_history=history,
                     target_date=route.target_date,
@@ -1848,6 +1930,7 @@ class PriceMonitorScheduler:
                     api_key=settings.deepseek_api_key or None,
                     base_url=settings.deepseek_base_url,
                     model=settings.deepseek_model,
+                    experience_context=experience_ctx,
                 )
                 current_price = float(min(fp.price for fp in history))
                 days_until = (route.target_date - date.today()).days
@@ -1864,8 +1947,188 @@ class PriceMonitorScheduler:
             with self._REPREDICT_LOCK:
                 self._REPREDICT_INFLIGHT.discard(route_id)
 
+    async def _check_buy_plans(
+        self,
+        session,
+        route: Route,
+        best_fp: FlightPrice,
+        history: List[FlightPrice],
+        stats: Dict[str, float],
+        price_count: int,
+        *,
+        days_until_departure: Optional[int] = None,
+        recent_3d_low: Optional[float] = None,
+        consecutive_declining: int = 0,
+    ) -> None:
+        """采集后检查买入计划触发，触发的计划推送通知提醒用户确认成交。
+
+        纯检查逻辑在 PurchaseService（可测试），本方法仅负责通知副作用。
+        """
+        from flightscanner.core.services import PurchaseService  # lazy import
+
+        try:
+            svc = PurchaseService(session)
+            triggered = svc.check_plans_for_route(route, float(best_fp.price))
+            if not triggered:
+                return
+
+            trend = self.analyzer.predict_trend(history, route.target_date)
+            for plan in triggered:
+                reason = (
+                    "buy_plan_price_hit"
+                    if plan.trigger_reason == "price_hit"
+                    else "buy_plan_deadline"
+                )
+                if plan.trigger_reason == "price_hit":
+                    recommendation = (
+                        f"买入计划触发：当前价 ¥{float(best_fp.price):.0f} "
+                        f"已达目标价 ¥{float(plan.plan_price):.0f}，请确认是否成交"
+                    )
+                else:
+                    recommendation = "买入计划已到最迟买入时间，请尽快决策"
+
+                if not self.notifiers or not history:
+                    # 触发已经可靠落库；没有可用通知渠道时保留 pending，后续
+                    # 配置渠道后由每日重试任务补发，而不是静默丢失提醒。
+                    plan.notification_status = "pending"
+                    plan.notification_error = "no notifier configured"
+                    session.commit()
+                    continue
+                ctx = self._build_notify_context(
+                    route, best_fp, stats, reason, price_count,
+                    days_until_departure=days_until_departure,
+                    recent_3d_low=recent_3d_low,
+                    consecutive_declining_batches=consecutive_declining,
+                    ai_brief=None,
+                )
+                ctx.recommendation = recommendation
+                ctx.urgency_level = "high"
+                message_json = self._build_alert_message_data(ctx)
+                success = await self._send_alert(
+                    best_fp, trend, message_json,
+                    route_id=route.id, trigger_reason=reason,
+                )
+                plan.notification_attempts = (plan.notification_attempts or 0) + 1
+                plan.last_notification_at = datetime.now(timezone.utc)
+                plan.notification_status = "sent" if success else "failed"
+                plan.notification_error = None if success else "all notification channels failed"
+                session.commit()
+                if success:
+                    logger.info(
+                        "买入计划 id=%d（路线 %s）触发通知已发送（%s）",
+                        plan.id, route.id, reason,
+                    )
+                else:
+                    logger.warning(
+                        "买入计划 id=%d（路线 %s）通知失败，已持久化等待重试",
+                        plan.id, route.id,
+                    )
+        except Exception as exc:
+            logger.error("路线 %s 买入计划检查失败：%s", route.id, exc, exc_info=True)
+
+    async def _retry_buy_plan_notifications(self) -> int:
+        """重试已触发但尚未成功通知的买入计划。
+
+        状态先由 ``PurchaseService`` 持久化为 triggered，本方法只负责可重试
+        的通知副作用。单渠道异常不会阻断其他计划，也不会把失败误标为成功。
+        """
+        from flightscanner.models.database import BuyPlan
+
+        if not self.notifiers:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        with self._SessionLocal() as session:
+            plans = (
+                session.query(BuyPlan)
+                .join(Route, BuyPlan.route_id == Route.id)
+                .filter(
+                    BuyPlan.status == "triggered",
+                    BuyPlan.notification_status != "sent",
+                    Route.deleted_at.is_(None),
+                    Route.target_date >= now.date(),
+                )
+                .order_by(BuyPlan.triggered_at.asc())
+                .all()
+            )
+            payloads = [
+                (plan.id, plan.route_id, plan.trigger_reason, plan.plan_price)
+                for plan in plans
+            ]
+
+        sent = 0
+        for plan_id, route_id, trigger_reason, plan_price in payloads:
+            try:
+                with self._SessionLocal() as session:
+                    plan = session.query(BuyPlan).filter(BuyPlan.id == plan_id).first()
+                    route = session.query(Route).filter(Route.id == route_id).first()
+                    if plan is None or route is None or plan.notification_status == "sent":
+                        continue
+
+                    history = RouteService(session).get_route_price_history(route_id, days=30)
+                    if not history:
+                        plan.notification_attempts = (plan.notification_attempts or 0) + 1
+                        plan.last_notification_at = now
+                        plan.notification_status = "failed"
+                        plan.notification_error = "no price history available"
+                        session.commit()
+                        continue
+
+                    latest_records = self._latest_batch_records(history)
+                    best_fp = min(latest_records, key=lambda fp: fp.price)
+                    stats = self._compute_price_stats(history)
+                    price_count = int(stats.get("batch_count", len(history)))
+                    reason = (
+                        "buy_plan_price_hit"
+                        if trigger_reason == "price_hit"
+                        else "buy_plan_deadline"
+                    )
+                    ctx = self._build_notify_context(
+                        route,
+                        best_fp,
+                        stats,
+                        reason,
+                        price_count,
+                        days_until_departure=(route.target_date - date.today()).days,
+                        recent_3d_low=self._compute_recent_3d_low(history),
+                        consecutive_declining_batches=self._compute_consecutive_declining_batches(
+                            history, lookback=settings.notify_trend_lookback_batches
+                        ),
+                        ai_brief=None,
+                    )
+                    if trigger_reason == "price_hit" and plan_price is not None:
+                        ctx.recommendation = (
+                            f"买入计划触发：当前价 ¥{float(best_fp.price):.0f} "
+                            f"已达目标价 ¥{float(plan_price):.0f}，请确认是否成交"
+                        )
+                    else:
+                        ctx.recommendation = "买入计划已到最迟买入时间，请尽快决策"
+                    ctx.urgency_level = "high"
+                    success = await self._send_alert(
+                        best_fp,
+                        self.analyzer.predict_trend(history, route.target_date),
+                        self._build_alert_message_data(ctx),
+                        route_id=route_id,
+                        trigger_reason=reason,
+                    )
+                    plan.notification_attempts = (plan.notification_attempts or 0) + 1
+                    plan.last_notification_at = datetime.now(timezone.utc)
+                    plan.notification_status = "sent" if success else "failed"
+                    plan.notification_error = (
+                        None if success else "all notification channels failed"
+                    )
+                    session.commit()
+                    if success:
+                        sent += 1
+            except Exception as exc:
+                logger.error(
+                    "[Purchase] 买入计划通知重试失败 plan_id=%d：%s",
+                    plan_id, exc, exc_info=True,
+                )
+        return sent
+
     async def _run_daily_evolution(self) -> None:
-        """G2 回测 + G3 RCA，每天 UTC 03:00 运行。"""
+        """G2 回测 + G3 RCA + 买入闭环日任务，每天 UTC 03:00 运行。"""
         from flightscanner.analyzers.evolution_engine import run_backtesting, run_rca
 
         logger.info("[Evolution] G2 回测开始")
@@ -1874,7 +2137,6 @@ class PriceMonitorScheduler:
             logger.info("[Evolution] G2 完成，处理 %d 条", n2)
         except Exception as exc:
             logger.error("[Evolution] G2 回测失败：%s", exc, exc_info=True)
-            return
 
         if settings.deepseek_api_key:
             logger.info("[Evolution] G3 RCA 开始")
@@ -1888,6 +2150,62 @@ class PriceMonitorScheduler:
                 logger.info("[Evolution] G3 完成，处理 %d 条", n3)
             except Exception as exc:
                 logger.error("[Evolution] G3 RCA 失败：%s", exc, exc_info=True)
+
+        # ── 买入闭环日任务：到期计划扫描 → 过期处理 → 起飞后自动买点分析 ──
+        await self._run_daily_purchase_tasks()
+
+    async def _run_daily_purchase_tasks(self) -> None:
+        """买入闭环每日任务：扫描到期计划、清理过期计划、起飞后自动生成买点分析。"""
+        from flightscanner.core.services import PurchaseService  # lazy import
+
+        # 1. 先过期，再扫描到期计划。否则已起飞路线会先被错误触发 deadline，
+        # 随后因状态不再 pending 而逃过 expire_stale_plans。
+        try:
+            with self._SessionLocal() as session:
+                svc = PurchaseService(session)
+                expired = svc.expire_stale_plans()
+                swept = svc.sweep_deadline_plans()
+                if swept or expired:
+                    logger.info(
+                        "[Purchase] 日任务：到期触发 %d 条，过期 %d 条",
+                        len(swept), expired,
+                    )
+        except Exception as exc:
+            logger.error("[Purchase] 计划扫描/过期处理失败：%s", exc, exc_info=True)
+
+        # 触发与投递分离：既处理本轮 sweep，也重试此前失败/无渠道的提醒。
+        try:
+            sent = await self._retry_buy_plan_notifications()
+            if sent:
+                logger.info("[Purchase] 买入计划通知补发成功 %d 条", sent)
+        except Exception as exc:
+            logger.error("[Purchase] 买入计划通知重试任务失败：%s", exc, exc_info=True)
+
+        # 2. 起飞后自动买点分析（筛选与执行分离，避免 session 嵌套协程）
+        try:
+            with self._SessionLocal() as session:
+                pending_ids = PurchaseService(session).auto_analyze_departed()
+
+            for purchase_id in pending_ids:
+                try:
+                    with self._SessionLocal() as session:
+                        await PurchaseService(session).generate_analysis(
+                            purchase_id,
+                            api_key=settings.deepseek_api_key,
+                            base_url=settings.deepseek_base_url,
+                            model=settings.deepseek_model,
+                            auto=True,
+                        )
+                        logger.info("[Purchase] 自动买点分析完成 purchase_id=%d", purchase_id)
+                except Exception as exc:
+                    logger.error(
+                        "[Purchase] 自动分析 purchase_id=%d 失败：%s",
+                        purchase_id, exc, exc_info=True,
+                    )
+            if pending_ids:
+                logger.info("[Purchase] 自动买点分析共处理 %d 条", len(pending_ids))
+        except Exception as exc:
+            logger.error("[Purchase] 自动买点分析任务失败：%s", exc, exc_info=True)
 
     async def _run_weekend_radar_batch(self) -> None:
         """周末低价雷达批处理任务（每周二/三凌晨执行）。

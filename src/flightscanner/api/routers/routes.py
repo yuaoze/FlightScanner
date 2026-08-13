@@ -27,7 +27,6 @@ from flightscanner.api.schemas import (
 from flightscanner.analyzers.rule_based_analyzer import RuleBasedAnalyzer
 from flightscanner.api.route_filter import filter_history_by_route
 from flightscanner.api.status_resolver import (
-    STATUS_MAP,
     STATUS_PRIORITY,
     is_ai_prediction_stale,
     resolve_status,
@@ -39,6 +38,33 @@ from flightscanner.models.database import AIPredictionLog, Flight, PriceHistory,
 
 router = APIRouter()
 _analyzer = RuleBasedAnalyzer()
+
+
+def _latest_comparable_records(price_history: List[FlightPrice]) -> List[FlightPrice]:
+    """Return records from the newest scrape batch in an already-filtered history.
+
+    ``price_history`` contains many flights per scrape.  Taking the minimum of
+    the first N rows mixes the newest quote with older batches and can surface a
+    stale bargain as the current price.  Keep the fallback for legacy rows that
+    predate ``batch_id`` while still restricting it to the newest timestamp.
+    """
+    if not price_history:
+        return []
+    newest = max(price_history, key=lambda fp: fp.scraped_at)
+    if newest.batch_id:
+        return [fp for fp in price_history if fp.batch_id == newest.batch_id]
+    return [fp for fp in price_history if fp.scraped_at == newest.scraped_at]
+
+
+def _batch_min_values(price_history: List[FlightPrice]) -> List[float]:
+    """Collapse raw quote rows to one comparable minimum per scrape batch."""
+    batches: dict[str, float] = {}
+    for fp in price_history:
+        key = fp.batch_id or fp.scraped_at.isoformat()
+        price = float(fp.price)
+        if key not in batches or price < batches[key]:
+            batches[key] = price
+    return list(batches.values())
 
 
 def _compute_sparkline(
@@ -77,14 +103,10 @@ def _get_latest_flight_info(
     price_history: List[FlightPrice],
 ) -> Optional[FlightBriefInfo]:
     """Get flight info from the cheapest record in the latest batch."""
-    if not price_history:
+    latest_records = _latest_comparable_records(price_history)
+    if not latest_records:
         return None
-    latest_batch_id = price_history[0].batch_id
-    if not latest_batch_id:
-        latest = price_history[0]
-    else:
-        batch_records = [fp for fp in price_history if fp.batch_id == latest_batch_id]
-        latest = min(batch_records, key=lambda fp: fp.price)
+    latest = min(latest_records, key=lambda fp: fp.price)
     fi = latest.flight_info
     return FlightBriefInfo(
         flight_no=fi.flight_no,
@@ -129,7 +151,7 @@ def get_routes(
 
         price_vs_avg_pct: Optional[float] = None
         if price_history and route.latest_price is not None:
-            prices = [float(fp.price) for fp in price_history]
+            prices = _batch_min_values(price_history)
             avg_price = sum(prices) / len(prices)
             if avg_price > 0:
                 price_vs_avg_pct = round(
@@ -351,12 +373,13 @@ def get_route_history(
 ) -> PriceHistoryResponse:
     """Get detailed price history for a specific route."""
     service = RouteService(db)
+    route = service.get_route_by_id(route_id)
+    if route is None:
+        raise HTTPException(status_code=404, detail="Route not found")
     history = service.get_route_price_history(route_id, days=days)
     # Filter by the route's currently configured time windows so the trend
     # chart and aggregate stats stay consistent with the active constraints.
-    route = db.query(Route).filter(Route.id == route_id).first()
-    if route is not None:
-        history = filter_history_by_route(route, history)
+    history = filter_history_by_route(route, history)
 
     points = [
         PriceHistoryPoint(
@@ -389,14 +412,17 @@ def get_route_detail(
     price_history = filter_history_by_route(route, price_history)
     trend = _analyzer.predict_trend(price_history, route.target_date)
 
-    # Compute latest_price from history
+    # Compute the current price from the newest batch only.  Older versions used
+    # ``min(price_history[:20])``, which could prefill a purchase with a stale
+    # low from a previous scrape whenever the newest batch contained <20 rows.
     latest_price: Optional[float] = None
-    if price_history:
-        latest_price = float(min(fp.price for fp in price_history[:20]))
+    latest_records = _latest_comparable_records(price_history)
+    if latest_records:
+        latest_price = float(min(fp.price for fp in latest_records))
 
     price_vs_avg_pct: Optional[float] = None
     if price_history and latest_price is not None:
-        prices = [float(fp.price) for fp in price_history]
+        prices = _batch_min_values(price_history)
         avg_price = sum(prices) / len(prices)
         if avg_price > 0:
             price_vs_avg_pct = round(
@@ -479,7 +505,11 @@ def update_route(
     string "" to clear the field, "HH:MM" to set a value, or omit it entirely
     to leave it unchanged.
     """
-    route = db.query(Route).filter(Route.id == route_id).first()
+    route = (
+        db.query(Route)
+        .filter(Route.id == route_id, Route.deleted_at.is_(None))
+        .first()
+    )
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
 
@@ -571,6 +601,9 @@ def get_route_predictions(
     """Get AI prediction history for a specific route."""
     from sqlalchemy import func
 
+    if RouteService(db).get_route_by_id(route_id) is None:
+        raise HTTPException(status_code=404, detail="Route not found")
+
     rows = (
         db.query(AIPredictionLog)
         .filter(AIPredictionLog.route_id == route_id)
@@ -636,6 +669,9 @@ def get_route_batches(
     """List recent scrape batches for a route."""
     from sqlalchemy import func
 
+    if RouteService(db).get_route_by_id(route_id) is None:
+        raise HTTPException(status_code=404, detail="Route not found")
+
     rows = (
         db.query(
             PriceHistory.batch_id,
@@ -679,6 +715,9 @@ def get_route_flights(
     from sqlalchemy.orm import aliased
 
     ReturnFlight = aliased(Flight, name="return_flight")
+    route = RouteService(db).get_route_by_id(route_id)
+    if route is None:
+        raise HTTPException(status_code=404, detail="Route not found")
 
     # Resolve batch_id: if not given, pick the latest for this route
     if not batch_id:
@@ -716,7 +755,6 @@ def get_route_flights(
     # scrape time, so existing batches reflect the user's current settings.
     from flightscanner.api.route_filter import _hhmm_to_minutes, _in_window
 
-    route = db.query(Route).filter(Route.id == route_id).first()
     if route is not None:
         dep_airport = route.dep_airport_code
         arr_airport = route.arr_airport_code

@@ -6,13 +6,20 @@ This module provides business logic for route management operations.
 from dataclasses import dataclass
 from datetime import datetime, date, timezone
 from decimal import Decimal
-from typing import Optional, List
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, and_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
-from flightscanner.models.database import Route, PriceHistory, Flight, AIPredictionLog
-from flightscanner.interfaces import FlightPrice
+from flightscanner.models.database import (
+    AIPredictionLog,
+    BuyPlan,
+    Flight,
+    PriceHistory,
+    PurchaseRecord,
+    Route,
+)
+from flightscanner.interfaces import FlightInfo, FlightPrice
 from flightscanner.utils.city_codes import is_international_route
 
 
@@ -153,6 +160,7 @@ class RouteService:
                 Route.origin == origin,
                 Route.destination == destination,
                 Route.target_date == target_date,
+                Route.deleted_at.is_(None),
             )
         ).first()
 
@@ -207,69 +215,74 @@ class RouteService:
             List of RouteWithLatestPrice objects containing route data
             and aggregated price information.
         """
-        # Subquery 1: per-route latest scraped_at (for display)
+        # Pick the newest *row* by its real collection time, then use its
+        # batch_id to recover the complete scrape batch.  Do this as indexed
+        # GROUP BY stages instead of a self anti-join: the latter becomes
+        # quadratic on a real history table and made /api/routes time out once
+        # tens of thousands of quotes had accumulated.
         latest_time_subq = (
             self.session.query(
-                PriceHistory.route_id,
-                func.max(PriceHistory.scraped_at).label("latest_scraped_at"),
+                PriceHistory.route_id.label("route_id"),
+                func.max(PriceHistory.scraped_at).label("scraped_at"),
             )
             .filter(PriceHistory.route_id.isnot(None))
             .group_by(PriceHistory.route_id)
             .subquery()
         )
-
-        # Subquery 2: latest batch_id per (route_id, source) pair
-        # Uses batch_id to group all records from a single scrape session,
-        # avoiding the issue where multiple records at the same second would
-        # have the same scraped_at timestamp but different prices
-        latest_batch_per_source_subq = (
+        newest_id_subq = (
             self.session.query(
-                PriceHistory.route_id,
-                PriceHistory.source,
-                func.max(PriceHistory.batch_id).label("latest_batch_id"),
-            )
-            .filter(
-                and_(
-                    PriceHistory.route_id.isnot(None),
-                    PriceHistory.batch_id.isnot(None),
-                )
-            )
-            .group_by(PriceHistory.route_id, PriceHistory.source)
-            .subquery()
-        )
-
-        # Subquery 3: minimum price per source within their latest batch
-        # This ensures we get the minimum price from all records in the latest
-        # collection session for each platform, not just records at exact same timestamp
-        min_price_per_source_subq = (
-            self.session.query(
-                PriceHistory.route_id,
-                func.min(PriceHistory.price).label("source_min_price"),
-            )
-            .join(
-                latest_batch_per_source_subq,
-                and_(
-                    PriceHistory.route_id == latest_batch_per_source_subq.c.route_id,
-                    PriceHistory.source == latest_batch_per_source_subq.c.source,
-                    PriceHistory.batch_id == latest_batch_per_source_subq.c.latest_batch_id,
-                ),
-            )
-            .group_by(PriceHistory.route_id, PriceHistory.source)
-            .subquery()
-        )
-
-        # Subquery 4: overall minimum across all sources (各平台最新采集的最低价的最小值)
-        latest_price_subq = (
-            self.session.query(
-                min_price_per_source_subq.c.route_id,
-                func.min(min_price_per_source_subq.c.source_min_price).label("latest_price"),
-                latest_time_subq.c.latest_scraped_at,
+                PriceHistory.route_id.label("route_id"),
+                func.max(PriceHistory.id).label("price_history_id"),
             )
             .join(
                 latest_time_subq,
-                min_price_per_source_subq.c.route_id == latest_time_subq.c.route_id,
+                and_(
+                    PriceHistory.route_id == latest_time_subq.c.route_id,
+                    PriceHistory.scraped_at == latest_time_subq.c.scraped_at,
+                ),
             )
-            .group_by(min_price_per_source_subq.c.route_id)
+            .group_by(PriceHistory.route_id)
+            .subquery()
+        )
+        newest_row_subq = (
+            self.session.query(
+                PriceHistory.route_id.label("route_id"),
+                PriceHistory.batch_id.label("batch_id"),
+                PriceHistory.scraped_at.label("scraped_at"),
+            )
+            .join(
+                newest_id_subq,
+                PriceHistory.id == newest_id_subq.c.price_history_id,
+            )
+            .subquery()
+        )
+
+        # Minimum comparable fare in that latest batch.  Legacy rows without
+        # batch_id fall back to all quotes carrying the newest timestamp.
+        latest_price_subq = (
+            self.session.query(
+                PriceHistory.route_id,
+                func.min(PriceHistory.price).label("latest_price"),
+                newest_row_subq.c.scraped_at.label("latest_scraped_at"),
+            )
+            .join(
+                newest_row_subq,
+                and_(
+                    PriceHistory.route_id == newest_row_subq.c.route_id,
+                    or_(
+                        and_(
+                            newest_row_subq.c.batch_id.isnot(None),
+                            PriceHistory.batch_id == newest_row_subq.c.batch_id,
+                        ),
+                        and_(
+                            newest_row_subq.c.batch_id.is_(None),
+                            PriceHistory.batch_id.is_(None),
+                            PriceHistory.scraped_at == newest_row_subq.c.scraped_at,
+                        ),
+                    ),
+                ),
+            )
+            .group_by(PriceHistory.route_id, newest_row_subq.c.scraped_at)
             .subquery()
         )
 
@@ -330,6 +343,7 @@ class RouteService:
                 price_count_subq,
                 Route.id == price_count_subq.c.route_id,
             )
+            .filter(Route.deleted_at.is_(None))
             .order_by(Route.created_at.desc())
             .all()
         )
@@ -400,6 +414,7 @@ class RouteService:
                 and_(
                     Route.is_active == 1,
                     Route.target_date >= today,
+                    Route.deleted_at.is_(None),
                 )
             )
             .order_by(Route.target_date)
@@ -417,7 +432,11 @@ class RouteService:
         Returns:
             Route object if found, None otherwise.
         """
-        return self.session.query(Route).filter(Route.id == route_id).first()
+        return (
+            self.session.query(Route)
+            .filter(Route.id == route_id, Route.deleted_at.is_(None))
+            .first()
+        )
 
     def delete_route(self, route_id: int) -> bool:
         """Delete a route by its ID.
@@ -428,12 +447,48 @@ class RouteService:
         Returns:
             True if route was deleted, False if not found.
         """
-        route = self.session.query(Route).filter(Route.id == route_id).first()
+        route = (
+            self.session.query(Route)
+            .filter(Route.id == route_id, Route.deleted_at.is_(None))
+            .first()
+        )
 
         if not route:
             return False
 
-        self.session.delete(route)
+        # 购买计划和买入记录属于长期账本，不能随着监控路线一起级联删除。
+        # 对有关联账本的路线做软删除：停止调度并从路线列表隐藏，但保留 Route
+        # 作为历史记录的外键目标，旧分析仍能继续读取完整路线信息。
+        has_ledger = (
+            self.session.query(BuyPlan.id)
+            .filter(BuyPlan.route_id == route_id)
+            .first()
+            is not None
+            or self.session.query(PurchaseRecord.id)
+            .filter(PurchaseRecord.route_id == route_id)
+            .first()
+            is not None
+            or self.session.query(AIPredictionLog.id)
+            .filter(AIPredictionLog.route_id == route_id)
+            .first()
+            is not None
+        )
+        if has_ledger:
+            route.is_active = 0
+            route.deleted_at = datetime.now(timezone.utc)
+            # A deleted monitor can no longer satisfy or notify an active buy
+            # plan.  Keep the rows for audit, but close their state machine so
+            # the purchases page does not show plans that can never progress.
+            (
+                self.session.query(BuyPlan)
+                .filter(
+                    BuyPlan.route_id == route_id,
+                    BuyPlan.status.in_(["pending", "triggered"]),
+                )
+                .update({BuyPlan.status: "cancelled"}, synchronize_session=False)
+            )
+        else:
+            self.session.delete(route)
         self.session.commit()
 
         return True
@@ -447,7 +502,11 @@ class RouteService:
         Returns:
             Updated Route object if found, None otherwise.
         """
-        route = self.session.query(Route).filter(Route.id == route_id).first()
+        route = (
+            self.session.query(Route)
+            .filter(Route.id == route_id, Route.deleted_at.is_(None))
+            .first()
+        )
 
         if not route:
             return None
@@ -468,7 +527,11 @@ class RouteService:
         Returns:
             Updated Route object if found, None otherwise.
         """
-        route = self.session.query(Route).filter(Route.id == route_id).first()
+        route = (
+            self.session.query(Route)
+            .filter(Route.id == route_id, Route.deleted_at.is_(None))
+            .first()
+        )
 
         if not route:
             return None
@@ -581,8 +644,6 @@ class RouteService:
         Returns:
             对应的 Flight ORM 对象（已 flush 到 session）。
         """
-        from flightscanner.interfaces import FlightInfo  # 避免循环导入
-
         flight = (
             self.session.query(Flight)
             .filter(

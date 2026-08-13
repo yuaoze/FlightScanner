@@ -232,7 +232,11 @@ def get_route_calendar(
     else:
         end_date = date(year, mon + 1, 1)
 
-    route = db.query(Route).filter(Route.id == route_id).first()
+    route = (
+        db.query(Route)
+        .filter(Route.id == route_id, Route.deleted_at.is_(None))
+        .first()
+    )
     if not route:
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Route not found")

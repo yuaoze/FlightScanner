@@ -155,3 +155,91 @@ export interface RouteFlightsResponse {
   scraped_at: string | null;
   flights: FlightListItem[];
 }
+
+// ── Purchase tracking types（v2.2.0 买入闭环）──────────────────────────────
+
+export type PlanStatus = 'pending' | 'triggered' | 'converted' | 'cancelled' | 'expired';
+export type PurchaseStatus = 'holding' | 'completed';
+export type BuyVerdict = 'excellent' | 'good' | 'fair' | 'poor';
+export type BuyPointAnalysisStatus = 'provisional' | 'final' | 'insufficient';
+
+export interface BuyPointAiAnalysis {
+  verdict_comment?: string;
+  timing_assessment?: string;
+  key_lessons?: string[];
+}
+
+export interface BuyPointAnalysis {
+  post_min_price: number | null;
+  post_max_price: number | null;
+  final_price: number | null;
+  regret_cost: number | null;
+  savings_vs_final: number | null;
+  verdict: BuyVerdict | null;
+  ai_analysis: BuyPointAiAnalysis | null;
+  llm_source: string;
+  auto_generated: boolean;
+  pre_departure: boolean;
+  analysis_status: BuyPointAnalysisStatus;
+  sample_size: number;
+  coverage_hours: number | null;
+  data_quality: string | null;
+  analyzed_at: string | null;
+}
+
+export interface PurchaseRecordItem {
+  id: number;
+  route_id: number;
+  route_label: string;
+  target_date: string | null;
+  flight_no: string | null;
+  airline: string | null;
+  purchase_price: number;
+  total_paid: number | null;
+  currency: string;
+  seat_class: string | null;
+  passengers: number;
+  purchased_at: string | null;
+  purchase_type: 'instant' | 'planned';
+  notes: string | null;
+  status: PurchaseStatus;
+  current_price: number | null;
+  change_pct: number | null;
+  analysis: BuyPointAnalysis | null;
+  created_at: string | null;
+}
+
+export interface PurchaseSeriesPoint {
+  time: string;
+  price: number;
+}
+
+export interface PurchaseDetail extends PurchaseRecordItem {
+  price_series: PurchaseSeriesPoint[];
+}
+
+export interface BuyPlan {
+  id: number;
+  route_id: number;
+  route_label: string;
+  plan_price: number | null;
+  plan_execute_by: string | null;
+  status: PlanStatus;
+  triggered_at: string | null;
+  trigger_price: number | null;
+  currency?: string;
+  trigger_reason: 'price_hit' | 'deadline' | null;
+  created_at: string | null;
+}
+
+export interface ExperienceEntry {
+  id: number;
+  route_pattern: string;
+  category: string;
+  title: string;
+  content: string;
+  evidence_count: number;
+  status: 'active' | 'archived';
+  created_at: string | null;
+  updated_at: string | null;
+}

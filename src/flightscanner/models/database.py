@@ -4,11 +4,12 @@ This module defines the core database tables for storing flight information
 and price history.
 """
 
-from datetime import datetime, date, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
     create_engine,
+    event,
     text,
     Column,
     Integer,
@@ -20,6 +21,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     UniqueConstraint,
+    inspect,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import backref, relationship, sessionmaker
@@ -132,6 +134,8 @@ class Route(Base):
     is_active = Column(Integer, default=1, nullable=False)  # 1=active, 0=inactive
     created_at = Column(DateTime, default=utcnow, nullable=False)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+    # 软删除时间。有买入计划/记录的路线不能物理删除，否则会破坏长期复盘账本。
+    deleted_at = Column(DateTime, nullable=True, index=True)
 
     # 往返程 + 国际标记（通过迁移添加）
     return_date = Column(Date, nullable=True)                              # 回程日期，单程=None
@@ -325,6 +329,209 @@ class AIPredictionLog(Base):
         )
 
 
+class BuyPlan(Base):
+    """买入计划表：用户设定的目标买入价和/或最迟买入时间。
+
+    状态机：pending → triggered（价格达标或到期）→ converted（确认成交）
+    也可转为 cancelled（手动取消）或 expired（过期未触发）。
+    """
+
+    __tablename__ = "buy_plans"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    route_id = Column(Integer, ForeignKey("routes.id"), nullable=False, index=True)
+    plan_price = Column(Numeric(10, 2), nullable=True)          # 目标买入价，NULL=仅按时间触发
+    plan_execute_by = Column(DateTime, nullable=True)           # 最迟买入时间，NULL=仅按价格触发
+    status = Column(String(20), nullable=False, default="pending")
+    # pending | triggered | converted | cancelled | expired
+    triggered_at = Column(DateTime, nullable=True)
+    trigger_price = Column(Numeric(10, 2), nullable=True)       # 触发时监控到的价格
+    trigger_reason = Column(String(30), nullable=True)          # "price_hit" | "deadline"
+    # 通知投递状态。触发和通知分开持久化，失败后由每日任务重试。
+    notification_status = Column(String(20), nullable=False, default="pending")
+    # pending | sent | failed
+    notification_attempts = Column(Integer, nullable=False, default=0)
+    last_notification_at = Column(DateTime, nullable=True)
+    notification_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    route = relationship(
+        "Route",
+        backref=backref("buy_plans", passive_deletes=True),
+    )
+
+    __table_args__ = (
+        Index("ix_buyplan_status", "status"),
+        Index("ix_buyplan_route_status", "route_id", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BuyPlan(id={self.id}, route_id={self.route_id}, "
+            f"plan_price={self.plan_price}, status='{self.status}')>"
+        )
+
+
+class PurchaseRecord(Base):
+    """买入记录表：用户记录的一次实际成交。"""
+
+    __tablename__ = "purchase_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    route_id = Column(Integer, ForeignKey("routes.id"), nullable=False, index=True)
+    plan_id = Column(Integer, ForeignKey("buy_plans.id"), nullable=True)
+    flight_id = Column(Integer, ForeignKey("flights.id"), nullable=True)
+    # purchase_price 始终为单人、同币种的可比票价；total_paid 为订单实付总额。
+    purchase_price = Column(Numeric(10, 2), nullable=False)
+    total_paid = Column(Numeric(12, 2), nullable=True)
+    currency = Column(String(10), nullable=False, default="CNY")
+    seat_class = Column(String(50), nullable=True)
+    passengers = Column(Integer, nullable=False, default=1)
+    # 成交时对应的报价快照，避免后续无法确认比较口径。
+    quote_price = Column(Numeric(10, 2), nullable=True)
+    quote_source = Column(String(50), nullable=True)
+    quote_batch_id = Column(String(100), nullable=True)
+    # 路线不可变快照：即使监控路线软删除/修改，购买账本仍可独立展示和复盘。
+    route_origin = Column(String(50), nullable=True)
+    route_destination = Column(String(50), nullable=True)
+    route_target_date = Column(Date, nullable=True)
+    route_return_date = Column(Date, nullable=True)
+    route_trip_type = Column(String(20), nullable=True)
+    purchased_at = Column(DateTime, default=utcnow, nullable=False)
+    purchase_type = Column(String(20), nullable=False, default="instant")  # instant | planned
+    notes = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="holding")  # holding | completed
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    route = relationship(
+        "Route",
+        backref=backref("purchase_records", passive_deletes=True),
+    )
+    plan = relationship("BuyPlan")
+    flight = relationship("Flight")
+
+    __table_args__ = (
+        # 一个计划最多转换为一笔买入；NULL 仍允许多笔即时买入。
+        Index("ux_purchase_plan_id", "plan_id", unique=True),
+        Index("ix_purchase_status", "status"),
+        Index("ix_purchase_route_time", "route_id", "purchased_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PurchaseRecord(id={self.id}, route_id={self.route_id}, "
+            f"price={self.purchase_price}, status='{self.status}')>"
+        )
+
+
+class BuyPointAnalysis(Base):
+    """买点分析表：与买入记录 1:1，起飞后自动或手动生成。"""
+
+    __tablename__ = "buy_point_analyses"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    purchase_id = Column(
+        Integer, ForeignKey("purchase_records.id"), nullable=False, unique=True, index=True
+    )
+    # 窗口统计（purchased_at → 起飞日）
+    post_min_price = Column(Numeric(10, 2), nullable=True)      # 买后最低价
+    post_max_price = Column(Numeric(10, 2), nullable=True)      # 买后最高价
+    final_price = Column(Numeric(10, 2), nullable=True)         # 起飞前最后采集价
+    regret_cost = Column(Numeric(10, 2), nullable=True)         # 多付金额（相对买后最低）
+    savings_vs_final = Column(Numeric(10, 2), nullable=True)    # 相对最终价节省
+    verdict = Column(String(20), nullable=True)                 # excellent | good | fair | poor
+    ai_analysis = Column(Text, nullable=True)                   # LLM 分析文本（JSON）
+    llm_source = Column(String(20), nullable=False, default="rule_based")
+    auto_generated = Column(Integer, nullable=False, default=0)  # 1=自动生成 0=手动
+    pre_departure = Column(Integer, nullable=False, default=0)   # 1=分析时航班未起飞
+    sample_size = Column(Integer, nullable=False, default=0)     # 可比较采集批次数
+    coverage_hours = Column(Numeric(10, 2), nullable=True)       # 首末有效样本覆盖时长
+    data_quality = Column(String(20), nullable=True)             # good | limited | insufficient
+    analysis_status = Column(String(20), nullable=False, default="provisional")
+    # provisional | final | insufficient
+    analyzed_at = Column(DateTime, default=utcnow, nullable=False)
+
+    purchase = relationship(
+        "PurchaseRecord",
+        backref=backref("analysis", uselist=False, cascade="all, delete-orphan"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BuyPointAnalysis(id={self.id}, purchase_id={self.purchase_id}, "
+            f"verdict='{self.verdict}')>"
+        )
+
+
+class ExperienceEntry(Base):
+    """经验库：从买点分析沉淀的可复用经验，注入后续 AI 决策。"""
+
+    __tablename__ = "experience_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    analysis_id = Column(Integer, ForeignKey("buy_point_analyses.id"), nullable=True)
+    route_pattern = Column(String(120), nullable=False, default="通用")
+    category = Column(String(20), nullable=False, default="general")  # timing|route|holiday|general
+    title = Column(String(200), nullable=False)
+    content = Column(Text, nullable=False)
+    evidence_count = Column(Integer, nullable=False, default=1)
+    status = Column(String(20), nullable=False, default="active")  # active | archived
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, nullable=False)
+
+    analysis = relationship("BuyPointAnalysis")
+
+    __table_args__ = (
+        Index("ix_experience_status", "status"),
+        Index("ix_experience_pattern", "route_pattern", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ExperienceEntry(id={self.id}, pattern='{self.route_pattern}', "
+            f"title='{self.title}')>"
+        )
+
+
+class ExperienceEvidence(Base):
+    """经验与独立买入案例的证据关联。
+
+    同一笔购买反复分析只会对应同一条证据，避免把重新生成分析误计为
+    多个独立案例。``evidence_count`` 可由该表的去重行数重算。
+    """
+
+    __tablename__ = "experience_evidence"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    experience_id = Column(
+        Integer,
+        ForeignKey("experience_entries.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    purchase_id = Column(
+        Integer,
+        ForeignKey("purchase_records.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(DateTime, default=utcnow, nullable=False)
+
+    experience = relationship(
+        "ExperienceEntry",
+        backref=backref("evidence", cascade="all, delete-orphan"),
+    )
+    purchase = relationship("PurchaseRecord")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "experience_id",
+            "purchase_id",
+            name="uq_experience_evidence_purchase",
+        ),
+    )
+
+
 class WeekendRadarCache(Base):
     """周末低价雷达缓存表。
 
@@ -442,6 +649,8 @@ def _apply_migrations(engine) -> None:
         "ALTER TABLE routes ADD COLUMN last_notified_at DATETIME",
         "ALTER TABLE routes ADD COLUMN last_notified_price NUMERIC",
         "ALTER TABLE routes ADD COLUMN notify_threshold_pct NUMERIC",
+        "ALTER TABLE routes ADD COLUMN deleted_at DATETIME",
+        "CREATE INDEX IF NOT EXISTS ix_routes_deleted_at ON routes(deleted_at)",
         # batch_id：用于标记同一次采集会话的所有记录（解决同秒多条记录取最低价错误问题）
         "ALTER TABLE price_history ADD COLUMN batch_id TEXT",
         # arrival_date：实际到达日期（跨日/多日航班的到达日期，可为 NULL）
@@ -508,14 +717,227 @@ def _apply_migrations(engine) -> None:
         "ALTER TABLE routes ADD COLUMN recent_3d_low NUMERIC",
         "ALTER TABLE routes ADD COLUMN recent_3d_low_at DATETIME",
         "ALTER TABLE routes ADD COLUMN last_notified_reason TEXT",
+        # v2.2.0 买入闭环四表（使用 CREATE TABLE IF NOT EXISTS，已有表静默跳过）
+        (
+            "CREATE TABLE IF NOT EXISTS buy_plans ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "route_id INTEGER NOT NULL REFERENCES routes(id), "
+            "plan_price NUMERIC, "
+            "plan_execute_by DATETIME, "
+            "status TEXT NOT NULL DEFAULT 'pending', "
+            "triggered_at DATETIME, "
+            "trigger_price NUMERIC, "
+            "trigger_reason TEXT, "
+            "notification_status TEXT NOT NULL DEFAULT 'pending', "
+            "notification_attempts INTEGER NOT NULL DEFAULT 0, "
+            "last_notification_at DATETIME, "
+            "notification_error TEXT, "
+            "created_at DATETIME NOT NULL)"
+        ),
+        "ALTER TABLE buy_plans ADD COLUMN notification_status TEXT NOT NULL DEFAULT 'pending'",
+        "ALTER TABLE buy_plans ADD COLUMN notification_attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE buy_plans ADD COLUMN last_notification_at DATETIME",
+        "ALTER TABLE buy_plans ADD COLUMN notification_error TEXT",
+        (
+            "CREATE TABLE IF NOT EXISTS purchase_records ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "route_id INTEGER NOT NULL REFERENCES routes(id), "
+            "plan_id INTEGER UNIQUE REFERENCES buy_plans(id), "
+            "flight_id INTEGER REFERENCES flights(id), "
+            "purchase_price NUMERIC NOT NULL, "
+            "total_paid NUMERIC, "
+            "currency TEXT NOT NULL DEFAULT 'CNY', "
+            "seat_class TEXT, "
+            "passengers INTEGER NOT NULL DEFAULT 1, "
+            "quote_price NUMERIC, "
+            "quote_source TEXT, "
+            "quote_batch_id TEXT, "
+            "route_origin TEXT, "
+            "route_destination TEXT, "
+            "route_target_date DATE, "
+            "route_return_date DATE, "
+            "route_trip_type TEXT, "
+            "purchased_at DATETIME NOT NULL, "
+            "purchase_type TEXT NOT NULL DEFAULT 'instant', "
+            "notes TEXT, "
+            "status TEXT NOT NULL DEFAULT 'holding', "
+            "created_at DATETIME NOT NULL)"
+        ),
+        "ALTER TABLE purchase_records ADD COLUMN total_paid NUMERIC",
+        "ALTER TABLE purchase_records ADD COLUMN quote_price NUMERIC",
+        "ALTER TABLE purchase_records ADD COLUMN quote_source TEXT",
+        "ALTER TABLE purchase_records ADD COLUMN quote_batch_id TEXT",
+        "ALTER TABLE purchase_records ADD COLUMN route_origin TEXT",
+        "ALTER TABLE purchase_records ADD COLUMN route_destination TEXT",
+        "ALTER TABLE purchase_records ADD COLUMN route_target_date DATE",
+        "ALTER TABLE purchase_records ADD COLUMN route_return_date DATE",
+        "ALTER TABLE purchase_records ADD COLUMN route_trip_type TEXT",
+        (
+            "CREATE TABLE IF NOT EXISTS buy_point_analyses ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "purchase_id INTEGER NOT NULL UNIQUE REFERENCES purchase_records(id), "
+            "post_min_price NUMERIC, "
+            "post_max_price NUMERIC, "
+            "final_price NUMERIC, "
+            "regret_cost NUMERIC, "
+            "savings_vs_final NUMERIC, "
+            "verdict TEXT, "
+            "ai_analysis TEXT, "
+            "llm_source TEXT NOT NULL DEFAULT 'rule_based', "
+            "auto_generated INTEGER NOT NULL DEFAULT 0, "
+            "pre_departure INTEGER NOT NULL DEFAULT 0, "
+            "sample_size INTEGER NOT NULL DEFAULT 0, "
+            "coverage_hours NUMERIC, "
+            "data_quality TEXT, "
+            "analysis_status TEXT NOT NULL DEFAULT 'provisional', "
+            "analyzed_at DATETIME NOT NULL)"
+        ),
+        "ALTER TABLE buy_point_analyses ADD COLUMN sample_size INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE buy_point_analyses ADD COLUMN coverage_hours NUMERIC",
+        "ALTER TABLE buy_point_analyses ADD COLUMN data_quality TEXT",
+        "ALTER TABLE buy_point_analyses ADD COLUMN analysis_status TEXT NOT NULL DEFAULT 'provisional'",
+        (
+            "CREATE TABLE IF NOT EXISTS experience_entries ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "analysis_id INTEGER REFERENCES buy_point_analyses(id), "
+            "route_pattern TEXT NOT NULL DEFAULT '通用', "
+            "category TEXT NOT NULL DEFAULT 'general', "
+            "title TEXT NOT NULL, "
+            "content TEXT NOT NULL, "
+            "evidence_count INTEGER NOT NULL DEFAULT 1, "
+            "status TEXT NOT NULL DEFAULT 'active', "
+            "created_at DATETIME NOT NULL, "
+            "updated_at DATETIME NOT NULL)"
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS experience_evidence ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "experience_id INTEGER NOT NULL REFERENCES experience_entries(id) ON DELETE CASCADE, "
+            "purchase_id INTEGER NOT NULL REFERENCES purchase_records(id) ON DELETE CASCADE, "
+            "created_at DATETIME NOT NULL, "
+            "CONSTRAINT uq_experience_evidence_purchase "
+            "UNIQUE (experience_id, purchase_id))"
+        ),
     ]
     with engine.connect() as conn:
         for stmt in stmts:
             try:
                 conn.execute(text(stmt))
                 conn.commit()
-            except Exception:
-                pass  # 列已存在时 SQLite 报错，直接跳过
+            except Exception as exc:
+                # ``Base.metadata.create_all`` runs before this compatibility
+                # migration, so ALTER statements for an already-current DB are
+                # expected to report duplicate columns.  Do not swallow lock,
+                # disk, malformed SQL, or missing-table errors: continuing with
+                # a half-migrated schema only turns startup failure into later
+                # data loss/500 responses.
+                message = str(exc).lower()
+                expected_duplicate = (
+                    "duplicate column name" in message
+                    or "already exists" in message
+                )
+                if not expected_duplicate:
+                    raise RuntimeError(f"数据库迁移失败：{stmt}") from exc
+
+    if engine.dialect.name == "sqlite":
+        # 旧版本在并发确认时可能为同一 plan 写入多条 purchase。保留全部账本，
+        # 仅解除后续重复记录的 plan 关联，再建立唯一索引以阻止继续重复。
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE purchase_records SET plan_id = NULL "
+                    "WHERE plan_id IS NOT NULL AND id NOT IN ("
+                    "SELECT MIN(id) FROM purchase_records "
+                    "WHERE plan_id IS NOT NULL GROUP BY plan_id)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_purchase_plan_id "
+                    "ON purchase_records(plan_id)"
+                )
+            )
+
+            # 为已有经验补建可审计证据。历史上无法证明 evidence_count 的增量
+            # 来自独立购买，因此迁移后以可验证的唯一购买数为准。
+            conn.execute(
+                text(
+                    "INSERT OR IGNORE INTO experience_evidence "
+                    "(experience_id, purchase_id, created_at) "
+                    "SELECT e.id, a.purchase_id, e.created_at "
+                    "FROM experience_entries e "
+                    "JOIN buy_point_analyses a ON a.id = e.analysis_id "
+                    "WHERE e.analysis_id IS NOT NULL"
+                )
+            )
+            conn.execute(
+                text(
+                    "UPDATE experience_entries SET evidence_count = ("
+                    "SELECT COUNT(*) FROM experience_evidence ee "
+                    "WHERE ee.experience_id = experience_entries.id) "
+                    "WHERE EXISTS (SELECT 1 FROM experience_evidence ee "
+                    "WHERE ee.experience_id = experience_entries.id)"
+                )
+            )
+            conn.execute(
+                text(
+                    "UPDATE experience_entries SET evidence_count = 0 "
+                    "WHERE analysis_id IS NULL AND NOT EXISTS ("
+                    "SELECT 1 FROM experience_evidence ee "
+                    "WHERE ee.experience_id = experience_entries.id)"
+                )
+            )
+
+        # Fail fast if a partially upgraded database is missing any field that
+        # the v2.2 purchase lifecycle relies on.
+        schema = inspect(engine)
+        required_columns = {
+            "routes": {"deleted_at"},
+            "buy_plans": {
+                "notification_status",
+                "notification_attempts",
+                "last_notification_at",
+                "notification_error",
+            },
+            "purchase_records": {
+                "total_paid",
+                "quote_price",
+                "quote_source",
+                "quote_batch_id",
+                "route_origin",
+                "route_destination",
+                "route_target_date",
+                "route_return_date",
+                "route_trip_type",
+            },
+            "buy_point_analyses": {
+                "sample_size",
+                "coverage_hours",
+                "data_quality",
+                "analysis_status",
+            },
+            "experience_evidence": {"experience_id", "purchase_id"},
+        }
+        missing: list[str] = []
+        existing_tables = set(schema.get_table_names())
+        for table_name, expected in required_columns.items():
+            if table_name not in existing_tables:
+                missing.append(f"{table_name}.*")
+                continue
+            actual = {column["name"] for column in schema.get_columns(table_name)}
+            missing.extend(
+                f"{table_name}.{column}" for column in sorted(expected - actual)
+            )
+        purchase_indexes = {
+            index["name"]: bool(index.get("unique"))
+            for index in schema.get_indexes("purchase_records")
+        }
+        if not purchase_indexes.get("ux_purchase_plan_id"):
+            missing.append("purchase_records.ux_purchase_plan_id(unique)")
+        if missing:
+            raise RuntimeError(
+                "数据库迁移后结构校验失败，缺少：" + ", ".join(missing)
+            )
 
 
 def init_db(db_url: str = "sqlite:///flightscanner.db"):
@@ -532,22 +954,24 @@ def init_db(db_url: str = "sqlite:///flightscanner.db"):
     connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
     engine = create_engine(db_url, echo=False, pool_pre_ping=True, connect_args=connect_args)
 
-    # 对 SQLite 开启 WAL 模式（Write-Ahead Logging），允许读写并发
+    # SQLite 的 connect 监听必须在任何 ``engine.connect()`` 之前注册。
+    # 否则连接池中的首个连接会永久保持 foreign_keys=OFF，恰好也是初始化和
+    # 大部分单元测试最常复用的连接。
     if db_url.startswith("sqlite"):
-        with engine.connect() as conn:
-            conn.execute(text("PRAGMA journal_mode=WAL"))
-            conn.commit()
-
-        # 强制 SQLite 开启外键约束。SQLite 默认 OFF，需在每个 connection 上设置；
-        # 不开启会出现这种孤儿写入：协程在路由删除后落库 price_history，
-        # 后续创建的同 ID 路由会"继承"老数据。
-        from sqlalchemy import event
-
         @event.listens_for(engine, "connect")
         def _enable_sqlite_fk(dbapi_conn, _connection_record) -> None:
             cursor = dbapi_conn.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.close()
+
+        # 首次取连接时同时验证监听器已生效，再开启 WAL 提升并发读写性能。
+        # 若运行环境拒绝启用外键，宁可初始化失败，也不要静默写入孤儿数据。
+        with engine.connect() as conn:
+            fk_enabled = conn.execute(text("PRAGMA foreign_keys")).scalar()
+            if fk_enabled != 1:
+                raise RuntimeError("SQLite foreign key enforcement could not be enabled")
+            conn.execute(text("PRAGMA journal_mode=WAL"))
+            conn.commit()
 
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine)

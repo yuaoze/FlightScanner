@@ -80,6 +80,7 @@ def _cached_generate_brief(
     base_url: str,
     model: str,
     evolution_context: str,
+    experience_context: str,
     _price_history: List,
 ) -> Dict[str, Any]:
     """Disk-cached wrapper around generate_brief_with_fallback.
@@ -98,6 +99,7 @@ def _cached_generate_brief(
         base_url=base_url,
         model=model,
         evolution_context=evolution_context,
+        experience_context=experience_context,
     )
 
 
@@ -162,7 +164,7 @@ def _get_credibility(route_id: int) -> Dict[str, Any]:
 
 
 def _get_evolution_context(route_id: int) -> str:
-    """获取 G4 进化上下文字符串（注入 AI prompt）。
+    """获取可信的 G4 进化上下文字符串（注入 AI system prompt）。
 
     Args:
         route_id: 路线 ID。
@@ -175,6 +177,19 @@ def _get_evolution_context(route_id: int) -> str:
         SessionLocal = _get_session_local()
         with SessionLocal() as session:
             return build_evolved_context(session, route_id)
+    except Exception:
+        return ""
+
+
+def _get_experience_context(route_id: int) -> str:
+    """获取用户可编辑的买入经验，作为非可信参考数据传给模型。"""
+    try:
+        from flightscanner.core.services import build_experience_context  # lazy
+        from flightscanner.models.database import Route  # lazy
+        SessionLocal = _get_session_local()
+        with SessionLocal() as session:
+            route = session.query(Route).filter(Route.id == route_id).first()
+            return build_experience_context(session, route) if route is not None else ""
     except Exception:
         return ""
 
@@ -385,6 +400,7 @@ def render_ai_brief(
 
     if should_trigger:
         evolution_ctx = _get_evolution_context(route.id)
+        experience_ctx = _get_experience_context(route.id)
         with st.spinner(f"AI 分析中（{reason}）…"):
             brief = _cached_generate_brief(
                 route_id=route.id,
@@ -395,6 +411,7 @@ def render_ai_brief(
                 base_url=settings.deepseek_base_url,
                 model=settings.deepseek_model,
                 evolution_context=evolution_ctx,
+                experience_context=experience_ctx,
                 _price_history=price_history,
             )
         st.session_state[cache_key] = brief
@@ -416,6 +433,7 @@ def render_ai_brief(
             help="调用 DeepSeek AI 分析价格趋势并给出购票建议",
         ):
             evolution_ctx = _get_evolution_context(route.id)
+            experience_ctx = _get_experience_context(route.id)
             with st.spinner("正在生成 AI 价格分析…"):
                 brief = _cached_generate_brief(
                     route_id=route.id,
@@ -426,6 +444,7 @@ def render_ai_brief(
                     base_url=settings.deepseek_base_url,
                     model=settings.deepseek_model,
                     evolution_context=evolution_ctx,
+                    experience_context=experience_ctx,
                     _price_history=price_history,
                 )
             st.session_state[cache_key] = brief

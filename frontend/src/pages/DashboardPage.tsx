@@ -28,8 +28,20 @@ function useCities() {
 export function DashboardPage() {
   const [activeTab, setActiveTab] = useState<MonitorStatus | '全部'>('全部');
   const [showAddDialog, setShowAddDialog] = useState(false);
-  const { data: routes, isLoading: routesLoading } = useRoutes();
-  const { data: stats, isLoading: statsLoading } = useStats();
+  const {
+    data: routes,
+    isLoading: routesLoading,
+    isError: routesError,
+    isFetching: routesFetching,
+    refetch: refetchRoutes,
+  } = useRoutes();
+  const {
+    data: stats,
+    isLoading: statsLoading,
+    isError: statsError,
+    isFetching: statsFetching,
+    refetch: refetchStats,
+  } = useStats();
   const { data: cities = [] } = useCities();
 
   const counts = {
@@ -66,6 +78,30 @@ export function DashboardPage() {
         cities={cities}
       />
 
+      {(routesError || statsError) && (
+        <div
+          role="alert"
+          className="mb-5 flex flex-col gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div>
+            <p className="font-medium">监控数据加载失败</p>
+            <p className="mt-0.5 text-xs text-red-600">
+              这不是空监控列表，请检查后端服务后重新加载。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              void Promise.all([refetchRoutes(), refetchStats()]);
+            }}
+            disabled={routesFetching || statsFetching}
+            className="shrink-0 rounded-lg bg-red-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {routesFetching || statsFetching ? '重新加载中…' : '重新加载'}
+          </button>
+        </div>
+      )}
+
       {/* KPI Cards */}
       <KpiCards stats={stats} isLoading={statsLoading} />
 
@@ -89,7 +125,7 @@ export function DashboardPage() {
             </div>
           ))}
         </div>
-      ) : (
+      ) : routesError ? null : (
         <MonitorCardGrid routes={routes ?? []} activeFilter={activeTab} />
       )}
     </div>

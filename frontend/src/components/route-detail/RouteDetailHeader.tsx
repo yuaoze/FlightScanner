@@ -1,6 +1,7 @@
 import { useNavigate } from 'react-router-dom';
 import type { RouteDetailResponse } from '../../types';
 import { DecisionBadge } from '../dashboard/DecisionBadge';
+import { BuyActions } from './BuyActions';
 import { formatPrice, formatDateRange, daysUntilText } from '../../lib/utils';
 
 interface Props {
@@ -45,19 +46,22 @@ export function RouteDetailHeader({ route }: Props) {
             <span className="ml-1">· 目标 {formatPrice(route.target_price)}</span>
           </p>
         </div>
-        <div className="text-right">
-          <div className="flex items-baseline gap-1.5">
-            <span className={`text-2xl font-bold ${priceColor}`}>
-              {formatPrice(route.latest_price)}
-            </span>
-            <span className={`text-sm ${priceColor}`}>{trendArrow}</span>
+        <div className="flex flex-col items-end">
+          <div className="text-right">
+            <div className="flex items-baseline gap-1.5">
+              <span className={`text-2xl font-bold ${priceColor}`}>
+                {formatPrice(route.latest_price)}
+              </span>
+              <span className={`text-sm ${priceColor}`}>{trendArrow}</span>
+            </div>
+            {route.price_vs_avg_pct !== null && (
+              <p className="text-xs text-gray-500 mt-0.5">
+                {route.price_vs_avg_pct < 0 ? '低于' : '高于'}均价{' '}
+                {Math.abs(route.price_vs_avg_pct)}%
+              </p>
+            )}
           </div>
-          {route.price_vs_avg_pct !== null && (
-            <p className="text-xs text-gray-500 mt-0.5">
-              {route.price_vs_avg_pct < 0 ? '低于' : '高于'}均价{' '}
-              {Math.abs(route.price_vs_avg_pct)}%
-            </p>
-          )}
+          <BuyActions route={route} />
         </div>
       </div>
     </div>

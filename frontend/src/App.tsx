@@ -9,6 +9,7 @@ import { AlertsPage } from './pages/AlertsPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
 import { RouteDetailPage } from './pages/RouteDetailPage';
 import { RadarPage } from './pages/RadarPage';
+import { PurchasesPage } from './pages/PurchasesPage';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -32,6 +33,7 @@ function App() {
             <Route path="/alerts" element={<AlertsPage />} />
             <Route path="/analytics" element={<AnalyticsPage />} />
             <Route path="/radar" element={<RadarPage />} />
+            <Route path="/purchases" element={<PurchasesPage />} />
             <Route path="/route/:id" element={<RouteDetailPage />} />
           </Routes>
         </Layout>

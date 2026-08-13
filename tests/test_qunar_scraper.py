@@ -22,8 +22,16 @@ from flightscanner.utils.city_codes import CITY_CODE_MAP
 
 
 @pytest.fixture
-def scraper():
-    return QunarScraper(headless=True, timeout=30000, max_retries=1)
+def scraper(tmp_path):
+    # Keep unit tests independent from a developer's real login state.  Loading
+    # the default working-directory cookie file makes empty-result tests enter
+    # the live HTTP fallback and turns deterministic tests into network calls.
+    return QunarScraper(
+        headless=True,
+        timeout=30000,
+        max_retries=1,
+        cookies_file=str(tmp_path / "no-qunar-cookies.json"),
+    )
 
 
 @pytest.fixture
@@ -249,6 +257,7 @@ class TestNonHeadlessLoginFlow:
         navigated_urls = []
 
         mock_page = AsyncMock()
+        mock_page.on = MagicMock()
         mock_page.url = "https://user.qunar.com/passport/login.jsp"
 
         async def fake_goto(url, **kwargs):
@@ -294,6 +303,7 @@ class TestNonHeadlessLoginFlow:
         )
 
         mock_page = AsyncMock()
+        mock_page.on = MagicMock()
         mock_context = AsyncMock()
         mock_context.new_page = AsyncMock(return_value=mock_page)
         scraper._context = mock_context
