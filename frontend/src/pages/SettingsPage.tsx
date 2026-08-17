@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../api/client';
 import { CookieCard } from '../components/settings/CookieCard';
@@ -192,13 +192,6 @@ export function SettingsPage() {
   // Keep an "extra channels" toggle so user can reveal credential inputs
   const [showCredentials, setShowCredentials] = useState(false);
 
-  // Reset draft after successful save so the inputs reflect persisted state.
-  useEffect(() => {
-    if (update.isSuccess) {
-      setDraft({});
-    }
-  }, [update.isSuccess]);
-
   if (isLoading || !settings) {
     return (
       <div className="space-y-4">
@@ -223,7 +216,9 @@ export function SettingsPage() {
 
   const handleSave = () => {
     if (Object.keys(draft).length === 0) return;
-    update.mutate(draft);
+    update.mutate(draft, {
+      onSuccess: () => setDraft({}),
+    });
   };
 
   const handleDiscard = () => {
@@ -264,7 +259,7 @@ export function SettingsPage() {
         {/* Scraper Settings */}
         <SettingCard title="爬虫设置">
           <div className="py-2">
-            <label className="text-xs text-gray-500 block mb-1">启用平台（逗号分隔，可选 qunar/ctrip）</label>
+            <label className="text-xs text-gray-500 block mb-1">启用平台（逗号分隔，可选 qunar/ctrip/tongcheng）</label>
             <input
               type="text"
               value={get('scraper_type', settings.scraper.scraper_type) as string}

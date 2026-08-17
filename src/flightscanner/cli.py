@@ -7,7 +7,7 @@ and price monitoring.
 import asyncio
 import logging
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date
 from decimal import Decimal
 from typing import Optional
 
@@ -18,7 +18,7 @@ from flightscanner.interfaces import SearchParams
 from flightscanner.models import init_db
 from flightscanner.notifiers import EmailNotifier
 from flightscanner.repositories import SQLAlchemyRepository
-from flightscanner.scrapers import CtripScraper
+from flightscanner.scrapers import ScraperRegistry
 from flightscanner.utils.config import settings
 
 # Configure logging
@@ -78,7 +78,7 @@ def search(
     """Search for flights and analyze prices.
 
     This command:
-    1. Scrapes flight data from Ctrip
+    1. Scrapes flight data from every platform enabled by SCRAPER_TYPE
     2. Saves prices to database
     3. Analyzes price trends
     4. Sends alerts if conditions are met
@@ -88,7 +88,7 @@ def search(
     """
     async def run_search():
         """Run the async search process."""
-        scraper = None
+        scrapers = []
         try:
             # Initialize database
             logger.info("Initializing database...")
@@ -110,8 +110,35 @@ def search(
 
             # Step 1: Scrape flights
             logger.info(f"Searching flights: {departure} → {arrival} on {departure_date}")
-            scraper = CtripScraper(headless=headless)
-            flight_prices = await scraper.search_flights(params)
+            platforms = [
+                value.strip()
+                for value in settings.scraper_type.split(",")
+                if value.strip()
+            ]
+            scrapers = ScraperRegistry.build_enabled(
+                platforms,
+                headless=headless,
+                timeout=settings.scraper_timeout,
+                max_retries=settings.scraper_retry_count,
+                max_results=settings.max_results_per_platform,
+            )
+            platform_results = await asyncio.gather(
+                *(scraper.search_flights(params) for scraper in scrapers),
+                return_exceptions=True,
+            )
+            flight_prices = []
+            for platform, result in zip(platforms, platform_results, strict=True):
+                if isinstance(result, Exception):
+                    logger.error("%s search failed: %s", platform, result)
+                    continue
+                flight_prices.extend(result)
+
+            from flightscanner.scheduler.price_monitor import PriceMonitorScheduler
+            flight_prices = PriceMonitorScheduler._deduplicate(flight_prices)
+            if return_date is not None:
+                flight_prices = PriceMonitorScheduler._combine_roundtrip_prices(
+                    flight_prices
+                )
 
             if not flight_prices:
                 click.echo("No flights found.")
@@ -121,7 +148,7 @@ def search(
             click.echo("-" * 80)
             click.echo(
                 f"{'Flight':<12} {'Airline':<15} {'Time':<15} "
-                f"{'Price':>10} {'Class':<10}"
+                f"{'Price':>10} {'Class':<10} {'Source':<12}"
             )
             click.echo("-" * 80)
 
@@ -137,7 +164,7 @@ def search(
                     f"{flight_info.flight_no:<12} "
                     f"{flight_info.airline:<15} "
                     f"{flight_info.departure_time}-{flight_info.arrival_time:<15} "
-                    f"¥{fp.price:>9} {fp.seat_class:<10}"
+                    f"¥{fp.price:>9} {fp.seat_class:<10} {fp.source:<12}"
                 )
 
             click.echo("-" * 80)
@@ -196,8 +223,10 @@ def search(
             click.echo(f"\nError: {e}", err=True)
             sys.exit(1)
         finally:
-            if scraper:
-                await scraper.close()
+            await asyncio.gather(
+                *(scraper.close() for scraper in scrapers),
+                return_exceptions=True,
+            )
 
     # Run async function
     asyncio.run(run_search())

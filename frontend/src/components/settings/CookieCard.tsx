@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../../api/client';
 
@@ -11,6 +11,8 @@ interface CookieStatus {
   updated_at: string | null;
   key_cookies_present: string[];
   key_cookies_missing: string[];
+  /** Some platforms only support manual Cookie upload. Defaults to true for older APIs. */
+  login_supported?: boolean;
 }
 
 interface LoginStateResponse {
@@ -113,36 +115,55 @@ function QrLoginDialog({
 }) {
   const queryClient = useQueryClient();
   const [startError, setStartError] = useState<string | null>(null);
+  const [pollingEnabled, setPollingEnabled] = useState(false);
+  const startRequested = useRef(false);
+  const attemptKey = useId();
 
-  // Kick off login on mount
+  // React StrictMode 会重复执行 mount effect。用 ref 保证只发起一次；若后端
+  // 返回 409，说明已有流程在跑，此弹窗直接附着并继续轮询。
   useEffect(() => {
-    apiClient.post(`/cookies/${platform}/login`).catch((err) => {
-      setStartError(err?.response?.data?.detail || '启动失败');
-    });
-    // Eslint: we want this to run exactly once when the dialog mounts.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (startRequested.current) return;
+    startRequested.current = true;
+
+    apiClient
+      .post(`/cookies/${platform}/login`)
+      .then(() => setPollingEnabled(true))
+      .catch((err) => {
+        if (err?.response?.status === 409) {
+          setPollingEnabled(true);
+          return;
+        }
+        setStartError(err?.response?.data?.detail || '启动失败');
+      });
+  }, [platform]);
 
   const { data: state } = useQuery({
-    queryKey: ['cookies', 'login', platform],
+    queryKey: ['cookies', 'login', platform, attemptKey],
     queryFn: async (): Promise<LoginStateResponse> => {
       const { data } = await apiClient.get<LoginStateResponse>(
         `/cookies/${platform}/login/status`,
       );
       return data;
     },
+    enabled: pollingEnabled,
     refetchInterval: (q) => {
-      const s = q.state.data?.status;
-      return s === 'success' || s === 'error' ? false : 1500;
+      return q.state.data?.done ? false : 1500;
     },
   });
 
   const handleClose = async () => {
-    try {
-      await apiClient.post(`/cookies/${platform}/login/reset`);
-    } catch {
-      /* ignore */
+    // 运行中的浏览器不能真正取消；关闭弹窗后流程继续，重新打开可附着。
+    // 仅清理已经结束的服务端状态，避免旧终态污染下一次尝试。
+    if (state?.done) {
+      try {
+        await apiClient.post(`/cookies/${platform}/login/reset`);
+      } catch {
+        /* ignore */
+      }
     }
+    queryClient.removeQueries({
+      queryKey: ['cookies', 'login', platform, attemptKey],
+    });
     queryClient.invalidateQueries({ queryKey: ['cookies', 'status'] });
     onClose();
   };
@@ -177,11 +198,13 @@ function QrLoginDialog({
           <>
             <div className="flex flex-col items-center py-2">
               {state?.qr_base64 ? (
-                <img
-                  src={`data:image/png;base64,${state.qr_base64}`}
-                  alt="QR code"
-                  className="w-56 h-56 border border-gray-100 rounded"
-                />
+                <div className="bg-white p-3 border border-gray-100 rounded">
+                  <img
+                    src={`data:image/png;base64,${state.qr_base64}`}
+                    alt={`${label} 登录二维码`}
+                    className="w-56 h-56"
+                  />
+                </div>
               ) : (
                 <div className="w-56 h-56 bg-gray-50 rounded flex items-center justify-center text-sm text-gray-400">
                   ⏳ 二维码加载中…
@@ -190,6 +213,11 @@ function QrLoginDialog({
               <p className="text-xs text-gray-600 mt-3">
                 {state?.message || '正在启动浏览器…'}
               </p>
+              {platform === 'tongcheng' && state?.qr_base64 && (
+                <p className="text-[11px] text-amber-700 mt-1 text-center">
+                  请使用微信“扫一扫”，不是同程旅行 App；继续即表示由同程官方微信登录页完成授权
+                </p>
+              )}
             </div>
             <div className="mt-3">
               <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
@@ -209,7 +237,7 @@ function QrLoginDialog({
           onClick={handleClose}
           className="w-full mt-4 px-3 py-2 bg-white text-gray-600 text-sm rounded-lg border border-gray-200 hover:bg-gray-50 font-medium"
         >
-          {state?.done ? '完成' : '取消'}
+          {state?.done ? '完成' : '关闭（登录继续）'}
         </button>
       </div>
     </div>
@@ -271,12 +299,14 @@ function CookieRow({ status }: { status: CookieStatus }) {
         )}
 
         <div className="flex gap-2">
-          <button
-            onClick={() => setShowLogin(true)}
-            className="flex-1 px-3 py-1.5 bg-blue-600 text-white text-xs rounded-lg hover:bg-blue-700 font-medium"
-          >
-            扫码刷新
-          </button>
+          {status.login_supported !== false && (
+            <button
+              onClick={() => setShowLogin(true)}
+              className="flex-1 px-3 py-1.5 bg-blue-600 text-white text-xs rounded-lg hover:bg-blue-700 font-medium"
+            >
+              扫码刷新
+            </button>
+          )}
           <button
             onClick={() => setShowUpload(true)}
             className="flex-1 px-3 py-1.5 bg-white text-gray-700 text-xs rounded-lg border border-gray-200 hover:bg-gray-50 font-medium"
@@ -332,12 +362,12 @@ export function CookieCard() {
     <div className="bg-white rounded-xl border border-gray-100 p-5">
       <h3 className="text-sm font-semibold text-gray-700 mb-1">Cookie 管理</h3>
       <p className="text-[11px] text-gray-400 mb-3">
-        去哪儿 Cookie 是 wbdflightlist 接口必需的凭据；携程 Cookie 可提升 API 采集成功率
+        去哪儿和携程使用各自 App 扫码；同程使用官方微信 OAuth，请用微信“扫一扫”。也可手动上传 Cookie
       </p>
 
       {isLoading || !data ? (
         <div className="space-y-3">
-          {Array.from({ length: 2 }).map((_, i) => (
+          {Array.from({ length: 3 }).map((_, i) => (
             <div key={i} className="h-20 bg-gray-50 rounded animate-pulse" />
           ))}
         </div>

@@ -21,6 +21,7 @@ from flightscanner.api.schemas import (
     RouteFlightsResponse,
     RouteResponse,
     RoutePredictionsResponse,
+    ScrapeTaskResponse,
     SparklinePoint,
     UpdateRouteRequest,
 )
@@ -562,10 +563,36 @@ def update_route(
 # ── Trigger scrape ────────────────────────────────────────────────────────
 
 
-@router.post("/routes/{route_id}/scrape", status_code=202)
-def trigger_scrape(route_id: int, db: Session = Depends(get_db)) -> dict:
-    """Trigger an immediate scrape for a route (fire-and-forget)."""
+def _scrape_task_response(
+    snapshot: dict,
+    message: Optional[str] = None,
+) -> ScrapeTaskResponse:
+    """Validate a scheduler snapshot and attach a concise user-facing message."""
+    status = snapshot["status"]
+    if message is None:
+        messages = {
+            "queued": "采集任务已排队",
+            "running": "正在并行采集各平台价格",
+            "completed": "所有平台采集完成",
+            "partial": "部分平台采集完成，部分平台失败",
+            "failed": "采集任务失败",
+        }
+        message = messages[status]
+    return ScrapeTaskResponse.model_validate({**snapshot, "message": message})
+
+
+@router.post(
+    "/routes/{route_id}/scrape",
+    status_code=202,
+    response_model=ScrapeTaskResponse,
+)
+def trigger_scrape(
+    route_id: int,
+    db: Session = Depends(get_db),
+) -> ScrapeTaskResponse:
+    """Queue an immediate scrape and return a pollable, platform-aware task."""
     import asyncio
+    import logging
 
     service = RouteService(db)
     route = service.get_route_by_id(route_id)
@@ -574,21 +601,79 @@ def trigger_scrape(route_id: int, db: Session = Depends(get_db)) -> dict:
     if not route.is_active:
         raise HTTPException(status_code=400, detail="Route is inactive")
 
+    monitor = _get_live_monitor()
+    loop = getattr(monitor, "_loop", None) if monitor else None
+    if monitor is None or loop is None or not loop.is_running():
+        return ScrapeTaskResponse(
+            route_id=route_id,
+            status="failed",
+            error="后台调度器未运行",
+            message="后台调度器未运行，采集任务未执行",
+        )
+
+    snapshot = monitor.create_scrape_task(route_id)
+    task_id = snapshot["task_id"]
+    scrape_coro = monitor.scrape_route(route, task_id=task_id)
     try:
-        from flightscanner.api import main as api_main
+        submitted = asyncio.run_coroutine_threadsafe(
+            scrape_coro,
+            loop,
+        )
+    except Exception as exc:
+        scrape_coro.close()
+        logging.getLogger(__name__).exception(
+            "立即采集任务提交失败 route=%s task=%s",
+            route_id,
+            task_id,
+        )
+        failed = monitor.fail_scrape_task(task_id, exc) or snapshot
+        return _scrape_task_response(failed, "采集任务提交失败")
 
-        monitor = api_main._monitor
-        loop = getattr(monitor, "_loop", None) if monitor else None
-        if monitor and loop and loop.is_running():
-            asyncio.run_coroutine_threadsafe(monitor.scrape_route(route), loop)
-            return {"message": "采集任务已提交到后台调度器", "status": "queued"}
-    except Exception:
-        pass
+    def record_submission_failure(done) -> None:
+        """Prevent a loop shutdown from leaving a task queued forever."""
+        if done.cancelled():
+            monitor.fail_scrape_task(task_id, "采集任务在执行前被取消")
+            return
+        try:
+            error = done.exception()
+        except BaseException as exc:  # concurrent Future may raise on inspection
+            error = exc
+        if error is not None:
+            monitor.fail_scrape_task(task_id, error)
 
-    return {
-        "message": "采集任务已记录，但后台调度器未运行，暂未执行",
-        "status": "scheduler_unavailable",
-    }
+    submitted.add_done_callback(record_submission_failure)
+
+    return _scrape_task_response(snapshot, "采集任务已提交到后台调度器")
+
+
+@router.get(
+    "/routes/{route_id}/scrape/status",
+    response_model=ScrapeTaskResponse,
+)
+def get_latest_scrape_status(route_id: int) -> ScrapeTaskResponse:
+    """Return the latest retained immediate scrape task for a route."""
+    monitor = _get_live_monitor()
+    if monitor is None:
+        raise HTTPException(status_code=503, detail="Background scheduler unavailable")
+    snapshot = monitor.get_latest_scrape_task(route_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Scrape task not found")
+    return _scrape_task_response(snapshot)
+
+
+@router.get(
+    "/routes/{route_id}/scrape/{task_id}",
+    response_model=ScrapeTaskResponse,
+)
+def get_scrape_status(route_id: int, task_id: str) -> ScrapeTaskResponse:
+    """Return a retained immediate scrape task by its stable task ID."""
+    monitor = _get_live_monitor()
+    if monitor is None:
+        raise HTTPException(status_code=503, detail="Background scheduler unavailable")
+    snapshot = monitor.get_scrape_task(task_id)
+    if snapshot is None or snapshot["route_id"] != route_id:
+        raise HTTPException(status_code=404, detail="Scrape task not found")
+    return _scrape_task_response(snapshot)
 
 
 # ── AI Predictions for route ──────────────────────────────────────────────
@@ -707,10 +792,21 @@ def get_route_batches(
 def get_route_flights(
     route_id: int,
     batch_id: Optional[str] = Query(None, description="Specific batch, defaults to latest"),
+    source: Optional[str] = Query(
+        None,
+        min_length=1,
+        max_length=50,
+        description="Platform source within the batch (for example qunar, ctrip, tongcheng)",
+    ),
     limit: int = Query(10, ge=1, le=50),
     db: Session = Depends(get_db),
 ) -> RouteFlightsResponse:
-    """Get top-N cheapest flights from a batch (or the latest batch if not specified)."""
+    """Get top-N cheapest flights from one platform in a scrape batch.
+
+    A scheduler run can write several platform snapshots with the same
+    ``batch_id``.  ``source`` keeps an explicitly selected batch row scoped to
+    the platform shown in the UI instead of silently mixing its competitors.
+    """
     from sqlalchemy import func
     from sqlalchemy.orm import aliased
 
@@ -721,12 +817,17 @@ def get_route_flights(
 
     # Resolve batch_id: if not given, pick the latest for this route
     if not batch_id:
-        latest_row = (
+        latest_query = (
             db.query(PriceHistory.batch_id, func.max(PriceHistory.scraped_at).label("scraped_at"))
             .filter(
                 PriceHistory.route_id == route_id,
                 PriceHistory.batch_id.isnot(None),
             )
+        )
+        if source:
+            latest_query = latest_query.filter(PriceHistory.source == source)
+        latest_row = (
+            latest_query
             .group_by(PriceHistory.batch_id)
             .order_by(func.max(PriceHistory.scraped_at).desc())
             .first()
@@ -735,7 +836,7 @@ def get_route_flights(
             return RouteFlightsResponse(route_id=route_id, flights=[])
         batch_id = latest_row.batch_id
 
-    rows = (
+    rows_query = (
         db.query(PriceHistory, Flight, ReturnFlight)
         .join(Flight, PriceHistory.flight_id == Flight.id)
         .outerjoin(ReturnFlight, PriceHistory.return_flight_id == ReturnFlight.id)
@@ -743,7 +844,11 @@ def get_route_flights(
             PriceHistory.route_id == route_id,
             PriceHistory.batch_id == batch_id,
         )
-        .order_by(PriceHistory.price.asc())
+    )
+    if source:
+        rows_query = rows_query.filter(PriceHistory.source == source)
+    rows = (
+        rows_query.order_by(PriceHistory.price.asc())
         .limit(limit)
         .all()
     )

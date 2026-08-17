@@ -72,7 +72,10 @@ class Settings(BaseSettings):
     # Scraper Configuration
     scraper_type: str = Field(
         default="qunar",
-        description="启用的爬虫平台，单个或逗号分隔多个：'qunar'、'ctrip'、'qunar,ctrip'",
+        description=(
+            "启用的爬虫平台，单个或逗号分隔多个："
+            "'qunar'、'ctrip'、'tongcheng'"
+        ),
     )
     scraper_headless: bool = Field(
         default=True, description="Run browser in headless mode"
@@ -90,6 +93,10 @@ class Settings(BaseSettings):
     ctrip_cookies: Optional[str] = Field(
         default=None,
         description="Ctrip cookies JSON string for authentication (optional)",
+    )
+    tongcheng_cookies: Optional[str] = Field(
+        default=None,
+        description="Tongcheng cookies JSON string for authentication (optional)",
     )
 
     # Scraper result limit
@@ -161,7 +168,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_scraper_type(cls, v: str) -> str:
         """验证爬虫平台配置，支持单个或逗号分隔的多个平台名。"""
-        allowed = {"qunar", "ctrip"}
+        allowed = {"qunar", "ctrip", "tongcheng"}
         platforms = [p.strip().lower() for p in v.split(",") if p.strip()]
         if not platforms:
             raise ValueError("scraper_type 不能为空")

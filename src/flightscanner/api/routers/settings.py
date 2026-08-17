@@ -1,5 +1,7 @@
 """Settings API: read + edit configuration."""
 
+import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -7,9 +9,45 @@ from dotenv import set_key
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from flightscanner.utils.config import Settings, get_settings, settings as live_settings
+from flightscanner.utils.config import Settings, get_settings
+from flightscanner.utils.config import settings as live_settings
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+_SCRAPER_RUNTIME_FIELDS = {
+    "scraper_type",
+    "scraper_headless",
+    "scraper_timeout",
+    "scraper_retry_count",
+    "max_results_per_platform",
+}
+
+
+def _schedule_scraper_reconfigure() -> bool:
+    """在调度器专属事件循环中应用新的 scraper 配置。"""
+    try:
+        from flightscanner.api import main as api_main
+
+        monitor = api_main._monitor
+        loop = getattr(monitor, "_loop", None) if monitor is not None else None
+        if monitor is None or loop is None or not loop.is_running():
+            return False
+        future = asyncio.run_coroutine_threadsafe(
+            monitor.reconfigure_scrapers(), loop
+        )
+
+        def _log_result(done) -> None:
+            try:
+                done.result()
+            except Exception:
+                logger.exception("运行中爬虫热重配失败；已保存配置将在重启后生效")
+
+        future.add_done_callback(_log_result)
+        return True
+    except Exception:
+        logger.exception("提交爬虫热重配任务失败；已保存配置将在重启后生效")
+        return False
 
 
 def _mask(value: Optional[str]) -> Optional[str]:
@@ -241,5 +279,8 @@ def update_settings(body: UpdateSettingsRequest) -> SettingsResponse:
 
     # Bust the lru_cache so a fresh get_settings() call re-reads .env if needed.
     get_settings.cache_clear()
+
+    if _SCRAPER_RUNTIME_FIELDS.intersection(payload):
+        _schedule_scraper_reconfigure()
 
     return get_current_settings()

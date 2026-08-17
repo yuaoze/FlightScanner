@@ -338,3 +338,72 @@ class TestCombineRoundtripPrices:
         out_fp = _make_rt_price("CA953", 600, direction=FlightDirection.DEPARTURE)
         result = PriceMonitorScheduler._combine_roundtrip_prices([out_fp])
         assert result == []
+
+    def test_different_sources_are_never_paired(self):
+        """An outbound and return fare from different platforms is not a product."""
+        out_fp = _make_rt_price(
+            "CA953", 600,
+            direction=FlightDirection.DEPARTURE,
+            source="qunar",
+        )
+        ret_fp = _make_rt_price(
+            "MU5102", 450,
+            direction=FlightDirection.RETURN,
+            source="tongcheng",
+        )
+
+        result = PriceMonitorScheduler._combine_roundtrip_prices([out_fp, ret_fp])
+
+        assert result == []
+
+    def test_different_cabin_or_currency_are_never_paired(self):
+        """A combined quote must retain one comparable currency/cabin scope."""
+        out_fp = _make_rt_price(
+            "MU5101", 500,
+            direction=FlightDirection.DEPARTURE,
+            source="tongcheng",
+        )
+        business_return = _make_rt_price(
+            "MU5102", 450,
+            direction=FlightDirection.RETURN,
+            source="tongcheng",
+        )
+        business_return.seat_class = "商务舱"
+        usd_return = _make_rt_price(
+            "MU5103", 80,
+            direction=FlightDirection.RETURN,
+            source="tongcheng",
+        )
+        usd_return.currency = "USD"
+
+        result = PriceMonitorScheduler._combine_roundtrip_prices(
+            [out_fp, business_return, usd_return]
+        )
+
+        assert result == []
+
+    def test_unmatched_source_does_not_contaminate_other_platform_pair(self):
+        """Keep a valid same-source pair while dropping another source's orphan."""
+        orphan_out = _make_rt_price(
+            "CA953", 600,
+            direction=FlightDirection.DEPARTURE,
+            source="qunar",
+        )
+        tc_out = _make_rt_price(
+            "MU5101", 500,
+            direction=FlightDirection.DEPARTURE,
+            source="tongcheng",
+        )
+        tc_ret = _make_rt_price(
+            "MU5102", 450,
+            direction=FlightDirection.RETURN,
+            source="tongcheng",
+        )
+
+        result = PriceMonitorScheduler._combine_roundtrip_prices(
+            [orphan_out, tc_out, tc_ret]
+        )
+
+        assert len(result) == 1
+        assert result[0].source == "tongcheng"
+        assert result[0].price == Decimal("950")

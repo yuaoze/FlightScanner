@@ -9,11 +9,13 @@ import json
 import logging
 import random
 import threading
-from dataclasses import dataclass
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from statistics import median
-from typing import ClassVar, Dict, List, Optional, Set, Tuple
+from typing import Any, ClassVar, Dict, Iterable, List, Optional, Set, Tuple
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -30,6 +32,230 @@ from flightscanner.models.database import init_db
 from flightscanner.utils.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+_PLATFORM_DISPLAY: Dict[str, Tuple[str, str]] = {
+    "QunarScraper": ("qunar", "去哪儿"),
+    "CtripScraper": ("ctrip", "携程"),
+    "TongchengScraper": ("tongcheng", "同程旅行"),
+}
+
+
+def _scraper_identity(scraper: FlightScraper) -> Tuple[str, str]:
+    """Return a stable API platform key and a human-readable label."""
+    class_name = type(scraper).__name__
+    known = _PLATFORM_DISPLAY.get(class_name)
+    if known is not None:
+        return known
+    platform = class_name.removesuffix("Scraper").lower() or "unknown"
+    return platform, class_name
+
+
+def _safe_scrape_error(error: BaseException | str) -> str:
+    """Keep task diagnostics useful while bounding memory and response size."""
+    if isinstance(error, BaseException):
+        detail = " ".join(str(error).split()) or type(error).__name__
+        text = f"{type(error).__name__}: {detail}"
+    else:
+        text = " ".join(str(error).split()) or "未知采集错误"
+    return text[:500]
+
+
+@dataclass
+class PlatformScrapeProgress:
+    """Mutable progress for one platform within an immediate scrape task."""
+
+    platform: str
+    display_name: str
+    status: str = "queued"
+    count: int = 0
+    error: Optional[str] = None
+    warning: Optional[str] = None
+    attempts: int = 0
+    successful_attempts: int = 0
+    failed_attempts: int = 0
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "platform": self.platform,
+            "display_name": self.display_name,
+            "status": self.status,
+            "count": self.count,
+            "error": self.error,
+            "warning": self.warning,
+        }
+
+
+@dataclass
+class ImmediateScrapeProgress:
+    """In-memory state for an API-triggered scrape task."""
+
+    task_id: str
+    route_id: int
+    status: str = "queued"
+    platforms: Dict[str, PlatformScrapeProgress] = field(default_factory=dict)
+    error: Optional[str] = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+    def snapshot(self) -> Dict[str, Any]:
+        platform_snapshots = [item.snapshot() for item in self.platforms.values()]
+        return {
+            "task_id": self.task_id,
+            "route_id": self.route_id,
+            "status": self.status,
+            "platforms": platform_snapshots,
+            "total_count": sum(item["count"] for item in platform_snapshots),
+            "error": self.error,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+        }
+
+
+class ImmediateScrapeStore:
+    """Thread-safe, bounded task registry shared by API and scheduler loops."""
+
+    def __init__(self, max_tasks: int = 100):
+        if max_tasks < 1:
+            raise ValueError("max_tasks must be positive")
+        self._max_tasks = max_tasks
+        self._tasks: OrderedDict[str, ImmediateScrapeProgress] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def create(
+        self,
+        route_id: int,
+        platforms: Iterable[Tuple[str, str]],
+    ) -> Dict[str, Any]:
+        task = ImmediateScrapeProgress(
+            task_id=uuid.uuid4().hex,
+            route_id=route_id,
+        )
+        for platform, display_name in platforms:
+            task.platforms.setdefault(
+                platform,
+                PlatformScrapeProgress(platform=platform, display_name=display_name),
+            )
+        with self._lock:
+            self._tasks[task.task_id] = task
+            while len(self._tasks) > self._max_tasks:
+                self._tasks.popitem(last=False)
+            return task.snapshot()
+
+    def get(self, task_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            return task.snapshot() if task is not None else None
+
+    def latest_for_route(self, route_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            for task in reversed(self._tasks.values()):
+                if task.route_id == route_id:
+                    return task.snapshot()
+        return None
+
+    def mark_running(self, task_id: str) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.completed_at is not None:
+                return
+            task.status = "running"
+            task.started_at = task.started_at or datetime.now(timezone.utc)
+
+    def mark_platform_running(
+        self,
+        task_id: str,
+        platform: str,
+        display_name: str,
+    ) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.completed_at is not None:
+                return
+            item = task.platforms.setdefault(
+                platform,
+                PlatformScrapeProgress(platform=platform, display_name=display_name),
+            )
+            item.attempts += 1
+            item.status = "running"
+
+    def mark_platform_result(
+        self,
+        task_id: str,
+        platform: str,
+        display_name: str,
+        *,
+        count: int = 0,
+        error: Optional[BaseException | str] = None,
+        warning: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.completed_at is not None:
+                return
+            item = task.platforms.setdefault(
+                platform,
+                PlatformScrapeProgress(platform=platform, display_name=display_name),
+            )
+            if error is None:
+                item.successful_attempts += 1
+                item.count += max(0, count)
+                item.status = "partial" if item.failed_attempts else "completed"
+            else:
+                item.failed_attempts += 1
+                new_error = _safe_scrape_error(error)
+                item.error = (
+                    f"{item.error}; {new_error}"[:500]
+                    if item.error and new_error not in item.error
+                    else new_error
+                )
+                item.status = "partial" if item.successful_attempts else "failed"
+            if warning:
+                item.warning = " ".join(warning.split())[:500]
+
+    def finish(
+        self,
+        task_id: str,
+        error: Optional[BaseException | str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            if task.completed_at is not None:
+                return task.snapshot()
+
+            task.completed_at = datetime.now(timezone.utc)
+            task.started_at = task.started_at or task.created_at
+            if error is not None:
+                task.status = "failed"
+                task.error = _safe_scrape_error(error)
+                for item in task.platforms.values():
+                    if item.status in {"queued", "running"}:
+                        item.failed_attempts += 1
+                        item.status = "failed"
+                        item.error = item.error or task.error
+            elif not task.platforms:
+                task.status = "failed"
+                task.error = "未配置任何采集平台"
+            else:
+                for item in task.platforms.values():
+                    if item.status in {"queued", "running"}:
+                        item.failed_attempts += 1
+                        item.status = "failed"
+                        item.error = item.error or "平台采集未完成"
+
+                statuses = {item.status for item in task.platforms.values()}
+                if statuses == {"completed"}:
+                    task.status = "completed"
+                elif statuses <= {"failed"}:
+                    task.status = "failed"
+                    task.error = task.error or "所有平台采集均失败"
+                else:
+                    task.status = "partial"
+            return task.snapshot()
 
 
 def _time_diff_minutes(t1: str, t2: str) -> int:
@@ -106,11 +332,35 @@ class PriceMonitorScheduler:
         """
         self.headless = headless
         self._scrape_warnings: List[str] = []  # 最近一次采集的平台级警告（如 Cookie 失效）
+        self._active_scraper_tasks: Set[asyncio.Task] = set()
+        self._immediate_scrapes = ImmediateScrapeStore(max_tasks=100)
 
-        # ── 解析爬虫平台列表 ──────────────────────────────────────────────
         platforms = [p.strip() for p in settings.scraper_type.split(",") if p.strip()]
+        self.scrapers = self._build_configured_scrapers(platforms)
 
-        # QunarScraper 需要额外传入 Cookie
+        self.analyzer = RuleBasedAnalyzer()
+
+        # ── 通知渠道 ──────────────────────────────────────────────────────
+        self.notifiers: List[Notifier] = build_notifiers(settings, enable_notifications)
+
+        self.scheduler = AsyncIOScheduler()
+        self._engine, self._SessionLocal = init_db(settings.database_url)
+
+        logger.info(
+            "PriceMonitorScheduler 已初始化（平台=%s，headless=%s，通知=%s）",
+            platforms, headless, enable_notifications,
+        )
+
+    def _build_configured_scrapers(
+        self,
+        platforms: Optional[List[str]] = None,
+    ) -> List[FlightScraper]:
+        """按当前 Settings 构建一套尚未启动浏览器的 scraper。"""
+        if platforms is None:
+            platforms = [
+                p.strip() for p in settings.scraper_type.split(",") if p.strip()
+            ]
+
         qunar_cookies = None
         if "qunar" in platforms and settings.qunar_cookies:
             try:
@@ -128,44 +378,107 @@ class PriceMonitorScheduler:
             except json.JSONDecodeError as exc:
                 logger.warning("Ctrip Cookie 解析失败：%s", exc)
 
-        # 按平台逐一构建（QunarScraper / CtripScraper 需特殊参数）
-        self.scrapers: List[FlightScraper] = []
+        # 同程公开搜索无需登录即可工作；配置 Cookie 后仍会注入浏览器，
+        # 可在平台风控收紧时提高请求稳定性。
+        tongcheng_cookies = None
+        if "tongcheng" in platforms and settings.tongcheng_cookies:
+            try:
+                tongcheng_cookies = json.loads(settings.tongcheng_cookies)
+                logger.info("已从配置加载 Tongcheng Cookie")
+            except json.JSONDecodeError as exc:
+                logger.warning("Tongcheng Cookie 解析失败：%s", exc)
+
+        built: List[FlightScraper] = []
         for platform in platforms:
+            common_kwargs = {
+                "headless": self.headless,
+                "timeout": settings.scraper_timeout,
+                "max_retries": settings.scraper_retry_count,
+                "max_results": settings.max_results_per_platform,
+            }
             if platform == "qunar":
                 scraper = ScraperRegistry.get(
                     "qunar",
-                    headless=headless,
                     cookies=qunar_cookies,
-                    max_results=20,
+                    **common_kwargs,
                 )
             elif platform == "ctrip":
                 scraper = ScraperRegistry.get(
                     "ctrip",
-                    headless=headless,
                     cookies=ctrip_cookies,  # None 时自动尝试 ctrip_cookies.json
+                    **common_kwargs,
+                )
+            elif platform == "tongcheng":
+                scraper = ScraperRegistry.get(
+                    "tongcheng",
+                    cookies=tongcheng_cookies,  # None 时自动尝试 tongcheng_cookies.json
+                    **common_kwargs,
                 )
             else:
-                scraper = ScraperRegistry.get(platform, headless=headless)
-            self.scrapers.append(scraper)
-            logger.info("已初始化爬虫：%s（headless=%s）", platform, headless)
+                scraper = ScraperRegistry.get(platform, **common_kwargs)
+            built.append(scraper)
+            logger.info("已初始化爬虫：%s（headless=%s）", platform, self.headless)
 
-        if not self.scrapers:
+        if not built:
             logger.warning("未配置任何爬虫平台，采集任务将无法执行")
+        return built
 
-        self.analyzer = RuleBasedAnalyzer()
+    async def reconfigure_scrapers(self) -> List[str]:
+        """让设置页的平台/超时/结果上限变更即时作用于运行中调度器。
 
-        # ── 通知渠道 ──────────────────────────────────────────────────────
-        self.notifiers: List[Notifier] = build_notifiers(settings, enable_notifications)
+        先完整构建新实例再原子替换列表；替换前已经开始的采集允许自然结束，
+        随后才关闭旧浏览器，避免保存设置时打断正在执行的一轮采集。
+        """
+        platforms = [p.strip() for p in settings.scraper_type.split(",") if p.strip()]
+        self.headless = settings.scraper_headless
+        new_scrapers = self._build_configured_scrapers(platforms)
+        old_scrapers = self.scrapers
+        active_before_swap = list(self._active_scraper_tasks)
+        self.scrapers = new_scrapers
 
-        self.scheduler = AsyncIOScheduler()
-        self._engine, self._SessionLocal = init_db(settings.database_url)
-
-        logger.info(
-            "PriceMonitorScheduler 已初始化（平台=%s，headless=%s，通知=%s）",
-            platforms, headless, enable_notifications,
+        if active_before_swap:
+            await asyncio.gather(*active_before_swap, return_exceptions=True)
+        await asyncio.gather(
+            *(scraper.close() for scraper in old_scrapers),
+            return_exceptions=True,
         )
+        logger.info("运行中爬虫已热重配：%s", platforms)
+        return platforms
 
-    async def scrape_route(self, route: Route) -> None:
+    def _immediate_scrape_store(self) -> ImmediateScrapeStore:
+        """Return the task store, lazily creating it for legacy/bare instances."""
+        store = getattr(self, "_immediate_scrapes", None)
+        if store is None:
+            store = ImmediateScrapeStore(max_tasks=100)
+            self._immediate_scrapes = store
+        return store
+
+    def create_scrape_task(self, route_id: int) -> Dict[str, Any]:
+        """Register a queued immediate scrape before submitting its coroutine."""
+        platforms = [_scraper_identity(scraper) for scraper in list(self.scrapers)]
+        return self._immediate_scrape_store().create(route_id, platforms)
+
+    def get_scrape_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Return one immutable task snapshot for the API polling endpoint."""
+        return self._immediate_scrape_store().get(task_id)
+
+    def get_latest_scrape_task(self, route_id: int) -> Optional[Dict[str, Any]]:
+        """Return the latest retained immediate task for a route."""
+        return self._immediate_scrape_store().latest_for_route(route_id)
+
+    def fail_scrape_task(
+        self,
+        task_id: str,
+        error: BaseException | str,
+    ) -> Optional[Dict[str, Any]]:
+        """Mark a task failed when it could not be submitted to the event loop."""
+        return self._immediate_scrape_store().finish(task_id, error)
+
+    async def scrape_route(
+        self,
+        route: Route,
+        task_id: Optional[str] = None,
+    ) -> None:
         """对单条路线执行多平台并行采集。
 
         并发调用所有已启用的爬虫，合并去重后存库，并在价格达标时触发告警。
@@ -173,17 +486,22 @@ class PriceMonitorScheduler:
 
         Args:
             route: 需要采集的路线对象。
+            task_id: API 立即采集任务 ID；定时任务不传，不产生状态记录。
         """
+        task_store = self._immediate_scrape_store() if task_id else None
+        if task_store is not None and task_id is not None:
+            task_store.mark_running(task_id)
         logger.info(
             "开始采集路线 %s：%s → %s（%s）",
             route.id, route.origin, route.destination, route.target_date,
         )
         self._scrape_warnings = []  # 清空上次采集的平台警告
 
+        task_error: Optional[BaseException] = None
         try:
             # ── 精准航班号监控模式 ─────────────────────────────────────────
             if getattr(route, "monitoring_mode", "route") == "flight":
-                await self._scrape_pinned_flights(route)
+                await self._scrape_pinned_flights(route, task_id=task_id)
                 return
 
             trip_type = getattr(route, "trip_type", "oneway")
@@ -197,7 +515,11 @@ class PriceMonitorScheduler:
             for scraper in self.scrapers:
                 if hasattr(scraper, "max_results"):
                     scraper.max_results = getattr(route, "max_results", 20)
-            flight_prices = await self._scrape_all_platforms(params, route=route)
+            flight_prices = await self._scrape_all_platforms(
+                params,
+                route=route,
+                task_id=task_id,
+            )
 
             if not flight_prices:
                 logger.warning(
@@ -363,7 +685,11 @@ class PriceMonitorScheduler:
                 session.close()
 
         except Exception as exc:
+            task_error = exc
             logger.error("路线 %s 采集失败：%s", route.id, exc, exc_info=True)
+        finally:
+            if task_store is not None and task_id is not None:
+                task_store.finish(task_id, task_error)
 
     @staticmethod
     def _hhmm_to_minutes(hhmm: str) -> int:
@@ -493,7 +819,11 @@ class PriceMonitorScheduler:
 
         return result
 
-    async def _scrape_pinned_flights(self, route: Route) -> None:
+    async def _scrape_pinned_flights(
+        self,
+        route: Route,
+        task_id: Optional[str] = None,
+    ) -> None:
         """精准航班号监控：搜索指定航班，记录价格并更新航班状态。
 
         对单程：仅搜索去程方向，匹配 outbound_flight_no。
@@ -501,6 +831,7 @@ class PriceMonitorScheduler:
 
         Args:
             route: 精准监控路线（monitoring_mode == 'flight'）。
+            task_id: 可选的 API 立即采集任务 ID。
         """
         trip_type = getattr(route, "trip_type", "oneway")
         outbound_no = getattr(route, "outbound_flight_no", None)
@@ -522,7 +853,10 @@ class PriceMonitorScheduler:
             departure_date=route.target_date,
             return_date=None,
         )
-        out_prices = await self._scrape_all_platforms(out_params)
+        out_prices = await self._scrape_all_platforms(
+            out_params,
+            task_id=task_id,
+        )
         outbound_fp, out_status = self._match_pinned_flight(out_prices, outbound_no, seat_class)
 
         # ── 往返程：回程搜索 ──────────────────────────────────────────────
@@ -535,7 +869,10 @@ class PriceMonitorScheduler:
                 departure_date=route.return_date,
                 return_date=None,
             )
-            in_prices = await self._scrape_all_platforms(in_params)
+            in_prices = await self._scrape_all_platforms(
+                in_params,
+                task_id=task_id,
+            )
             inbound_fp, in_status = self._match_pinned_flight(in_prices, inbound_no, seat_class)
 
         # ── 确定综合状态并写库 ────────────────────────────────────────────
@@ -753,7 +1090,10 @@ class PriceMonitorScheduler:
         return "available"
 
     async def _scrape_all_platforms(
-        self, params: SearchParams, route: Optional[Route] = None,
+        self,
+        params: SearchParams,
+        route: Optional[Route] = None,
+        task_id: Optional[str] = None,
     ) -> List[FlightPrice]:
         """并发调用所有爬虫并合并去重结果。
 
@@ -768,14 +1108,18 @@ class PriceMonitorScheduler:
             params: 搜索参数，return_date 非空时各爬虫自行处理往返逻辑。
             route:  路线对象。若提供则在 per-platform top-N 截断前先应用路线
                     的机场/时间段过滤，避免最便宜的 N 条全部被过滤器剔除。
+            task_id: API 立即采集任务 ID；用于记录平台级数量和错误。
 
         Returns:
             合并去重后的 FlightPrice 列表，按价格升序排列。
         """
-        return await self._scrape_oneway(params, route=route)
+        return await self._scrape_oneway(params, route=route, task_id=task_id)
 
     async def _scrape_oneway(
-        self, params: SearchParams, route: Optional[Route] = None,
+        self,
+        params: SearchParams,
+        route: Optional[Route] = None,
+        task_id: Optional[str] = None,
     ) -> List[FlightPrice]:
         """并发调用所有爬虫，合并去重搜索结果。
 
@@ -788,24 +1132,47 @@ class PriceMonitorScheduler:
         Returns:
             合并去重后的 FlightPrice 列表，按价格升序排列。
         """
-        if not self.scrapers:
+        scrapers = list(self.scrapers)
+        if not scrapers:
             return []
 
-        tasks = [s.search_flights(params) for s in self.scrapers]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        task_store = self._immediate_scrape_store() if task_id else None
+        if task_store is not None and task_id is not None:
+            for scraper in scrapers:
+                platform, display_name = _scraper_identity(scraper)
+                task_store.mark_platform_running(task_id, platform, display_name)
+
+        tasks = [asyncio.create_task(s.search_flights(params)) for s in scrapers]
+        self._active_scraper_tasks.update(tasks)
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._active_scraper_tasks.difference_update(tasks)
 
         all_prices: List[FlightPrice] = []
-        _PLATFORM_DISPLAY = {"QunarScraper": "去哪儿", "CtripScraper": "携程"}
-        for scraper, result in zip(self.scrapers, results):
-            platform = type(scraper).__name__
-            display = _PLATFORM_DISPLAY.get(platform, platform)
-            if isinstance(result, Exception):
-                logger.error("%s 采集失败：%s", platform, result)
-            elif isinstance(result, list):
-                if not result:
-                    self._scrape_warnings.append(
-                        f"{display} 未获取到数据，Cookie 可能已失效"
+        for scraper, result in zip(scrapers, results, strict=True):
+            class_name = type(scraper).__name__
+            platform, display = _scraper_identity(scraper)
+            if isinstance(result, BaseException):
+                logger.error("%s 采集失败：%s", class_name, result)
+                if task_store is not None and task_id is not None:
+                    task_store.mark_platform_result(
+                        task_id,
+                        platform,
+                        display,
+                        error=result,
                     )
+            elif isinstance(result, list):
+                warning: Optional[str] = None
+                raw_count = len(result)
+                if not result:
+                    hint = (
+                        "请检查是否暂无可售航班或触发同程风控"
+                        if class_name == "TongchengScraper"
+                        else "Cookie 可能已失效，或当前暂无可售航班"
+                    )
+                    warning = f"{display} 未获取到数据，{hint}"
+                    self._scrape_warnings.append(warning)
                 # ── 截断前先按路线过滤器筛一遍，避免最便宜的 N 条全被过滤掉 ──
                 # 路线有 dep_time_from=19:00 之类的约束时，"top N 最低价"里
                 # 可能全是清晨/凌晨便宜航班，filter 后一条不剩；先过滤再截
@@ -818,7 +1185,7 @@ class PriceMonitorScheduler:
                     if len(result) != before:
                         logger.info(
                             "%s 路线过滤（去程/回程按路线时间窗/机场筛）：%d → %d 条",
-                            platform, before, len(result),
+                            class_name, before, len(result),
                         )
 
                 # ── 每平台仅保留最低的前 N 条（方向感知） ────────────────────
@@ -840,29 +1207,55 @@ class PriceMonitorScheduler:
                     sorted(departures, key=lambda fp: fp.price)[:limit]
                     + sorted(returns, key=lambda fp: fp.price)[:limit]
                 )
+                if raw_count and not top:
+                    warning = (
+                        f"{display} 返回 {raw_count} 条结果，但均不符合路线筛选条件"
+                    )
                 if returns:
                     logger.info(
                         "%s 采集到 %d 条结果（去程 %d / 回程 %d），"
                         "保留最低 %d 条（去程+回程各最多 %d）",
-                        platform, len(result), len(departures), len(returns),
+                        class_name, len(result), len(departures), len(returns),
                         len(top), limit,
                     )
                 else:
                     logger.info(
                         "%s 采集到 %d 条结果，保留最低 %d 条",
-                        platform, len(result), len(top),
+                        class_name, len(result), len(top),
                     )
                 all_prices.extend(top)
+                if task_store is not None and task_id is not None:
+                    task_store.mark_platform_result(
+                        task_id,
+                        platform,
+                        display,
+                        count=len(top),
+                        warning=warning,
+                    )
+            else:
+                error = TypeError(
+                    f"{class_name}.search_flights 返回了不支持的类型 "
+                    f"{type(result).__name__}"
+                )
+                logger.error("%s", error)
+                if task_store is not None and task_id is not None:
+                    task_store.mark_platform_result(
+                        task_id,
+                        platform,
+                        display,
+                        error=error,
+                    )
 
-        # ── 去重：同平台同航班同舱位保留最低价，不同平台数据独立保留 ────────────
+        # ── 去重：同平台同日同方向同航班同舱位保留最低价 ──────────────────
         return self._deduplicate(all_prices)
 
     @staticmethod
     def _deduplicate(prices: List[FlightPrice]) -> List[FlightPrice]:
-        """合并去重：相同 (flight_no, seat_class, source) 组合仅保留价格最低的记录。
+        """合并去重：相同航班、舱位、来源、方向和日期仅保留最低价。
 
         不同平台（source）的数据独立保留，便于比价和来源溯源。
-        同一平台同一航班的重复采集结果则保留最低价。
+        同一航班号在不同日期或不同方向出现时也必须独立保留；仅同平台、
+        同方向、同日期的重复采集结果保留最低价。
 
         Args:
             prices: 原始价格列表（可能来自多个平台）。
@@ -870,9 +1263,15 @@ class PriceMonitorScheduler:
         Returns:
             去重后按价格升序排列的列表。
         """
-        best: Dict[Tuple[str, str, str], FlightPrice] = {}
+        best: Dict[Tuple[str, str, str, FlightDirection, date], FlightPrice] = {}
         for fp in prices:
-            key = (fp.flight_info.flight_no, fp.seat_class, fp.source)
+            key = (
+                fp.flight_info.flight_no,
+                fp.seat_class,
+                fp.source,
+                fp.flight_info.direction,
+                fp.flight_info.departure_date,
+            )
             if key not in best or fp.price < best[key].price:
                 best[key] = fp
         return sorted(best.values(), key=lambda fp: fp.price)
@@ -885,7 +1284,8 @@ class PriceMonitorScheduler:
         1. 爬虫已返回含 return_flight_info 的组合记录（携程 batchSearch、Qunar 国际往返 API）
            → 直接纳入结果集。
         2. 爬虫返回单独的 DEPARTURE + RETURN 记录（Qunar 国际往返降级搜索）
-           → 按 FlightDirection 分组，每个去程选同来源最便宜的回程配对，
+           → 按 FlightDirection 分组，每个去程选择同来源、同币种、同舱等的
+             最便宜回程配对，
            生成 return_flight_info 已填充、price 为两段之和的记录。
 
         两类结果合并后一起返回，不会因存在组合记录而丢弃单程待配对记录。
@@ -902,21 +1302,38 @@ class PriceMonitorScheduler:
 
         # 仅含单程记录（如 Qunar 国际往返降级搜索）：配对去程 + 回程
         single_leg = [fp for fp in prices if fp.return_flight_info is None]
-        outbound = [fp for fp in single_leg if fp.flight_info.direction == FlightDirection.DEPARTURE]
-        returns = [fp for fp in single_leg if fp.flight_info.direction == FlightDirection.RETURN]
+        outbound = [
+            fp
+            for fp in single_leg
+            if fp.flight_info.direction == FlightDirection.DEPARTURE
+        ]
+        returns = [
+            fp
+            for fp in single_leg
+            if fp.flight_info.direction == FlightDirection.RETURN
+        ]
 
         newly_combined: List[FlightPrice] = []
         if outbound and returns:
-            # 为每个去程找同来源最便宜的回程进行配对；若无同来源则跨来源取最低价
-            cheapest_return_by_source: Dict[str, FlightPrice] = {}
+            # 为每个去程找同来源最便宜的回程。不同平台的票价口径、税费和
+            # 可售性不可混用，因此无同来源回程时直接跳过该去程。
+            cheapest_return_by_scope: Dict[Tuple[str, str, str], FlightPrice] = {}
             for fp in returns:
-                src = fp.source
-                if src not in cheapest_return_by_source or fp.price < cheapest_return_by_source[src].price:
-                    cheapest_return_by_source[src] = fp
-            cheapest_return_global = min(returns, key=lambda fp: fp.price)
-
+                scope = (fp.source, fp.currency, fp.seat_class)
+                if (
+                    scope not in cheapest_return_by_scope
+                    or fp.price < cheapest_return_by_scope[scope].price
+                ):
+                    cheapest_return_by_scope[scope] = fp
             for out_fp in outbound:
-                ret_fp = cheapest_return_by_source.get(out_fp.source, cheapest_return_global)
+                scope = (out_fp.source, out_fp.currency, out_fp.seat_class)
+                ret_fp = cheapest_return_by_scope.get(scope)
+                if ret_fp is None:
+                    logger.warning(
+                        "往返程配对跳过：%s 无同币种、同舱等回程（%s/%s）",
+                        out_fp.source, out_fp.currency, out_fp.seat_class,
+                    )
+                    continue
                 seats = None
                 if out_fp.available_seats is not None and ret_fp.available_seats is not None:
                     seats = min(out_fp.available_seats, ret_fp.available_seats)

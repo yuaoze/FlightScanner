@@ -23,11 +23,19 @@ from flightscanner.interfaces import (
 from flightscanner.scrapers import ScraperRegistry
 from flightscanner.scrapers.ctrip_scraper import CtripScraper
 from flightscanner.scrapers.qunar_scraper import QunarScraper
+from flightscanner.scrapers.tongcheng_scraper import TongchengScraper
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _make_flight_price(flight_no: str, seat_class: str, price: float, source: str = "test") -> FlightPrice:
+def _make_flight_price(
+    flight_no: str,
+    seat_class: str,
+    price: float,
+    source: str = "test",
+    direction: FlightDirection = FlightDirection.DEPARTURE,
+    departure_date: date | None = None,
+) -> FlightPrice:
     """Create a minimal FlightPrice for test purposes."""
     info = FlightInfo(
         flight_no=flight_no,
@@ -36,8 +44,8 @@ def _make_flight_price(flight_no: str, seat_class: str, price: float, source: st
         arrival_city="上海",
         departure_time="08:00",
         arrival_time="10:00",
-        departure_date=date.today(),
-        direction=FlightDirection.DEPARTURE,
+        departure_date=departure_date or date.today(),
+        direction=direction,
     )
     return FlightPrice(
         flight_info=info,
@@ -62,6 +70,7 @@ class TestScraperRegistry:
         assert isinstance(platforms, list)
         assert "ctrip" in platforms
         assert "qunar" in platforms
+        assert "tongcheng" in platforms
         assert platforms == sorted(platforms)
 
     def test_get_ctrip_returns_ctrip_scraper(self):
@@ -78,6 +87,14 @@ class TestScraperRegistry:
 
         assert isinstance(scraper, QunarScraper)
         assert scraper.headless is False
+
+    def test_get_tongcheng_returns_tongcheng_scraper(self):
+        """get('tongcheng') should return a TongchengScraper instance."""
+        scraper = ScraperRegistry.get("tongcheng", headless=True, timeout=5000)
+
+        assert isinstance(scraper, TongchengScraper)
+        assert scraper.headless is True
+        assert scraper.timeout == 5000
 
     def test_get_is_case_insensitive(self):
         """get() should handle uppercase platform names."""
@@ -231,6 +248,50 @@ class TestDeduplicateLogic:
         assert [fp.price for fp in result] == [
             Decimal("400"), Decimal("600"), Decimal("800")
         ]
+
+    def test_deduplicate_preserves_same_flight_in_both_directions(self):
+        """A reused flight number on outbound/return legs must not collapse."""
+        deduplicate = self._get_deduplicate()
+        prices = [
+            _make_flight_price(
+                "MU5101", "经济舱", 500, "tongcheng",
+                direction=FlightDirection.DEPARTURE,
+            ),
+            _make_flight_price(
+                "MU5101", "经济舱", 480, "tongcheng",
+                direction=FlightDirection.RETURN,
+            ),
+        ]
+
+        result = deduplicate(prices)
+
+        assert len(result) == 2
+        assert {fp.flight_info.direction for fp in result} == {
+            FlightDirection.DEPARTURE,
+            FlightDirection.RETURN,
+        }
+
+    def test_deduplicate_preserves_same_flight_on_different_dates(self):
+        """Daily occurrences of the same flight number are separate inventory."""
+        deduplicate = self._get_deduplicate()
+        prices = [
+            _make_flight_price(
+                "MU5101", "经济舱", 500, "tongcheng",
+                departure_date=date(2026, 9, 10),
+            ),
+            _make_flight_price(
+                "MU5101", "经济舱", 480, "tongcheng",
+                departure_date=date(2026, 9, 11),
+            ),
+        ]
+
+        result = deduplicate(prices)
+
+        assert len(result) == 2
+        assert {fp.flight_info.departure_date for fp in result} == {
+            date(2026, 9, 10),
+            date(2026, 9, 11),
+        }
 
     def test_deduplicate_multi_source_dedup_scenario(self):
         """Simulate real multi-source scenario: Qunar + Ctrip same flights.

@@ -9,7 +9,9 @@
     scraper = ScraperRegistry.get("qunar", headless=True)
 
     # 批量构建多个爬虫（多源聚合场景）
-    scrapers = ScraperRegistry.build_enabled(["qunar", "ctrip"], headless=True)
+    scrapers = ScraperRegistry.build_enabled(
+        ["qunar", "ctrip", "tongcheng"], headless=True
+    )
 """
 
 import logging
@@ -45,10 +47,12 @@ class ScraperRegistry:
         if cls._registry is None:
             from flightscanner.scrapers.ctrip_scraper import CtripScraper
             from flightscanner.scrapers.qunar_scraper import QunarScraper
+            from flightscanner.scrapers.tongcheng_scraper import TongchengScraper
 
             cls._registry = {
                 "qunar": QunarScraper,
                 "ctrip": CtripScraper,
+                "tongcheng": TongchengScraper,
             }
         return cls._registry
 
@@ -66,7 +70,8 @@ class ScraperRegistry:
         """按平台名实例化并返回对应爬虫。
 
         Args:
-            platform: 平台名称（不区分大小写），如 ``"qunar"``、``"ctrip"``。
+            platform: 平台名称（不区分大小写），如 ``"qunar"``、``"ctrip"``、
+                ``"tongcheng"``。
             **kwargs: 透传给爬虫构造函数的关键字参数，例如
                 ``headless=True``、``timeout=30000``。
 
@@ -99,7 +104,8 @@ class ScraperRegistry:
         列表为空时直接返回空列表，不会抛出异常。
 
         Args:
-            platforms: 需要启用的平台名称列表，例如 ``["qunar", "ctrip"]``。
+            platforms: 需要启用的平台名称列表，例如
+                ``["qunar", "ctrip", "tongcheng"]``。
             **kwargs: 透传给所有爬虫构造函数的关键字参数。
 
         Returns:

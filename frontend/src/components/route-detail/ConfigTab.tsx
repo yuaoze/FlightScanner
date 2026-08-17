@@ -2,7 +2,12 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useUpdateRoute, useTriggerScrape, useDeleteRoute } from '../../hooks/useRouteDetail';
 import type { UpdateRouteBody } from '../../hooks/useRouteDetail';
-import type { RouteDetailResponse } from '../../types';
+import type {
+  RouteDetailResponse,
+  ScrapePlatformResult,
+  ScrapeTaskStatus,
+  TriggerScrapeResponse,
+} from '../../types';
 
 interface Props {
   routeId: number;
@@ -10,6 +15,95 @@ interface Props {
 }
 
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+const SCRAPE_STATUS_LABELS: Record<ScrapeTaskStatus, string> = {
+  queued: '排队中',
+  running: '采集中',
+  completed: '已完成',
+  partial: '部分完成',
+  failed: '失败',
+};
+
+const SCRAPE_STATUS_STYLES: Record<ScrapeTaskStatus, string> = {
+  queued: 'bg-gray-100 text-gray-600',
+  running: 'bg-blue-50 text-blue-700',
+  completed: 'bg-green-50 text-green-700',
+  partial: 'bg-amber-50 text-amber-700',
+  failed: 'bg-red-50 text-red-700',
+};
+
+function ScrapeStatusBadge({ status }: { status: ScrapeTaskStatus }) {
+  return (
+    <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${SCRAPE_STATUS_STYLES[status]}`}>
+      {SCRAPE_STATUS_LABELS[status]}
+    </span>
+  );
+}
+
+function ScrapePlatformRow({ result }: { result: ScrapePlatformResult }) {
+  return (
+    <div className="rounded-lg border border-gray-100 bg-white px-3 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate text-xs font-medium text-gray-700">{result.display_name}</span>
+          <ScrapeStatusBadge status={result.status} />
+        </div>
+        <span className="shrink-0 text-xs tabular-nums text-gray-500">{result.count} 条</span>
+      </div>
+      {result.warning && <p className="mt-1 text-[11px] leading-4 text-amber-700">{result.warning}</p>}
+      {result.error && <p className="mt-1 break-words text-[11px] leading-4 text-red-600">{result.error}</p>}
+    </div>
+  );
+}
+
+function ScrapeTaskPanel({ task }: { task: TriggerScrapeResponse }) {
+  const summaryStyle =
+    task.status === 'failed'
+      ? 'border-red-100 bg-red-50/60 text-red-700'
+      : task.status === 'partial'
+        ? 'border-amber-100 bg-amber-50/60 text-amber-700'
+        : task.status === 'completed'
+          ? 'border-green-100 bg-green-50/60 text-green-700'
+          : 'border-blue-100 bg-blue-50/60 text-blue-700';
+
+  const summary =
+    task.status === 'completed'
+      ? `采集完成，共获取 ${task.total_count} 条报价`
+      : task.status === 'partial'
+        ? `部分平台采集失败，共获取 ${task.total_count} 条报价`
+        : task.status === 'failed'
+          ? task.error || task.message || '采集任务失败'
+          : task.message || (task.status === 'queued' ? '采集任务已排队' : '正在采集各平台价格');
+
+  return (
+    <div className={`rounded-lg border p-3 ${summaryStyle}`}>
+      <div className="flex items-start justify-between gap-3">
+        <p className="text-xs font-medium leading-5">{summary}</p>
+        <ScrapeStatusBadge status={task.status} />
+      </div>
+      {task.platforms.length > 0 && (
+        <div className="mt-2 space-y-2">
+          {task.platforms.map((result) => (
+            <ScrapePlatformRow key={result.platform} result={result} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function getMutationErrorMessage(error: unknown): string {
+  const apiError = error as {
+    message?: string;
+    response?: { data?: { detail?: string; message?: string } };
+  };
+  return (
+    apiError.response?.data?.detail ||
+    apiError.response?.data?.message ||
+    apiError.message ||
+    '采集任务提交或状态查询失败'
+  );
+}
 
 function TimeInput({
   value,
@@ -282,10 +376,19 @@ export function ConfigTab({ routeId, route }: Props) {
             disabled={scrapeMutation.isPending}
             className="w-full px-4 py-2 bg-white text-gray-700 text-sm rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors disabled:opacity-50 font-medium"
           >
-            {scrapeMutation.isPending ? '采集中...' : '立即采集'}
+            {scrapeMutation.isPending
+              ? scrapeMutation.task?.status === 'queued'
+                ? '任务排队中...'
+                : scrapeMutation.task?.status === 'running'
+                  ? '正在采集...'
+                  : '正在提交...'
+              : '立即采集'}
           </button>
-          {scrapeMutation.isSuccess && (
-            <p className="text-xs text-green-600 text-center">采集任务已触发</p>
+          {scrapeMutation.task && <ScrapeTaskPanel task={scrapeMutation.task} />}
+          {scrapeMutation.isError && (
+            <p className="text-xs text-red-600 text-center">
+              {getMutationErrorMessage(scrapeMutation.error)}
+            </p>
           )}
 
           {!showDeleteConfirm ? (

@@ -25,7 +25,7 @@ FlightScanner 是一套面向个人用户的机票价格智能监控系统。它
 ## 核心功能
 
 - **路线监控 + 精准航班监控**：支持按航线监控，也支持按航班号固定监控去程/回程与舱位
-- **多平台采集与定时调度**：基于 Playwright + APScheduler，按路线独立间隔自动采集价格
+- **多平台采集与定时调度**：基于 Playwright + APScheduler，支持去哪儿、携程、同程旅行；同程覆盖国内、港澳台和国际单程/往返，按路线独立间隔自动采集
 - **价格历史与 AI 决策**：保存历史票价，结合规则分析与 DeepSeek 输出趋势判断与建议操作
 - **现代化 Web 控制台**：React + FastAPI 前后端分离，支持监控总览、路线详情、提醒记录、设置中心、周末雷达
 - **多渠道通知**：支持 Email、Telegram、飞书、企业微信等提醒方式
@@ -41,7 +41,7 @@ React + Vite 前端
 FastAPI API / 调度入口
         │
         ├── PriceMonitorScheduler（定时采集 / 通知 / AI 预测）
-        ├── Playwright Scrapers（Qunar / Ctrip）
+        ├── Playwright Scrapers（Qunar / Ctrip / Tongcheng）
         ├── Analyzers（规则分析 / DeepSeek）
         └── Notifiers（Email / Telegram / 飞书 / 企业微信）
         │
@@ -89,9 +89,12 @@ cp .env.example .env
 ```bash
 python scripts/qunar_login.py
 python scripts/ctrip_login.py
+python scripts/tongcheng_login.py
 ```
 
 也可以先启动后端后，在 `/settings` 页通过 Cookie 管理卡片扫码刷新。
+同程旅行通过其官方微信 OAuth 登录页刷新 Cookie，请使用微信“扫一扫”
+（不是同程旅行 App）；同程默认也可匿名采集。
 
 ### 4. 启动后端 API
 
@@ -137,7 +140,7 @@ pytest tests/test_qunar_scraper.py -q
 ```ini
 DATABASE_URL=sqlite:///flightscanner.db
 
-SCRAPER_TYPE=qunar,ctrip
+SCRAPER_TYPE=qunar,ctrip,tongcheng
 SCRAPER_HEADLESS=true
 SCRAPER_TIMEOUT=30000
 SCRAPER_RETRY_COUNT=3
@@ -164,18 +167,27 @@ WECOM_WEBHOOK_URL=
 
 - `python-dotenv` 不会自动忽略值后面的内联 `# 注释`，注释建议单独占一行
 - 通知渠道无需全部填写，但至少配置一个才有告警意义
-- `SCRAPER_TYPE` 支持 `qunar`、`ctrip` 或逗号组合
+- `SCRAPER_TYPE` 支持 `qunar`、`ctrip`、`tongcheng` 或逗号组合
 
 ### Cookie 文件
 
 - `qunar_cookies.json`：去哪儿登录 Cookie
 - `ctrip_cookies.json`：携程登录 Cookie
+- `tongcheng_cookies.json`：同程旅行 Cookie（可选；默认可匿名采集，风控时建议通过官方微信 OAuth 扫码刷新）
 
-推荐通过扫码脚本生成：
+推荐通过扫码脚本生成；同程脚本展示的是官方微信登录二维码，请使用微信“扫一扫”：
 
 ```bash
 python scripts/qunar_login.py
 python scripts/ctrip_login.py
+python scripts/tongcheng_login.py
 ```
 
 Cookie 过期后重新刷新即可。
+
+### 同程国际机票口径
+
+- 国内航线走同程国内机票页；港澳台和海外航线自动切换到官方国际机票页。
+- 国际列表只记录成人经济舱的公开含税价，不把未税票面价、会员价或券后价混入趋势。
+- 国际往返会读取官方 RT 产品详情中的真实去程、回程和整套含税价，不使用两个独立单程最低价相加。
+- “立即采集”会显示各平台的结果数量、告警和错误；同程风控、登录失效或接口变化不会再伪装成正常的 0 条结果。

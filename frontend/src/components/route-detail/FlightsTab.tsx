@@ -10,23 +10,27 @@ interface Props {
 const SOURCE_LABELS: Record<string, string> = {
   qunar: '去哪儿',
   ctrip: '携程',
+  tongcheng: '同程旅行',
   trip: 'Trip',
 };
 
 const SOURCE_COLORS: Record<string, string> = {
   qunar: 'bg-amber-50 text-amber-700',
   ctrip: 'bg-blue-50 text-blue-700',
+  tongcheng: 'bg-violet-50 text-violet-700',
   trip: 'bg-green-50 text-green-700',
 };
 
 export function FlightsTab({ routeId, route }: Props) {
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
+  const [selectedSource, setSelectedSource] = useState<string | null>(null);
   const [topN, setTopN] = useState(10);
 
   const { data: batchesData, isLoading: batchesLoading } = useRouteBatches(routeId, 30);
   const { data: flightsData, isLoading: flightsLoading } = useRouteFlights(
     routeId,
     selectedBatchId,
+    selectedSource,
     topN
   );
 
@@ -40,14 +44,27 @@ export function FlightsTab({ routeId, route }: Props) {
           <div>
             <label className="text-xs text-gray-500 block mb-1.5">采集批次</label>
             <select
-              value={selectedBatchId ?? ''}
-              onChange={(e) => setSelectedBatchId(e.target.value || null)}
+              value={
+                selectedBatchId && selectedSource
+                  ? `${selectedBatchId}::${selectedSource}`
+                  : ''
+              }
+              onChange={(e) => {
+                const selected = batches.find(
+                  (batch) => `${batch.batch_id}::${batch.source}` === e.target.value,
+                );
+                setSelectedBatchId(selected?.batch_id ?? null);
+                setSelectedSource(selected?.source ?? null);
+              }}
               className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-100"
               disabled={batchesLoading}
             >
               <option value="">最新批次</option>
               {batches.map((b) => (
-                <option key={`${b.batch_id}-${b.source}`} value={b.batch_id}>
+                <option
+                  key={`${b.batch_id}-${b.source}`}
+                  value={`${b.batch_id}::${b.source}`}
+                >
                   {b.scraped_at} · {SOURCE_LABELS[b.source] || b.source} · ¥{Math.round(b.min_price)}起 ({b.flight_count}班)
                 </option>
               ))}

@@ -156,6 +156,30 @@ export interface RouteFlightsResponse {
   flights: FlightListItem[];
 }
 
+export type ScrapeTaskStatus = 'queued' | 'running' | 'completed' | 'partial' | 'failed';
+
+export interface ScrapePlatformResult {
+  platform: string;
+  display_name: string;
+  status: ScrapeTaskStatus;
+  count: number;
+  error: string | null;
+  warning: string | null;
+}
+
+export interface TriggerScrapeResponse {
+  task_id: string | null;
+  route_id: number;
+  message: string;
+  status: ScrapeTaskStatus;
+  platforms: ScrapePlatformResult[];
+  total_count: number;
+  error: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
 // ── Purchase tracking types（v2.2.0 买入闭环）──────────────────────────────
 
 export type PlanStatus = 'pending' | 'triggered' | 'converted' | 'cancelled' | 'expired';

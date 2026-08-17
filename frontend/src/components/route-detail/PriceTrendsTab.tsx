@@ -12,23 +12,25 @@ import {
 } from 'recharts';
 import { useRouteHistory, useRouteCalendar } from '../../hooks/useRouteDetail';
 import { formatPrice } from '../../lib/utils';
+import { buildPriceChartSeries } from '../../lib/priceTrend';
+import type { PriceGranularity } from '../../lib/priceTrend';
 
 interface Props {
   routeId: number;
   targetPrice: number;
 }
 
-type Granularity = 'hour' | 'day';
-
 const SOURCE_COLORS: Record<string, string> = {
   qunar: '#F59E0B',
   ctrip: '#3B82F6',
+  tongcheng: '#8B5CF6',
   trip: '#22C55E',
 };
 
 const SOURCE_LABELS: Record<string, string> = {
   qunar: '去哪儿',
   ctrip: '携程',
+  tongcheng: '同程旅行',
   trip: 'Trip',
 };
 
@@ -42,7 +44,7 @@ function StatCard({ value, label }: { value: string; label: string }) {
 }
 
 export function PriceTrendsTab({ routeId, targetPrice }: Props) {
-  const [granularity, setGranularity] = useState<Granularity>('hour');
+  const [granularity, setGranularity] = useState<PriceGranularity>('hour');
   const { data: history, isLoading } = useRouteHistory(routeId, 30);
 
   const today = new Date();
@@ -57,25 +59,9 @@ export function PriceTrendsTab({ routeId, targetPrice }: Props) {
     );
   }
 
-  // Bucket points by (timestamp_key, source) → min price
-  const sources = Array.from(new Set(history.points.map((p) => p.source)));
-  const bucketMap = new Map<string, Record<string, number | string>>();
-
-  for (const pt of history.points) {
-    const key =
-      granularity === 'hour'
-        ? pt.date.slice(5, 16).replace('T', ' ') // MM-DD HH:MM
-        : pt.date.slice(5, 10); // MM-DD
-    const existing = bucketMap.get(key) || { time: key };
-    const prev = existing[pt.source];
-    if (typeof prev !== 'number' || pt.price < prev) {
-      existing[pt.source] = pt.price;
-    }
-    bucketMap.set(key, existing);
-  }
-
-  const chartData = Array.from(bucketMap.values()).sort((a, b) =>
-    String(a.time).localeCompare(String(b.time))
+  const { sources, chartData, pointCounts } = buildPriceChartSeries(
+    history.points,
+    granularity,
   );
 
   // Aggregate stats across all points
@@ -156,7 +142,15 @@ export function PriceTrendsTab({ routeId, targetPrice }: Props) {
                   dataKey={src}
                   stroke={SOURCE_COLORS[src] || '#6B7280'}
                   strokeWidth={2}
-                  dot={false}
+                  dot={
+                    pointCounts[src] === 1
+                      ? {
+                          r: 4,
+                          fill: SOURCE_COLORS[src] || '#6B7280',
+                          strokeWidth: 2,
+                        }
+                      : false
+                  }
                   connectNulls
                   name={src}
                 />

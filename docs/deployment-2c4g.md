@@ -173,7 +173,7 @@ DATABASE_URL=sqlite:////var/lib/flightscanner/flightscanner.db
 
 # 必须 headless（服务器无图形）
 SCRAPER_HEADLESS=true
-SCRAPER_TYPE=qunar,ctrip
+SCRAPER_TYPE=qunar,ctrip,tongcheng
 SCRAPER_TIMEOUT=30000
 MAX_RESULTS_PER_PLATFORM=15      # 4G 内存建议从 15 起，跑稳后再调
 
@@ -349,10 +349,11 @@ sudo certbot renew --dry-run
 
 服务跑起来后访问 `https://your-domain.com/settings`：
 
-1. **「Cookie 管理」** 卡片 → 点「**扫码刷新 去哪儿**」
+1. **「Cookie 管理」** 卡片 → 点对应平台的「**扫码刷新**」
 2. 服务端启动 headless Chromium → 抓取登录二维码 → 通过 base64 返回前端
-3. 用手机扫描浏览器上显示的二维码 → 几秒后服务端拿到 Cookie 落库
-4. **携程同样操作一次**
+3. 按页面提示扫码；**同程旅行使用官方微信 OAuth 登录，请用微信“扫一扫”**
+   （不是同程旅行 App）
+4. 登录确认后，服务端获取 Cookie 并落库；同程默认也可匿名采集
 
 或本地获取 Cookie 后通过「手动上传」粘贴：
 
@@ -494,7 +495,7 @@ ssh flightscanner@your-server
 | **浏览器访问公网 IP 超时** | ① `sudo ufw status` 应有 80/tcp + 443/tcp ALLOW（**没有就 `sudo ufw allow 80/tcp && sudo ufw allow 443/tcp && sudo ufw reload`**）；② 云控制台安全组入方向开 80/443；③ 大陆 ECS 域名未备案时 80/443 可能被运营商拦，临时改 8080 |
 | `https://your-domain.com` 502 Bad Gateway | `sudo systemctl status flightscanner-api`，看 journalctl |
 | API 响应正常但前端白屏 | nginx 配置 `try_files` 是否正确；`frontend/dist/` 是否存在 |
-| 采集 0 条 / 403 | Cookie 失效 → 设置页扫码刷新 |
+| 采集 0 条 / 403 | 先在路线详情查看“立即采集”的平台级结果；同程会明确区分正常无票、登录失效和国际接口风控。需要刷新登录时，请使用微信扫描官方 OAuth 二维码（不是同程旅行 App），扫码服务暂不可用时可手动上传 Cookie |
 | 内存爆 / 服务重启循环 | swap 是否启用；`MAX_RESULTS_PER_PLATFORM` 减小到 8-10 |
 | 时区显示错（UTC 而非 CST） | `timedatectl` 检查；服务端代码已用 `time_utils.fmt_cst` |
 | 数据库锁死 (database is locked) | 检查是否有遗留 streamlit 进程；`fuser /var/lib/flightscanner/flightscanner.db` |

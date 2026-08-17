@@ -1,6 +1,6 @@
 """Cookie 管理 UI 组件。
 
-提供去哪儿 / 携程 Cookie 状态查看和扫码刷新功能。
+提供去哪儿 / 携程 / 同程旅行 Cookie 状态查看和扫码刷新。
 
 架构说明：
 - `get_login_manager()` — @st.cache_resource 单例，整个进程共享
@@ -26,20 +26,25 @@ _project_root = Path(__file__).resolve().parent.parent.parent
 _COOKIE_FILES: dict[str, Path] = {
     "qunar": _project_root / "qunar_cookies.json",
     "ctrip": _project_root / "ctrip_cookies.json",
+    "tongcheng": _project_root / "tongcheng_cookies.json",
 }
 
 _PLATFORM_NAMES: dict[str, str] = {
     "qunar": "去哪儿",
     "ctrip": "携程",
+    "tongcheng": "同程旅行",
 }
 
 # 与各平台 login 脚本中的检测集合保持一致
 _KEY_COOKIES: dict[str, set[str]] = {
     "qunar": {"QN42", "JSESSIONID", "ctt_june"},
     "ctrip": {"ibu_uid", "UBT_VID", "uid", "suid"},
+    # 同程公开列表无需固定登录 Cookie；文件中有可用条目即可。
+    "tongcheng": set(),
 }
 
-_LOGIN_TIMEOUT = 120  # 秒
+_LOGIN_TIMEOUT = 120  # 去哪儿 / 携程
+_LOGIN_TIMEOUTS = {"qunar": 120, "ctrip": 120, "tongcheng": 300}
 
 
 # ── 共享状态 ──────────────────────────────────────────────────────────────────
@@ -67,6 +72,7 @@ class CookieLoginManager:
         self._states: dict[str, CookieLoginState] = {
             "qunar": CookieLoginState(),
             "ctrip": CookieLoginState(),
+            "tongcheng": CookieLoginState(),
         }
 
     def get_state(self, platform: str) -> CookieLoginState:
@@ -93,7 +99,11 @@ class CookieLoginManager:
         def _on_qr_ready(png_path: str) -> None:
             state.qr_path = png_path
             state.status = "qr_ready"
-            state.message = "请用 APP 扫描二维码"
+            state.message = (
+                "请使用微信扫描官方 OAuth 二维码"
+                if platform == "tongcheng"
+                else "请用 APP 扫描二维码"
+            )
 
         def _thread_target() -> None:
             try:
@@ -107,11 +117,20 @@ class CookieLoginManager:
 
                 if platform == "qunar":
                     from scripts.qunar_login import qr_login
-                else:
+                elif platform == "ctrip":
                     from scripts.ctrip_login import qr_login  # type: ignore[assignment]
+                elif platform == "tongcheng":
+                    from scripts.tongcheng_login import qr_login  # type: ignore[assignment]
+                else:
+                    raise ValueError(f"不支持的平台：{platform}")
 
                 success = asyncio.run(
-                    qr_login(headless=True, on_qr_ready=_on_qr_ready)
+                    qr_login(
+                        headless=True,
+                        output_path=str(_COOKIE_FILES[platform]),
+                        timeout=_LOGIN_TIMEOUTS[platform],
+                        on_qr_ready=_on_qr_ready,
+                    )
                 )
                 state.success = success
                 state.status = "success" if success else "error"
@@ -147,7 +166,8 @@ def _get_cookie_info(platform: str) -> dict:
 
     # 过滤空值 Cookie 后与关键集合求交
     cookie_names = {c["name"] for c in cookies if c.get("value")}
-    has_key = bool(_KEY_COOKIES[platform] & cookie_names)
+    key_cookies = _KEY_COOKIES[platform]
+    has_key = bool(cookie_names) if not key_cookies else bool(key_cookies & cookie_names)
 
     return {
         "exists": True,
@@ -243,15 +263,21 @@ def _cookie_dialog_fragment() -> None:
 
         with col_info:
             st.write(f"**状态：** {state.message or '正在启动浏览器…'}")
+            timeout_seconds = _LOGIN_TIMEOUTS[active]
             st.progress(
-                min(elapsed / _LOGIN_TIMEOUT, 1.0),
-                text=f"已等待 {int(elapsed)}s / {_LOGIN_TIMEOUT}s",
+                min(elapsed / timeout_seconds, 1.0),
+                text=f"已等待 {int(elapsed)}s / {timeout_seconds}s",
             )
-            st.caption("打开手机 APP，扫描左侧二维码完成登录")
-            if st.button("取消", key="qr_cancel"):
-                manager.reset(active)
+            if active == "tongcheng":
+                st.caption(
+                    "请使用微信“扫一扫”扫描左侧官方 OAuth 二维码"
+                    "（不是同程旅行 App）"
+                )
+            else:
+                st.caption("打开手机 APP，扫描左侧二维码完成登录")
+            if st.button("关闭（登录继续）", key="qr_cancel"):
                 st.session_state.pop("cookie_mgr_active", None)
-                st.rerun(scope="fragment")  # 返回状态视图，不关闭对话框
+                st.rerun()  # 登录线程继续运行，重新打开可查看进度
 
         # 轮询：每 2s 刷新一次片段（不影响对话框外的页面）
         time.sleep(2)
@@ -259,9 +285,15 @@ def _cookie_dialog_fragment() -> None:
 
     # ── 默认：显示 Cookie 状态面板 ───────────────────────────────────
     else:
-        tab_qunar, tab_ctrip = st.tabs(["去哪儿", "携程"])
+        tab_qunar, tab_ctrip, tab_tongcheng = st.tabs(
+            ["去哪儿", "携程", "同程旅行"]
+        )
 
-        for tab, platform in ((tab_qunar, "qunar"), (tab_ctrip, "ctrip")):
+        for tab, platform in (
+            (tab_qunar, "qunar"),
+            (tab_ctrip, "ctrip"),
+            (tab_tongcheng, "tongcheng"),
+        ):
             with tab:
                 info = _get_cookie_info(platform)
                 platform_name = _PLATFORM_NAMES[platform]
@@ -282,13 +314,19 @@ def _cookie_dialog_fragment() -> None:
 
                 st.divider()
 
+                running = manager.is_running(platform)
                 if st.button(
-                    f"刷新 {platform_name} Cookie",
+                    (
+                        f"查看 {platform_name} 扫码进度"
+                        if running
+                        else f"扫码刷新 {platform_name} Cookie"
+                    ),
                     key=f"refresh_{platform}",
                     type="primary",
                     use_container_width=True,
                 ):
-                    manager.start_login(platform)
+                    if not running:
+                        manager.start_login(platform)
                     st.session_state["cookie_mgr_active"] = platform
                     st.rerun(scope="fragment")  # 片段刷新，对话框保持开启
 

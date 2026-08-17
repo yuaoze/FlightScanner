@@ -68,6 +68,34 @@ class PriceHistoryResponse(BaseModel):
     points: List[PriceHistoryPoint]
 
 
+# ── Immediate scrape task schemas ─────────────────────────────────────────
+
+
+ScrapeTaskStatus = Literal["queued", "running", "completed", "partial", "failed"]
+
+
+class ScrapePlatformResult(BaseModel):
+    platform: str
+    display_name: str
+    status: ScrapeTaskStatus
+    count: int = Field(default=0, ge=0)
+    error: Optional[str] = None
+    warning: Optional[str] = None
+
+
+class ScrapeTaskResponse(BaseModel):
+    task_id: Optional[str] = None
+    route_id: int
+    status: ScrapeTaskStatus
+    platforms: List[ScrapePlatformResult] = Field(default_factory=list)
+    total_count: int = Field(default=0, ge=0)
+    error: Optional[str] = None
+    message: str
+    created_at: Optional[AwareDatetime] = None
+    started_at: Optional[AwareDatetime] = None
+    completed_at: Optional[AwareDatetime] = None
+
+
 # ── Route Detail schemas ──────────────────────────────────────────────────
 
 
