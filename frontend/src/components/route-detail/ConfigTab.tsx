@@ -8,6 +8,7 @@ import type {
   ScrapeTaskStatus,
   TriggerScrapeResponse,
 } from '../../types';
+import { ArrivalDayLimitSelect } from '../ArrivalDayLimitSelect';
 
 interface Props {
   routeId: number;
@@ -139,7 +140,7 @@ function TimeRow({
   onToChange: (v: string) => void;
 }) {
   return (
-    <div className="grid grid-cols-[80px_1fr_auto_1fr] items-center gap-2">
+    <div className="grid grid-cols-1 items-center gap-2 sm:grid-cols-[80px_1fr_auto_1fr]">
       <span className="text-xs text-gray-500">{label}</span>
       <TimeInput value={fromValue} onChange={onFromChange} placeholder="HH:MM" />
       <span className="text-xs text-gray-400">至</span>
@@ -167,6 +168,12 @@ export function ConfigTab({ routeId, route }: Props) {
   const [retDepTo, setRetDepTo] = useState(route.ret_dep_time_to ?? '');
   const [retArrFrom, setRetArrFrom] = useState(route.ret_arr_time_from ?? '');
   const [retArrTo, setRetArrTo] = useState(route.ret_arr_time_to ?? '');
+  const [maxArrivalDayOffset, setMaxArrivalDayOffset] = useState(
+    route.max_arrival_day_offset,
+  );
+  const [retMaxArrivalDayOffset, setRetMaxArrivalDayOffset] = useState(
+    route.ret_max_arrival_day_offset,
+  );
 
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -192,6 +199,8 @@ export function ConfigTab({ routeId, route }: Props) {
       dep_time_to: depTo,
       arr_time_from: arrFrom,
       arr_time_to: arrTo,
+      max_arrival_day_offset: maxArrivalDayOffset,
+      ret_max_arrival_day_offset: isRoundtrip ? retMaxArrivalDayOffset : null,
     };
     if (isRoundtrip) {
       body.ret_dep_time_from = retDepFrom;
@@ -263,6 +272,30 @@ export function ConfigTab({ routeId, route }: Props) {
               />
             </button>
           </div>
+        </div>
+      </div>
+
+      {/* Arrival-day limits */}
+      <div className="rounded-xl border border-gray-100 bg-white p-5">
+        <h3 className="text-sm font-semibold text-gray-700">到达日期限制</h3>
+        <p className="mb-4 mt-1 text-[11px] leading-4 text-gray-400">
+          按每段行程的实际到达日期过滤。这是累计上限：选择“最晚 +1 天”会保留当天和 +1 天到达的航班。
+        </p>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <ArrivalDayLimitSelect
+            id="config-max-arrival-day-offset"
+            label="去程最晚到达"
+            value={maxArrivalDayOffset}
+            onChange={setMaxArrivalDayOffset}
+          />
+          {isRoundtrip && (
+            <ArrivalDayLimitSelect
+              id="config-ret-max-arrival-day-offset"
+              label="回程最晚到达"
+              value={retMaxArrivalDayOffset}
+              onChange={setRetMaxArrivalDayOffset}
+            />
+          )}
         </div>
       </div>
 
@@ -357,7 +390,7 @@ export function ConfigTab({ routeId, route }: Props) {
           {updateMutation.isPending ? '保存中...' : '保存修改'}
         </button>
         {updateMutation.isSuccess && (
-          <p className="text-xs text-green-600 text-center mt-2">已保存，历史数据已按新窗口重新筛选</p>
+          <p className="text-xs text-green-600 text-center mt-2">已保存，历史数据已按新过滤条件重新筛选</p>
         )}
         {updateMutation.isError && (
           <p className="text-xs text-red-600 text-center mt-2">

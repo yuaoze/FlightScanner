@@ -9,6 +9,7 @@ import type {
   RouteBatchesResponse,
   RouteFlightsResponse,
   TriggerScrapeResponse,
+  ArrivalDayLimit,
 } from '../types';
 import {
   SCRAPE_POLL_INTERVAL_MS,
@@ -80,6 +81,8 @@ export interface UpdateRouteBody {
   ret_dep_time_to?: string;
   ret_arr_time_from?: string;
   ret_arr_time_to?: string;
+  max_arrival_day_offset?: ArrivalDayLimit;
+  ret_max_arrival_day_offset?: ArrivalDayLimit;
 }
 
 export function useUpdateRoute(id: number) {

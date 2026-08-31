@@ -1,14 +1,16 @@
 """Routes API endpoints for Dashboard data."""
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from flightscanner.analyzers.rule_based_analyzer import RuleBasedAnalyzer
 from flightscanner.api.deps import get_db
+from flightscanner.api.route_filter import filter_history_by_route
 from flightscanner.api.schemas import (
     BatchInfo,
     FlightBriefInfo,
@@ -19,22 +21,24 @@ from flightscanner.api.schemas import (
     RouteBatchesResponse,
     RouteDetailResponse,
     RouteFlightsResponse,
-    RouteResponse,
     RoutePredictionsResponse,
+    RouteResponse,
     ScrapeTaskResponse,
     SparklinePoint,
     UpdateRouteRequest,
 )
-from flightscanner.analyzers.rule_based_analyzer import RuleBasedAnalyzer
-from flightscanner.api.route_filter import filter_history_by_route
 from flightscanner.api.status_resolver import (
     STATUS_PRIORITY,
     is_ai_prediction_stale,
     resolve_status,
 )
 from flightscanner.api.time_utils import fmt_cst, iso_utc
+from flightscanner.core.route_filter import (
+    arrival_day_offset,
+    itinerary_matches_route,
+)
 from flightscanner.core.services.route_service import RouteService
-from flightscanner.interfaces import FlightPrice
+from flightscanner.interfaces import FlightInfo, FlightPrice
 from flightscanner.models.database import AIPredictionLog, Flight, PriceHistory, Route
 
 router = APIRouter()
@@ -85,38 +89,86 @@ def _compute_sparkline(
     return points[-days:]
 
 
-def _compute_duration(dep_time: str, arr_time: str) -> Optional[str]:
-    """Compute flight duration from HH:MM strings."""
+def _compute_duration(
+    dep_time: str,
+    arr_time: str,
+    departure_date: Optional[date] = None,
+    arrival_date: Optional[date] = None,
+) -> Optional[str]:
+    """Compute duration using calendar dates when available, including D+2+."""
     try:
         dh, dm = map(int, dep_time.split(":"))
         ah, am = map(int, arr_time.split(":"))
         dep_mins = dh * 60 + dm
         arr_mins = ah * 60 + am
-        if arr_mins < dep_mins:
+        if departure_date is not None and arrival_date is not None:
+            arr_mins += (arrival_date - departure_date).days * 24 * 60
+        elif arr_mins < dep_mins:
             arr_mins += 24 * 60
         diff = arr_mins - dep_mins
+        if diff < 0:
+            return None
         return f"{diff // 60}h{diff % 60:02d}m"
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return None
 
 
-def _get_latest_flight_info(
-    price_history: List[FlightPrice],
-) -> Optional[FlightBriefInfo]:
-    """Get flight info from the cheapest record in the latest batch."""
-    latest_records = _latest_comparable_records(price_history)
-    if not latest_records:
+def _resolved_arrival_date(flight: Any) -> tuple[Optional[date], bool]:
+    """Return a trustworthy or inferred arrival date and whether it was inferred."""
+    if flight is None or getattr(flight, "flight_no", None) == "VIRTUAL_RETURN":
+        return None, False
+    offset = arrival_day_offset(flight)
+    if offset is None:
+        return None, False
+    departure_date = getattr(flight, "departure_date", None)
+    if departure_date is None:
+        return None, False
+    actual_arrival_date = flight.arrival_date
+    estimated = (
+        actual_arrival_date is None
+        or actual_arrival_date < departure_date
+    )
+    if estimated:
+        actual_arrival_date = departure_date + timedelta(days=offset)
+    return actual_arrival_date, estimated
+
+
+def _flight_brief_info(flight: Optional[FlightInfo]) -> Optional[FlightBriefInfo]:
+    """Convert a real flight leg to the dashboard's date-aware brief."""
+    if flight is None or flight.flight_no == "VIRTUAL_RETURN":
         return None
-    latest = min(latest_records, key=lambda fp: fp.price)
-    fi = latest.flight_info
+    offset = arrival_day_offset(flight)
+    actual_arrival_date, estimated = _resolved_arrival_date(flight)
     return FlightBriefInfo(
-        flight_no=fi.flight_no,
-        airline=fi.airline,
-        departure_time=fi.departure_time,
-        arrival_time=fi.arrival_time,
-        duration=_compute_duration(fi.departure_time, fi.arrival_time),
-        departure_airport_code=fi.departure_airport_code,
-        arrival_airport_code=fi.arrival_airport_code,
+        flight_no=flight.flight_no,
+        airline=flight.airline,
+        departure_date=flight.departure_date,
+        arrival_date=actual_arrival_date,
+        arrival_day_offset=offset,
+        arrival_date_is_estimated=estimated,
+        departure_time=flight.departure_time,
+        arrival_time=flight.arrival_time,
+        duration=_compute_duration(
+            flight.departure_time,
+            flight.arrival_time,
+            flight.departure_date,
+            actual_arrival_date,
+        ),
+        departure_airport_code=flight.departure_airport_code,
+        arrival_airport_code=flight.arrival_airport_code,
+    )
+
+
+def _get_latest_itinerary_info(
+    latest_records: List[FlightPrice],
+) -> tuple[Optional[FlightBriefInfo], Optional[FlightBriefInfo]]:
+    """Return both legs from the cheapest matching record in one latest batch."""
+    if not latest_records:
+        return None, None
+    latest = min(latest_records, key=lambda fp: fp.price)
+    return (
+        _flight_brief_info(latest.flight_info),
+        _flight_brief_info(latest.return_flight_info),
     )
 
 
@@ -143,20 +195,30 @@ def get_routes(
     for route in filtered_routes:
         days_until = (route.target_date - today).days
 
-        price_history = service.get_route_price_history(route.id, days=14)
+        raw_history = service.get_route_price_history(route.id, days=14)
+        latest_raw_records = _latest_comparable_records(raw_history)
+        latest_records = filter_history_by_route(route, latest_raw_records)
+        if route.last_flight_status == "filtered_out":
+            latest_records = []
         # Apply route time-window/airport filter so the dashboard reflects the
         # currently configured constraints (existing data is filtered, future
         # scrapes are also constrained by the same fields).
-        price_history = filter_history_by_route(route, price_history)
+        price_history = filter_history_by_route(route, raw_history)
         trend = _analyzer.predict_trend(price_history, route.target_date)
 
+        latest_price = (
+            float(min(fp.price for fp in latest_records))
+            if latest_records
+            else None
+        )
+
         price_vs_avg_pct: Optional[float] = None
-        if price_history and route.latest_price is not None:
+        if price_history and latest_price is not None:
             prices = _batch_min_values(price_history)
             avg_price = sum(prices) / len(prices)
             if avg_price > 0:
                 price_vs_avg_pct = round(
-                    (float(route.latest_price) - avg_price) / avg_price * 100, 1
+                    (latest_price - avg_price) / avg_price * 100, 1
                 )
 
         status, ai_reason, ai_confidence = resolve_status(
@@ -164,16 +226,25 @@ def get_routes(
             route.id,
             trend.direction,
             price_vs_avg_pct,
-            latest_price=float(route.latest_price) if route.latest_price else None,
+            latest_price=latest_price,
             target_price=float(route.target_price) if route.target_price else None,
         )
+        if route.last_flight_status == "filtered_out":
+            status = "建议观望"
+            ai_reason = "最新采集批次暂无符合当前过滤条件的航班"
+            ai_confidence = 0.0
         # 检测 AI 是否已过时；过时则异步触发重预测（带去重，不会重复打 API）
-        _enqueue_repredict_if_stale(db, route.id, route.latest_price)
+        _enqueue_repredict_if_stale(db, route.id, latest_price)
         prediction_text = ai_reason or trend.recommendation
         confidence = ai_confidence if ai_confidence is not None else trend.confidence
 
         sparkline = _compute_sparkline(price_history)
-        flight_info = _get_latest_flight_info(price_history)
+        flight_info, return_flight_info = _get_latest_itinerary_info(latest_records)
+        latest_scraped_at = (
+            max(fp.scraped_at for fp in latest_raw_records)
+            if latest_raw_records
+            else None
+        )
 
         has_alert = (
             route.is_active
@@ -190,9 +261,7 @@ def get_routes(
                 return_date=route.return_date,
                 trip_type=route.trip_type,
                 target_price=float(route.target_price),
-                latest_price=(
-                    float(route.latest_price) if route.latest_price else None
-                ),
+                latest_price=latest_price,
                 status=status,
                 trend_direction=trend.direction,
                 trend_confidence=confidence,
@@ -201,14 +270,19 @@ def get_routes(
                 prediction_text=prediction_text,
                 sparkline=sparkline,
                 flight_info=flight_info,
+                return_flight_info=return_flight_info,
                 days_until=days_until,
                 has_alert=has_alert,
                 is_active=route.is_active,
                 monitoring_mode=route.monitoring_mode,
                 outbound_flight_no=route.outbound_flight_no,
+                inbound_flight_no=route.inbound_flight_no,
                 seat_class=route.pinned_seat_class,
-                latest_scraped_at=iso_utc(route.latest_scraped_at),
+                last_flight_status=route.last_flight_status,
+                latest_scraped_at=iso_utc(latest_scraped_at),
                 scrape_interval=route.scrape_interval,
+                max_arrival_day_offset=route.max_arrival_day_offset,
+                ret_max_arrival_day_offset=route.ret_max_arrival_day_offset,
             )
         )
 
@@ -233,6 +307,8 @@ class CreateRouteRequest(BaseModel):
     dep_time_to: Optional[str] = None
     arr_time_from: Optional[str] = None
     arr_time_to: Optional[str] = None
+    max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
+    ret_max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
     max_results: int = 20
     monitoring_mode: str = "route"
     outbound_flight_no: Optional[str] = None
@@ -266,6 +342,8 @@ def create_route(
             dep_time_to=body.dep_time_to,
             arr_time_from=body.arr_time_from,
             arr_time_to=body.arr_time_to,
+            max_arrival_day_offset=body.max_arrival_day_offset,
+            ret_max_arrival_day_offset=body.ret_max_arrival_day_offset,
             max_results=body.max_results,
             monitoring_mode=body.monitoring_mode,
             outbound_flight_no=body.outbound_flight_no,
@@ -409,15 +487,18 @@ def get_route_detail(
     today = date.today()
     days_until = (route.target_date - today).days
 
-    price_history = service.get_route_price_history(route.id, days=14)
-    price_history = filter_history_by_route(route, price_history)
+    raw_history = service.get_route_price_history(route.id, days=14)
+    latest_raw_records = _latest_comparable_records(raw_history)
+    latest_records = filter_history_by_route(route, latest_raw_records)
+    if route.last_flight_status == "filtered_out":
+        latest_records = []
+    price_history = filter_history_by_route(route, raw_history)
     trend = _analyzer.predict_trend(price_history, route.target_date)
 
     # Compute the current price from the newest batch only.  Older versions used
     # ``min(price_history[:20])``, which could prefill a purchase with a stale
     # low from a previous scrape whenever the newest batch contained <20 rows.
     latest_price: Optional[float] = None
-    latest_records = _latest_comparable_records(price_history)
     if latest_records:
         latest_price = float(min(fp.price for fp in latest_records))
 
@@ -438,15 +519,24 @@ def get_route_detail(
         latest_price=latest_price,
         target_price=float(route.target_price) if route.target_price else None,
     )
+    if route.last_flight_status == "filtered_out":
+        status = "建议观望"
+        ai_reason = "最新采集批次暂无符合当前过滤条件的航班"
+        ai_confidence = 0.0
     _enqueue_repredict_if_stale(db, route.id, latest_price)
     prediction_text = ai_reason or trend.recommendation
     confidence = ai_confidence if ai_confidence is not None else trend.confidence
 
     sparkline = _compute_sparkline(price_history)
-    flight_info = _get_latest_flight_info(price_history)
+    flight_info, return_flight_info = _get_latest_itinerary_info(latest_records)
 
-    # Latest scrape timestamp (price_history is sorted desc)
-    latest_scraped_at = iso_utc(price_history[0].scraped_at) if price_history else None
+    # Keep the raw latest scrape timestamp even if that batch has zero matches;
+    # the card can then distinguish "not scraped" from "no matching flight".
+    latest_scraped_at = (
+        iso_utc(max(fp.scraped_at for fp in latest_raw_records))
+        if latest_raw_records
+        else None
+    )
 
     has_alert = (
         route.is_active
@@ -471,12 +561,15 @@ def get_route_detail(
         prediction_text=prediction_text,
         sparkline=sparkline,
         flight_info=flight_info,
+        return_flight_info=return_flight_info,
         days_until=days_until,
         has_alert=has_alert,
         is_active=route.is_active,
         monitoring_mode=route.monitoring_mode,
         outbound_flight_no=route.outbound_flight_no,
+        inbound_flight_no=route.inbound_flight_no,
         seat_class=route.pinned_seat_class,
+        last_flight_status=route.last_flight_status,
         scrape_interval=route.scrape_interval,
         latest_scraped_at=latest_scraped_at,
         dep_airport_code=route.dep_airport_code,
@@ -489,6 +582,8 @@ def get_route_detail(
         ret_dep_time_to=route.ret_dep_time_to,
         ret_arr_time_from=route.ret_arr_time_from,
         ret_arr_time_to=route.ret_arr_time_to,
+        max_arrival_day_offset=route.max_arrival_day_offset,
+        ret_max_arrival_day_offset=route.ret_max_arrival_day_offset,
         created_at=fmt_cst(route.created_at),
     )
 
@@ -502,9 +597,8 @@ def update_route(
 ) -> dict:
     """Update route configuration fields.
 
-    For time-window fields (dep_/arr_/ret_dep_/ret_arr_*), pass the empty
-    string "" to clear the field, "HH:MM" to set a value, or omit it entirely
-    to leave it unchanged.
+    Time-window fields accept "" to clear. Arrival-day limits accept 0/1/2,
+    explicit null to clear, or omission to leave the current value unchanged.
     """
     route = (
         db.query(Route)
@@ -538,6 +632,10 @@ def update_route(
         if f in payload:
             v = payload[f]
             setattr(route, f, v if v else None)
+
+    for field_name in ("max_arrival_day_offset", "ret_max_arrival_day_offset"):
+        if field_name in payload:
+            setattr(route, field_name, payload[field_name])
 
     db.commit()
     db.refresh(route)
@@ -751,19 +849,24 @@ def get_route_predictions(
 def get_route_batches(
     route_id: int, limit: int = Query(20, ge=1, le=100), db: Session = Depends(get_db)
 ) -> RouteBatchesResponse:
-    """List recent scrape batches for a route."""
-    from sqlalchemy import func
+    """List recent batches after applying the route's current constraints."""
+    from sqlalchemy import func, tuple_
+    from sqlalchemy.orm import aliased
 
-    if RouteService(db).get_route_by_id(route_id) is None:
+    route = RouteService(db).get_route_by_id(route_id)
+    if route is None:
         raise HTTPException(status_code=404, detail="Route not found")
 
-    rows = (
+    # Fetch lightweight group metadata first, then load flight rows in bounded
+    # chunks until ``limit`` matching groups have been found.  Loading every
+    # PriceHistory row made this endpoint grow linearly without bound (a real
+    # route already has thousands of quotes), even though the client asks for
+    # only the newest 20 groups.
+    group_rows = (
         db.query(
             PriceHistory.batch_id,
             PriceHistory.source,
             func.max(PriceHistory.scraped_at).label("scraped_at"),
-            func.count(PriceHistory.id).label("cnt"),
-            func.min(PriceHistory.price).label("min_price"),
         )
         .filter(
             PriceHistory.route_id == route_id,
@@ -771,20 +874,50 @@ def get_route_batches(
         )
         .group_by(PriceHistory.batch_id, PriceHistory.source)
         .order_by(func.max(PriceHistory.scraped_at).desc())
-        .limit(limit)
         .all()
     )
 
-    batches = [
-        BatchInfo(
-            batch_id=row.batch_id,
-            source=row.source,
-            scraped_at=fmt_cst(row.scraped_at) or "",
-            flight_count=row.cnt,
-            min_price=float(row.min_price),
+    ReturnFlight = aliased(Flight, name="batch_return_flight")
+    batches: List[BatchInfo] = []
+    chunk_size = max(20, min(100, limit * 2))
+    for start in range(0, len(group_rows), chunk_size):
+        chunk = group_rows[start:start + chunk_size]
+        keys = [(row.batch_id, row.source) for row in chunk]
+        rows = (
+            db.query(PriceHistory, Flight, ReturnFlight)
+            .join(Flight, PriceHistory.flight_id == Flight.id)
+            .outerjoin(ReturnFlight, PriceHistory.return_flight_id == ReturnFlight.id)
+            .filter(
+                PriceHistory.route_id == route_id,
+                tuple_(PriceHistory.batch_id, PriceHistory.source).in_(keys),
+            )
+            .all()
         )
-        for row in rows
-    ]
+
+        rows_by_group: dict[tuple[str, str], list] = {}
+        for price, flight, return_flight in rows:
+            if not itinerary_matches_route(route, flight, return_flight):
+                continue
+            rows_by_group.setdefault((price.batch_id, price.source), []).append(price)
+
+        for group in chunk:
+            matching = rows_by_group.get((group.batch_id, group.source), [])
+            if not matching:
+                continue
+            batches.append(
+                BatchInfo(
+                    batch_id=group.batch_id,
+                    source=group.source,
+                    scraped_at=fmt_cst(
+                        max(item.scraped_at for item in matching)
+                    ) or "",
+                    flight_count=len(matching),
+                    min_price=min(float(item.price) for item in matching),
+                )
+            )
+            if len(batches) >= limit:
+                return RouteBatchesResponse(route_id=route_id, batches=batches)
+
     return RouteBatchesResponse(route_id=route_id, batches=batches)
 
 
@@ -849,75 +982,65 @@ def get_route_flights(
         rows_query = rows_query.filter(PriceHistory.source == source)
     rows = (
         rows_query.order_by(PriceHistory.price.asc())
-        .limit(limit)
         .all()
     )
 
     if not rows:
         return RouteFlightsResponse(route_id=route_id, batch_id=batch_id, flights=[])
 
-    # Apply route time-window/airport filter to mirror the filter applied at
-    # scrape time, so existing batches reflect the user's current settings.
-    from flightscanner.api.route_filter import _hhmm_to_minutes, _in_window
-
-    if route is not None:
-        dep_airport = route.dep_airport_code
-        arr_airport = route.arr_airport_code
-        dep_from = _hhmm_to_minutes(route.dep_time_from)
-        dep_to = _hhmm_to_minutes(route.dep_time_to)
-        arr_from = _hhmm_to_minutes(route.arr_time_from)
-        arr_to = _hhmm_to_minutes(route.arr_time_to)
-        ret_dep_from = _hhmm_to_minutes(route.ret_dep_time_from)
-        ret_dep_to = _hhmm_to_minutes(route.ret_dep_time_to)
-        ret_arr_from = _hhmm_to_minutes(route.ret_arr_time_from)
-        ret_arr_to = _hhmm_to_minutes(route.ret_arr_time_to)
-
-        def _row_passes(flight: Flight, return_flight: Optional[Flight]) -> bool:
-            if dep_airport and flight.departure_airport_code and flight.departure_airport_code != dep_airport:
-                return False
-            if arr_airport and flight.arrival_airport_code and flight.arrival_airport_code != arr_airport:
-                return False
-            if not _in_window(flight.departure_time, dep_from, dep_to):
-                return False
-            if not _in_window(flight.arrival_time, arr_from, arr_to):
-                return False
-            if return_flight is not None and getattr(return_flight, "flight_no", "") != "VIRTUAL_RETURN":
-                # Return leg airports reverse
-                if arr_airport and return_flight.departure_airport_code and return_flight.departure_airport_code != arr_airport:
-                    return False
-                if dep_airport and return_flight.arrival_airport_code and return_flight.arrival_airport_code != dep_airport:
-                    return False
-                if not _in_window(return_flight.departure_time, ret_dep_from, ret_dep_to):
-                    return False
-                if not _in_window(return_flight.arrival_time, ret_arr_from, ret_arr_to):
-                    return False
-            return True
-
-        rows = [r for r in rows if _row_passes(r[1], r[2])]
-        if not rows:
-            return RouteFlightsResponse(route_id=route_id, batch_id=batch_id, flights=[])
+    # Filter before applying the client limit.  Otherwise the cheapest N raw
+    # rows can all be ineligible while a valid N+1 row is incorrectly hidden.
+    rows = [
+        row for row in rows if itinerary_matches_route(route, row[1], row[2])
+    ][:limit]
+    if not rows:
+        return RouteFlightsResponse(route_id=route_id, batch_id=batch_id, flights=[])
 
     first_scraped = fmt_cst(rows[0][0].scraped_at)
-    flights = [
-        FlightListItem(
-            flight_no=flight.flight_no,
-            airline=flight.airline,
-            departure_time=flight.departure_time,
-            arrival_time=flight.arrival_time,
-            duration=_compute_duration(flight.departure_time, flight.arrival_time),
-            departure_airport_code=flight.departure_airport_code,
-            arrival_airport_code=flight.arrival_airport_code,
-            price=float(ph.price),
-            seat_class=ph.seat_class,
-            available_seats=ph.available_seats,
-            source=ph.source,
-            batch_id=ph.batch_id,
-            return_flight_no=return_flight.flight_no if return_flight else None,
-            return_departure_time=return_flight.departure_time if return_flight else None,
-            return_arrival_time=return_flight.arrival_time if return_flight else None,
+    flights: List[FlightListItem] = []
+    for ph, flight, return_flight in rows:
+        resolved_arrival_date, _ = _resolved_arrival_date(flight)
+        resolved_return_arrival_date, _ = _resolved_arrival_date(return_flight)
+        flights.append(
+            FlightListItem(
+                flight_no=flight.flight_no,
+                airline=flight.airline,
+                departure_date=flight.departure_date,
+                arrival_date=resolved_arrival_date,
+                arrival_day_offset=arrival_day_offset(flight),
+                departure_time=flight.departure_time,
+                arrival_time=flight.arrival_time,
+                duration=_compute_duration(
+                    flight.departure_time,
+                    flight.arrival_time,
+                    flight.departure_date,
+                    resolved_arrival_date,
+                ),
+                departure_airport_code=flight.departure_airport_code,
+                arrival_airport_code=flight.arrival_airport_code,
+                price=float(ph.price),
+                seat_class=ph.seat_class,
+                available_seats=ph.available_seats,
+                source=ph.source,
+                batch_id=ph.batch_id,
+                return_flight_no=(
+                    return_flight.flight_no if return_flight else None
+                ),
+                return_departure_date=(
+                    return_flight.departure_date if return_flight else None
+                ),
+                return_arrival_date=resolved_return_arrival_date,
+                return_arrival_day_offset=(
+                    arrival_day_offset(return_flight) if return_flight else None
+                ),
+                return_departure_time=(
+                    return_flight.departure_time if return_flight else None
+                ),
+                return_arrival_time=(
+                    return_flight.arrival_time if return_flight else None
+                ),
+            )
         )
-        for ph, flight, return_flight in rows
-    ]
     return RouteFlightsResponse(
         route_id=route_id,
         batch_id=batch_id,

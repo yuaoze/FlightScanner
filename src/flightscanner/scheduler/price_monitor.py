@@ -22,12 +22,13 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.orm import Session
 
 from flightscanner.models.database import PriceHistory, Route
+from flightscanner.core.route_filter import filter_prices_by_route
 from flightscanner.core.services import RouteService
 from flightscanner.scrapers import ScraperRegistry
 from flightscanner.analyzers import RuleBasedAnalyzer
 from flightscanner.analyzers.rule_based_analyzer import _batch_min_prices
 from flightscanner.notifiers import build_notifiers
-from flightscanner.interfaces import FlightDirection, FlightInfo, FlightPrice, FlightScraper, Notifier, PriceTrend, SearchParams
+from flightscanner.interfaces import FlightDirection, FlightPrice, FlightScraper, Notifier, PriceTrend, SearchParams
 from flightscanner.models.database import init_db
 from flightscanner.utils.config import settings
 
@@ -555,8 +556,12 @@ class PriceMonitorScheduler:
             # ── 按路线配置的机场/时间段过滤 ─────────────────────────────
             flight_prices = self._apply_route_filters(route, flight_prices)
             if not flight_prices:
+                with self._SessionLocal() as status_session:
+                    RouteService(status_session).update_flight_status(
+                        route.id, "filtered_out"
+                    )
                 logger.info(
-                    "路线 %s 采集结果全部被机场/时间段过滤器过滤（0 条匹配），跳过存库",
+                    "路线 %s 采集结果全部被到达日/机场/时间过滤器过滤（0 条匹配），跳过存库",
                     route.id,
                 )
                 return
@@ -589,11 +594,22 @@ class PriceMonitorScheduler:
                 route_service = RouteService(session)
                 for fp in flight_prices:
                     route_service.save_price_for_route(route.id, fp)
-                logger.info("路线 %s 已保存 %d 条价格记录（批次 ID: %s）", route.id, len(flight_prices), batch_id)
+                # A previous all-filtered scrape must not keep suppressing the
+                # newly successful current batch on the dashboard.
+                route_service.update_flight_status(route.id, "available")
+                logger.info(
+                    "路线 %s 已保存 %d 条价格记录（批次 ID: %s）",
+                    route.id,
+                    len(flight_prices),
+                    batch_id,
+                )
 
                 # ── 价格告警判断 ───────────────────────────────────────────
                 # 1. 获取30天历史并计算统计数据
-                history = route_service.get_route_price_history(route.id, days=30)
+                history = filter_prices_by_route(
+                    route,
+                    route_service.get_route_price_history(route.id, days=30),
+                )
                 stats = self._compute_price_stats(history)
                 price_count = int(stats.get("batch_count", len(history)))
 
@@ -691,133 +707,19 @@ class PriceMonitorScheduler:
             if task_store is not None and task_id is not None:
                 task_store.finish(task_id, task_error)
 
-    @staticmethod
-    def _hhmm_to_minutes(hhmm: str) -> int:
-        """将 'HH:MM' 格式时间字符串转换为午夜起的分钟数。"""
-        try:
-            h, m = map(int, hhmm.split(":"))
-            return h * 60 + m
-        except (ValueError, AttributeError):
-            return 0
-
     def _apply_route_filters(
         self,
         route: Route,
         prices: List[FlightPrice],
+        *,
+        require_complete_roundtrip: bool = True,
     ) -> List[FlightPrice]:
-        """按路线配置的机场代码和时间段过滤航班价格列表。
-
-        过滤规则：
-        - 机场代码：若路线设置了 dep_airport_code/arr_airport_code，则仅保留
-          flight_info.departure_airport_code/arrival_airport_code 匹配的记录。
-          若航班无机场代码数据（爬虫未采集到），则放行（宁可放行不可漏掉）。
-        - 去程时间段：对 direction=DEPARTURE 的记录应用 dep_time_from/to
-          （起飞窗口）和 arr_time_from/to（落地窗口）。
-        - 回程时间段：对 direction=RETURN 的单程记录应用 ret_dep_time_from/to
-          和 ret_arr_time_from/to。若路线没配置回程窗口则 RETURN 记录直接放行。
-        - 组合记录（return_flight_info 非空）：同时检查去程和回程两段都满足
-          各自的时间窗，任一段不合格都剔除。
-
-        Args:
-            route: 路线配置（含过滤字段）。
-            prices: 待过滤的 FlightPrice 列表。
-
-        Returns:
-            过滤后的 FlightPrice 列表。
-        """
-        dep_airport = getattr(route, "dep_airport_code", None)
-        arr_airport = getattr(route, "arr_airport_code", None)
-        dep_from    = getattr(route, "dep_time_from", None)
-        dep_to      = getattr(route, "dep_time_to", None)
-        arr_from    = getattr(route, "arr_time_from", None)
-        arr_to      = getattr(route, "arr_time_to", None)
-        ret_dep_from = getattr(route, "ret_dep_time_from", None)
-        ret_dep_to   = getattr(route, "ret_dep_time_to", None)
-        ret_arr_from = getattr(route, "ret_arr_time_from", None)
-        ret_arr_to   = getattr(route, "ret_arr_time_to", None)
-
-        # 没有任何过滤条件，直接返回
-        if not any([
-            dep_airport, arr_airport,
-            dep_from, dep_to, arr_from, arr_to,
-            ret_dep_from, ret_dep_to, ret_arr_from, ret_arr_to,
-        ]):
-            return prices
-
-        # 预计算分钟数
-        def _to_min(v: Optional[str]) -> Optional[int]:
-            return self._hhmm_to_minutes(v) if v else None
-
-        dep_from_min, dep_to_min = _to_min(dep_from), _to_min(dep_to)
-        arr_from_min, arr_to_min = _to_min(arr_from), _to_min(arr_to)
-        ret_dep_from_min, ret_dep_to_min = _to_min(ret_dep_from), _to_min(ret_dep_to)
-        ret_arr_from_min, ret_arr_to_min = _to_min(ret_arr_from), _to_min(ret_arr_to)
-
-        def _check_window(
-            time_str: Optional[str], from_min: Optional[int], to_min: Optional[int]
-        ) -> bool:
-            """True = within window (or no window configured)."""
-            if from_min is None and to_min is None:
-                return True
-            m = self._hhmm_to_minutes(time_str or "00:00")
-            if from_min is not None and m < from_min:
-                return False
-            if to_min is not None and m > to_min:
-                return False
-            return True
-
-        def _check_outbound_leg(fi: FlightInfo) -> bool:
-            """去程 leg：机场 + 去程时间窗。机场信息缺失则放行。"""
-            if dep_airport:
-                fp_dep = fi.departure_airport_code
-                if fp_dep and fp_dep != dep_airport:
-                    return False
-            if arr_airport:
-                fp_arr = fi.arrival_airport_code
-                if fp_arr and fp_arr != arr_airport:
-                    return False
-            if not _check_window(fi.departure_time, dep_from_min, dep_to_min):
-                return False
-            if not _check_window(fi.arrival_time, arr_from_min, arr_to_min):
-                return False
-            return True
-
-        def _check_return_leg(fi: FlightInfo) -> bool:
-            """回程 leg：机场反向（起飞=原到达机场，到达=原出发机场）+ 回程时间窗。"""
-            # 机场反向校验：回程的出发机场 = 原路线的到达机场，反之亦然
-            if arr_airport:
-                fp_dep = fi.departure_airport_code
-                if fp_dep and fp_dep != arr_airport:
-                    return False
-            if dep_airport:
-                fp_arr = fi.arrival_airport_code
-                if fp_arr and fp_arr != dep_airport:
-                    return False
-            if not _check_window(fi.departure_time, ret_dep_from_min, ret_dep_to_min):
-                return False
-            if not _check_window(fi.arrival_time, ret_arr_from_min, ret_arr_to_min):
-                return False
-            return True
-
-        result: List[FlightPrice] = []
-        for fp in prices:
-            fi = fp.flight_info
-            # 组合记录：两段都必须通过
-            if fp.return_flight_info is not None:
-                if not _check_outbound_leg(fi):
-                    continue
-                if not _check_return_leg(fp.return_flight_info):
-                    continue
-            elif fi.direction == FlightDirection.RETURN:
-                # 单独的回程记录（Qunar 分程往返在配对前会出现在列表里）
-                if not _check_return_leg(fi):
-                    continue
-            else:
-                if not _check_outbound_leg(fi):
-                    continue
-            result.append(fp)
-
-        return result
+        """Apply the shared airport, time and cumulative arrival-day rules."""
+        return filter_prices_by_route(
+            route,
+            prices,
+            require_complete_roundtrip=require_complete_roundtrip,
+        )
 
     async def _scrape_pinned_flights(
         self,
@@ -914,6 +816,16 @@ class PriceMonitorScheduler:
         else:
             return
 
+        prices_to_save = self._apply_route_filters(route, prices_to_save)
+        if not prices_to_save:
+            with self._SessionLocal() as session:
+                RouteService(session).update_flight_status(route.id, "filtered_out")
+            logger.info(
+                "路线 %s 精准航班不符合最晚到达/机场/时间过滤条件，跳过存库与通知",
+                route.id,
+            )
+            return
+
         import hashlib
         batch_timestamp = datetime.now(timezone.utc).isoformat()
         batch_hash = hashlib.md5(
@@ -933,7 +845,10 @@ class PriceMonitorScheduler:
             )
 
             # ── 价格告警（与普通模式相同逻辑） ────────────────────────────
-            history = route_service.get_route_price_history(route.id, days=30)
+            history = filter_prices_by_route(
+                route,
+                route_service.get_route_price_history(route.id, days=30),
+            )
             stats = self._compute_price_stats(history)
             price_count = int(stats.get("batch_count", len(history)))
             best_fp = min(prices_to_save, key=lambda fp: fp.price)
@@ -1181,7 +1096,11 @@ class PriceMonitorScheduler:
                 # RETURN 用 ret_*），回程若无对应配置则放行。
                 if route is not None:
                     before = len(result)
-                    result = self._apply_route_filters(route, result)
+                    result = self._apply_route_filters(
+                        route,
+                        result,
+                        require_complete_roundtrip=False,
+                    )
                     if len(result) != before:
                         logger.info(
                             "%s 路线过滤（去程/回程按路线时间窗/机场筛）：%d → %d 条",
@@ -2330,7 +2249,10 @@ class PriceMonitorScheduler:
                     return
 
                 route_service = RouteService(session)
-                history = route_service.get_route_price_history(route_id, days=30)
+                history = filter_prices_by_route(
+                    route,
+                    route_service.get_route_price_history(route_id, days=30),
+                )
                 if len(history) < 7:
                     logger.info("[G1-refresh] 路线 %s 历史不足 7 条，跳过 AI 重预测", route_id)
                     return
@@ -2482,7 +2404,10 @@ class PriceMonitorScheduler:
                     if plan is None or route is None or plan.notification_status == "sent":
                         continue
 
-                    history = RouteService(session).get_route_price_history(route_id, days=30)
+                    history = filter_prices_by_route(
+                        route,
+                        RouteService(session).get_route_price_history(route_id, days=30),
+                    )
                     if not history:
                         plan.notification_attempts = (plan.notification_attempts or 0) + 1
                         plan.last_notification_at = now

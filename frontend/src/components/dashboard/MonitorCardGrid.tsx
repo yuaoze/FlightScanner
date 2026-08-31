@@ -26,7 +26,7 @@ export function MonitorCardGrid({ routes, activeFilter }: MonitorCardGridProps) 
 
   if (activeFilter !== '全部') {
     return (
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
         <AnimatePresence mode="popLayout">
           {filtered.map((route) => (
             <MonitorCard key={route.id} route={route} />
@@ -55,7 +55,7 @@ export function MonitorCardGrid({ routes, activeFilter }: MonitorCardGridProps) 
               <span className="text-xs text-gray-400">({group.length})</span>
               <span className="text-xs text-gray-400 ml-2">{config.description}</span>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
               <AnimatePresence mode="popLayout">
                 {group.map((route) => (
                   <MonitorCard key={route.id} route={route} />

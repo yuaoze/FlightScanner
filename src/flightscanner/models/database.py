@@ -158,6 +158,10 @@ class Route(Base):
     ret_arr_time_from = Column(String(10), nullable=True)   # 回程落地时间段开始
     ret_arr_time_to   = Column(String(10), nullable=True)   # 回程落地时间段结束
 
+    # 最大允许跨日天数（0=当天，1=当天或+1，2=当天至+2，NULL=不限）
+    max_arrival_day_offset = Column(Integer, nullable=True)      # 去程/单程
+    ret_max_arrival_day_offset = Column(Integer, nullable=True)  # 回程
+
     # 通知防骚扰字段（通过迁移添加）
     last_notified_at    = Column(DateTime, nullable=True)           # 上次通知时间（UTC）
     last_notified_price = Column(Numeric(10, 2), nullable=True)     # 上次通知时的价格
@@ -176,7 +180,8 @@ class Route(Base):
     pinned_seat_class     = Column(String(50), nullable=True)   # 指定舱位，如 "经济舱"（None=不限）
     outbound_dep_time_ref = Column(String(10), nullable=True)   # 添加时的去程起飞参考时刻 "HH:MM"
     inbound_dep_time_ref  = Column(String(10), nullable=True)   # 添加时的回程起飞参考时刻 "HH:MM"
-    last_flight_status    = Column(String(30), nullable=True)   # 'available'|'sold_out'|'not_found'|'schedule_changed'
+    # available / sold_out / not_found / schedule_changed / filtered_out
+    last_flight_status = Column(String(30), nullable=True)
 
     # Relationship
     price_histories = relationship(
@@ -645,6 +650,9 @@ def _apply_migrations(engine) -> None:
         "ALTER TABLE routes ADD COLUMN ret_dep_time_to TEXT",
         "ALTER TABLE routes ADD COLUMN ret_arr_time_from TEXT",
         "ALTER TABLE routes ADD COLUMN ret_arr_time_to TEXT",
+        # 到达日期过滤（NULL=不限；0/1/2 为最大允许跨日天数）
+        "ALTER TABLE routes ADD COLUMN max_arrival_day_offset INTEGER",
+        "ALTER TABLE routes ADD COLUMN ret_max_arrival_day_offset INTEGER",
         # 通知防骚扰字段
         "ALTER TABLE routes ADD COLUMN last_notified_at DATETIME",
         "ALTER TABLE routes ADD COLUMN last_notified_price NUMERIC",
@@ -889,10 +897,14 @@ def _apply_migrations(engine) -> None:
             )
 
         # Fail fast if a partially upgraded database is missing any field that
-        # the v2.2 purchase lifecycle relies on.
+        # current read/write paths rely on.
         schema = inspect(engine)
         required_columns = {
-            "routes": {"deleted_at"},
+            "routes": {
+                "deleted_at",
+                "max_arrival_day_offset",
+                "ret_max_arrival_day_offset",
+            },
             "buy_plans": {
                 "notification_status",
                 "notification_attempts",

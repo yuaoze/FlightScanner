@@ -3,11 +3,17 @@ export interface SparklinePoint {
   price: number;
 }
 
+export type ArrivalDayLimit = 0 | 1 | 2 | null;
+
 export interface FlightBriefInfo {
   flight_no: string;
   airline: string;
+  departure_date: string;
   departure_time: string;
+  arrival_date: string | null;
   arrival_time: string;
+  arrival_day_offset: number | null;
+  arrival_date_is_estimated: boolean;
   duration: string | null;
   departure_airport_code: string | null;
   arrival_airport_code: string | null;
@@ -32,6 +38,7 @@ export interface RouteResponse {
   prediction_text: string;
   sparkline: SparklinePoint[];
   flight_info: FlightBriefInfo | null;
+  return_flight_info: FlightBriefInfo | null;
   days_until: number;
   has_alert: boolean;
   is_active: boolean;
@@ -42,6 +49,8 @@ export interface RouteResponse {
   last_flight_status: string | null;
   latest_scraped_at: string | null;
   scrape_interval: number;
+  max_arrival_day_offset: ArrivalDayLimit;
+  ret_max_arrival_day_offset: ArrivalDayLimit;
 }
 
 export interface StatsResponse {
@@ -134,6 +143,9 @@ export interface RouteBatchesResponse {
 export interface FlightListItem {
   flight_no: string;
   airline: string;
+  departure_date: string;
+  arrival_date: string | null;
+  arrival_day_offset: number | null;
   departure_time: string;
   arrival_time: string;
   duration: string | null;
@@ -145,6 +157,9 @@ export interface FlightListItem {
   source: string;
   batch_id: string | null;
   return_flight_no: string | null;
+  return_departure_date: string | null;
+  return_arrival_date: string | null;
+  return_arrival_day_offset: number | null;
   return_departure_time: string | null;
   return_arrival_time: string | null;
 }

@@ -6,15 +6,34 @@ from typing import List
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from flightscanner.analyzers.rule_based_analyzer import RuleBasedAnalyzer
 from flightscanner.api.deps import get_db
 from flightscanner.api.route_filter import filter_history_by_route
 from flightscanner.api.schemas import StatsResponse
 from flightscanner.api.status_resolver import resolve_status
-from flightscanner.analyzers.rule_based_analyzer import RuleBasedAnalyzer
 from flightscanner.core.services.route_service import RouteService
+from flightscanner.interfaces import FlightPrice
 
 router = APIRouter()
 _analyzer = RuleBasedAnalyzer()
+
+
+def _latest_batch_records(history: List[FlightPrice]) -> List[FlightPrice]:
+    if not history:
+        return []
+    newest = max(history, key=lambda price: price.scraped_at)
+    if newest.batch_id:
+        return [price for price in history if price.batch_id == newest.batch_id]
+    return [price for price in history if price.scraped_at == newest.scraped_at]
+
+
+def _batch_minimums(history: List[FlightPrice]) -> List[float]:
+    batches: dict[str, float] = {}
+    for item in history:
+        key = item.batch_id or item.scraped_at.isoformat()
+        value = float(item.price)
+        batches[key] = min(batches.get(key, value), value)
+    return list(batches.values())
 
 
 @router.get("/stats", response_model=StatsResponse)
@@ -38,19 +57,29 @@ def get_stats(db: Session = Depends(get_db)) -> StatsResponse:
     alert_count = 0
 
     for route in active_routes:
-        price_history = service.get_route_price_history(route.id, days=14)
+        raw_history = service.get_route_price_history(route.id, days=14)
+        current_records = filter_history_by_route(
+            route, _latest_batch_records(raw_history)
+        )
+        if route.last_flight_status == "filtered_out":
+            current_records = []
         # Mirror routes.py — apply the route's time-window filter so the KPI
         # status reflects the same data the cards display.
-        price_history = filter_history_by_route(route, price_history)
+        price_history = filter_history_by_route(route, raw_history)
         trend = _analyzer.predict_trend(price_history, route.target_date)
+        latest_price = (
+            float(min(item.price for item in current_records))
+            if current_records
+            else None
+        )
 
         price_vs_avg_pct = None
-        if price_history and route.latest_price is not None:
-            prices = [float(fp.price) for fp in price_history]
+        if price_history and latest_price is not None:
+            prices = _batch_minimums(price_history)
             avg_price = sum(prices) / len(prices)
             if avg_price > 0:
                 price_vs_avg_pct = round(
-                    (float(route.latest_price) - avg_price) / avg_price * 100, 1
+                    (latest_price - avg_price) / avg_price * 100, 1
                 )
 
         status, _reason, _conf = resolve_status(
@@ -58,17 +87,19 @@ def get_stats(db: Session = Depends(get_db)) -> StatsResponse:
             route.id,
             trend.direction,
             price_vs_avg_pct,
-            latest_price=float(route.latest_price) if route.latest_price else None,
+            latest_price=latest_price,
             target_price=float(route.target_price) if route.target_price else None,
         )
+        if route.last_flight_status == "filtered_out":
+            status = "建议观望"
 
         if status == "建议购买":
             buy_count += 1
-            if price_history and route.latest_price is not None:
-                prices = [float(fp.price) for fp in price_history]
+            if price_history and latest_price is not None:
+                prices = _batch_minimums(price_history)
                 avg_price = sum(prices) / len(prices)
                 if avg_price > 0:
-                    pct = (avg_price - float(route.latest_price)) / avg_price * 100
+                    pct = (avg_price - latest_price) / avg_price * 100
                     if pct > 0:
                         drop_pcts.append(pct)
         elif status == "建议观望":

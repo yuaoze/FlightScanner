@@ -73,6 +73,8 @@ class RouteWithLatestPrice:
     ret_dep_time_to: Optional[str] = None
     ret_arr_time_from: Optional[str] = None
     ret_arr_time_to: Optional[str] = None
+    max_arrival_day_offset: Optional[int] = None
+    ret_max_arrival_day_offset: Optional[int] = None
     last_notified_at: Optional[datetime] = None
     last_notified_price: Optional[Decimal] = None
     max_results: int = 20
@@ -121,6 +123,8 @@ class RouteService:
         ret_dep_time_to: Optional[str] = None,
         ret_arr_time_from: Optional[str] = None,
         ret_arr_time_to: Optional[str] = None,
+        max_arrival_day_offset: Optional[int] = None,
+        ret_max_arrival_day_offset: Optional[int] = None,
         max_results: int = 20,
         monitoring_mode: str = "route",
         outbound_flight_no: Optional[str] = None,
@@ -173,6 +177,14 @@ class RouteService:
         if is_international is None:
             is_international = is_international_route(origin, destination)
 
+        arrival_day_limits = {
+            "max_arrival_day_offset": max_arrival_day_offset,
+            "ret_max_arrival_day_offset": ret_max_arrival_day_offset,
+        }
+        for field_name, value in arrival_day_limits.items():
+            if value is not None and value not in (0, 1, 2):
+                raise ValueError(f"{field_name} must be one of 0, 1, 2, or None")
+
         route = Route(
             origin=origin,
             destination=destination,
@@ -193,6 +205,8 @@ class RouteService:
             ret_dep_time_to=ret_dep_time_to or None,
             ret_arr_time_from=ret_arr_time_from or None,
             ret_arr_time_to=ret_arr_time_to or None,
+            max_arrival_day_offset=max_arrival_day_offset,
+            ret_max_arrival_day_offset=ret_max_arrival_day_offset,
             max_results=max_results,
             monitoring_mode=monitoring_mode,
             outbound_flight_no=outbound_flight_no or None,
@@ -321,6 +335,8 @@ class RouteService:
                 Route.ret_dep_time_to,
                 Route.ret_arr_time_from,
                 Route.ret_arr_time_to,
+                Route.max_arrival_day_offset,
+                Route.ret_max_arrival_day_offset,
                 Route.last_notified_at,
                 Route.last_notified_price,
                 Route.max_results,
@@ -377,6 +393,8 @@ class RouteService:
                     ret_dep_time_to=row.ret_dep_time_to,
                     ret_arr_time_from=row.ret_arr_time_from,
                     ret_arr_time_to=row.ret_arr_time_to,
+                    max_arrival_day_offset=row.max_arrival_day_offset,
+                    ret_max_arrival_day_offset=row.ret_max_arrival_day_offset,
                     last_notified_at=row.last_notified_at,
                     last_notified_price=(
                         Decimal(str(row.last_notified_price))
@@ -676,6 +694,27 @@ class RouteService:
             )
             self.session.add(flight)
             self.session.flush()
+        else:
+            # Flight 的唯一键不包含时刻、机场或到达日期。同一航班后续采集到
+            # 更完整/更新的行程信息时应刷新静态字段，否则旧 NULL arrival_date
+            # 会永久让跨日过滤退化为时间推断。
+            if flight_info.departure_time:
+                flight.departure_time = flight_info.departure_time
+            if flight_info.arrival_time:
+                flight.arrival_time = flight_info.arrival_time
+            if flight_info.arrival_date is not None:
+                flight.arrival_date = flight_info.arrival_date
+
+            airport_fields = (
+                "departure_airport",
+                "arrival_airport",
+                "departure_airport_code",
+                "arrival_airport_code",
+            )
+            for field_name in airport_fields:
+                value = getattr(flight_info, field_name)
+                if value:
+                    setattr(flight, field_name, value)
 
         return flight
 
@@ -748,11 +787,12 @@ class RouteService:
             self.session.commit()
 
     def update_flight_status(self, route_id: int, status: str) -> None:
-        """Update the pinned flight's last known status.
+        """Update the route's latest availability/filter outcome.
 
         Args:
             route_id: The route ID to update.
-            status: One of 'available', 'sold_out', 'not_found', 'schedule_changed'.
+            status: One of 'available', 'sold_out', 'not_found',
+                'schedule_changed', or 'filtered_out'.
         """
         route = self.session.query(Route).filter(Route.id == route_id).first()
         if route:

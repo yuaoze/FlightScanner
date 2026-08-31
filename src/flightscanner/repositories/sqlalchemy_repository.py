@@ -73,9 +73,31 @@ class SQLAlchemyRepository(DataRepository):
                 arrival_time=flight_price.flight_info.arrival_time,
                 departure_date=flight_price.flight_info.departure_date,
                 direction=flight_price.flight_info.direction.value,
+                departure_airport=flight_price.flight_info.departure_airport,
+                arrival_airport=flight_price.flight_info.arrival_airport,
+                departure_airport_code=flight_price.flight_info.departure_airport_code,
+                arrival_airport_code=flight_price.flight_info.arrival_airport_code,
+                arrival_date=flight_price.flight_info.arrival_date,
             )
             self.session.add(flight)
             self.session.flush()  # Flush to get the ID
+        else:
+            info = flight_price.flight_info
+            if info.departure_time:
+                flight.departure_time = info.departure_time
+            if info.arrival_time:
+                flight.arrival_time = info.arrival_time
+            for field_name in (
+                "departure_airport",
+                "arrival_airport",
+                "departure_airport_code",
+                "arrival_airport_code",
+            ):
+                value = getattr(info, field_name)
+                if value:
+                    setattr(flight, field_name, value)
+            if info.arrival_date is not None:
+                flight.arrival_date = info.arrival_date
 
         # Create price history record
         price_history = PriceHistory(
@@ -195,6 +217,11 @@ class SQLAlchemyRepository(DataRepository):
                 arrival_time=flight.arrival_time,
                 departure_date=flight.departure_date,
                 direction=FlightDirection(flight.direction),
+                departure_airport=flight.departure_airport,
+                arrival_airport=flight.arrival_airport,
+                departure_airport_code=flight.departure_airport_code,
+                arrival_airport_code=flight.arrival_airport_code,
+                arrival_date=flight.arrival_date,
             ),
             price=price.price_decimal,
             currency=price.currency,

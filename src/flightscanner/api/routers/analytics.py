@@ -1,18 +1,20 @@
 """Analytics API endpoints for data analysis page."""
 
-from datetime import date, timedelta
+from datetime import date
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import func, and_
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func
+from sqlalchemy.orm import Session, aliased
 
-from flightscanner.api.deps import get_db
-from flightscanner.api.time_utils import fmt_cst
 from flightscanner.analyzers.rule_based_analyzer import RuleBasedAnalyzer
+from flightscanner.api.deps import get_db
+from flightscanner.api.route_filter import filter_history_by_route
+from flightscanner.api.time_utils import fmt_cst
+from flightscanner.core.route_filter import itinerary_matches_route
 from flightscanner.core.services.route_service import RouteService
-from flightscanner.models.database import AIPredictionLog, PriceHistory, Route
+from flightscanner.models.database import AIPredictionLog, Flight, PriceHistory, Route
 
 router = APIRouter()
 _analyzer = RuleBasedAnalyzer()
@@ -108,7 +110,9 @@ def get_analytics_summary(db: Session = Depends(get_db)) -> AnalyticsSummaryResp
 
     volatility_list: List[RouteVolatility] = []
     for route in active_routes:
-        history = service.get_route_price_history(route.id, days=30)
+        history = filter_history_by_route(
+            route, service.get_route_price_history(route.id, days=30)
+        )
         if len(history) < 3:
             continue
         prices = [float(fp.price) for fp in history]
@@ -134,7 +138,9 @@ def get_analytics_summary(db: Session = Depends(get_db)) -> AnalyticsSummaryResp
     # Recent trends: last 7 days daily min across all active routes (top 5)
     recent_trends: List[PriceTrendPoint] = []
     for route in active_routes[:5]:
-        history = service.get_route_price_history(route.id, days=7)
+        history = filter_history_by_route(
+            route, service.get_route_price_history(route.id, days=7)
+        )
         daily_min: Dict[str, float] = {}
         for fp in history:
             day = fmt_cst(fp.scraped_at, "%m-%d")
@@ -241,14 +247,11 @@ def get_route_calendar(
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Route not found")
 
+    ReturnFlight = aliased(Flight, name="calendar_return_flight")
     rows = (
-        db.query(
-            func.date(PriceHistory.scraped_at).label("day"),
-            func.min(PriceHistory.price).label("min_price"),
-            func.max(PriceHistory.price).label("max_price"),
-            func.avg(PriceHistory.price).label("avg_price"),
-            func.count(PriceHistory.id).label("cnt"),
-        )
+        db.query(PriceHistory, Flight, ReturnFlight)
+        .join(Flight, PriceHistory.flight_id == Flight.id)
+        .outerjoin(ReturnFlight, PriceHistory.return_flight_id == ReturnFlight.id)
         .filter(
             and_(
                 PriceHistory.route_id == route_id,
@@ -256,20 +259,27 @@ def get_route_calendar(
                 func.date(PriceHistory.scraped_at) < end_date,
             )
         )
-        .group_by(func.date(PriceHistory.scraped_at))
-        .order_by(func.date(PriceHistory.scraped_at))
+        .order_by(PriceHistory.scraped_at)
         .all()
     )
 
+    daily: Dict[str, List[float]] = {}
+    for price, flight, return_flight in rows:
+        if not itinerary_matches_route(route, flight, return_flight):
+            continue
+        day_key = fmt_cst(price.scraped_at, "%Y-%m-%d")
+        if day_key is not None:
+            daily.setdefault(day_key, []).append(float(price.price))
+
     days = [
         CalendarDayPrice(
-            date=str(row.day),
-            min_price=float(row.min_price),
-            max_price=float(row.max_price),
-            avg_price=round(float(row.avg_price), 1),
-            record_count=row.cnt,
+            date=day_key,
+            min_price=min(prices),
+            max_price=max(prices),
+            avg_price=round(sum(prices) / len(prices), 1),
+            record_count=len(prices),
         )
-        for row in rows
+        for day_key, prices in sorted(daily.items())
     ]
 
     return CalendarResponse(

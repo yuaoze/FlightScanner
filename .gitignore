@@ -49,6 +49,7 @@ dmypy.json
 *.db
 *.db-shm
 *.db-wal
+*.db.corrupt*
 *.sqlite
 *.sqlite3
 
@@ -61,6 +62,9 @@ logs/
 
 # Claude Code working directory
 .claude/
+
+# Qoder generated repository wiki
+.qoder/
 
 # Environment variables
 .env

@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../api/client';
+import type { ArrivalDayLimit } from '../types';
+import { ArrivalDayLimitSelect } from '../components/ArrivalDayLimitSelect';
 
 interface CityItem {
   name: string;
@@ -33,10 +35,6 @@ function CityInput({
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState(value);
   const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    setSearch(value);
-  }, [value]);
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
@@ -106,6 +104,8 @@ export function AddMonitorPage() {
   const [depTimeTo, setDepTimeTo] = useState('');
   const [depAirport, setDepAirport] = useState('');
   const [arrAirport, setArrAirport] = useState('');
+  const [maxArrivalDayOffset, setMaxArrivalDayOffset] = useState<ArrivalDayLimit>(null);
+  const [retMaxArrivalDayOffset, setRetMaxArrivalDayOffset] = useState<ArrivalDayLimit>(null);
 
   // Pinned flight fields
   const [outboundFlightNo, setOutboundFlightNo] = useState('');
@@ -121,6 +121,8 @@ export function AddMonitorPage() {
         target_price: parseFloat(targetPrice),
         scrape_interval: scrapeInterval,
         trip_type: isRoundTrip ? 'roundtrip' : 'oneway',
+        max_arrival_day_offset: maxArrivalDayOffset,
+        ret_max_arrival_day_offset: isRoundTrip ? retMaxArrivalDayOffset : null,
       };
       if (isRoundTrip && returnDate) body.return_date = returnDate;
       if (depTimeFrom) body.dep_time_from = depTimeFrom;
@@ -192,7 +194,7 @@ export function AddMonitorPage() {
         </div>
 
         {/* Cities */}
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-1.5">出发城市</label>
             <CityInput
@@ -214,7 +216,7 @@ export function AddMonitorPage() {
         </div>
 
         {/* Dates */}
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-1.5">出发日期</label>
             <input
@@ -247,11 +249,37 @@ export function AddMonitorPage() {
           </div>
         </div>
 
+        {/* Arrival-day limit */}
+        <div className="rounded-lg border border-gray-100 bg-gray-50 p-4">
+          <div className="mb-3">
+            <p className="text-xs font-medium text-gray-600">到达日期限制</p>
+            <p className="mt-1 text-[11px] leading-4 text-gray-400">
+              这是最大允许跨日天数。例如选择“最晚 +1 天”时，会同时保留当天和 +1 天到达的航班。
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <ArrivalDayLimitSelect
+              id="page-max-arrival-day-offset"
+              label="去程最晚到达"
+              value={maxArrivalDayOffset}
+              onChange={setMaxArrivalDayOffset}
+            />
+            {isRoundTrip && (
+              <ArrivalDayLimitSelect
+                id="page-ret-max-arrival-day-offset"
+                label="回程最晚到达"
+                value={retMaxArrivalDayOffset}
+                onChange={setRetMaxArrivalDayOffset}
+              />
+            )}
+          </div>
+        </div>
+
         {/* Pinned Flight Fields */}
         {monitoringMode === 'flight' && (
           <div className="space-y-4 p-4 bg-blue-50 rounded-lg border border-blue-200">
             <p className="text-xs font-medium text-blue-700">精准航班信息</p>
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div>
                 <label className="block text-xs font-medium text-gray-500 mb-1.5">
                   去程航班号 <span className="text-red-500">*</span>
@@ -298,7 +326,7 @@ export function AddMonitorPage() {
         )}
 
         {/* Price & Interval */}
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-1.5">目标价格 (¥)</label>
             <input
@@ -337,7 +365,7 @@ export function AddMonitorPage() {
             高级选项
           </button>
           {showAdvanced && (
-            <div className="mt-3 grid grid-cols-2 gap-4 p-4 bg-gray-50 rounded-lg">
+            <div className="mt-3 grid grid-cols-1 gap-4 rounded-lg bg-gray-50 p-4 sm:grid-cols-2">
               <div>
                 <label className="block text-xs font-medium text-gray-500 mb-1.5">
                   起飞时间从

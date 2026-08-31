@@ -14,6 +14,10 @@ class SparklinePoint(BaseModel):
 class FlightBriefInfo(BaseModel):
     flight_no: str
     airline: str
+    departure_date: date
+    arrival_date: Optional[date] = None
+    arrival_day_offset: Optional[int] = Field(default=None, ge=0)
+    arrival_date_is_estimated: bool = False
     departure_time: str
     arrival_time: str
     duration: Optional[str] = None
@@ -38,14 +42,19 @@ class RouteResponse(BaseModel):
     prediction_text: str
     sparkline: List[SparklinePoint]
     flight_info: Optional[FlightBriefInfo] = None
+    return_flight_info: Optional[FlightBriefInfo] = None
     days_until: int
     has_alert: bool
     is_active: bool
     monitoring_mode: str
     outbound_flight_no: Optional[str] = None
+    inbound_flight_no: Optional[str] = None
     seat_class: Optional[str] = None
+    last_flight_status: Optional[str] = None
     latest_scraped_at: Optional[str] = None
     scrape_interval: int = 6
+    max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
+    ret_max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
 
 
 class StatsResponse(BaseModel):
@@ -148,6 +157,8 @@ class UpdateRouteRequest(BaseModel):
     ret_dep_time_to: Optional[str] = None
     ret_arr_time_from: Optional[str] = None
     ret_arr_time_to: Optional[str] = None
+    max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
+    ret_max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
 
 
 # ── Flight batch / listing schemas ────────────────────────────────────────
@@ -169,6 +180,9 @@ class RouteBatchesResponse(BaseModel):
 class FlightListItem(BaseModel):
     flight_no: str
     airline: str
+    departure_date: date
+    arrival_date: Optional[date] = None
+    arrival_day_offset: Optional[int] = Field(default=None, ge=0)
     departure_time: str
     arrival_time: str
     duration: Optional[str] = None
@@ -180,6 +194,9 @@ class FlightListItem(BaseModel):
     source: str
     batch_id: Optional[str] = None
     return_flight_no: Optional[str] = None
+    return_departure_date: Optional[date] = None
+    return_arrival_date: Optional[date] = None
+    return_arrival_day_offset: Optional[int] = Field(default=None, ge=0)
     return_departure_time: Optional[str] = None
     return_arrival_time: Optional[str] = None
 

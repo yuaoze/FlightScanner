@@ -30,8 +30,7 @@ from flightscanner.interfaces import (
     ParseError,
     SearchParams,
 )
-from flightscanner.utils.city_codes import CITY_CODE_MAP, get_city_code
-from flightscanner.utils.config import settings
+from flightscanner.utils.city_codes import get_city_code
 
 logger = logging.getLogger(__name__)
 
@@ -584,65 +583,109 @@ class CtripScraper(FlightScraper):
         prices: List[FlightPrice] = []
 
         # ── 提取航班信息 ─────────────────────────────────────────────────────
-        # 兼容嵌套格式（flightSegments[0].flightList[0]）和扁平格式
-        segment = None
-        seg_airline: Optional[str] = None  # 航段级航空公司（batchSearch seg0.airlineName）
-        segments = itinerary.get("flightSegments")
-        if segments and isinstance(segments, list) and segments:
-            seg0 = segments[0]
-            seg_airline = seg0.get("airlineName")  # 保存航段级别的航空公司名称作为备用
-            fl = seg0.get("flightList")
-            if fl and isinstance(fl, list) and fl:
-                segment = fl[0]
-        if segment is None:
-            segment = itinerary  # 扁平格式直接作为 segment
+        # 嵌套格式的 flightSegments[0].flightList 是完整单程的有序航段。
+        # 中转行程用首段出发、末段到达，并组合全部航班号。
+        legs: List[Dict[str, Any]] = []
+        segment_airline: Optional[str] = None
+        segment_groups = itinerary.get("flightSegments")
+        if isinstance(segment_groups, list) and segment_groups:
+            first_group = segment_groups[0]
+            if isinstance(first_group, dict):
+                segment_airline = first_group.get("airlineName")
+                raw_legs = first_group.get("flightList")
+                if isinstance(raw_legs, list):
+                    legs = [leg for leg in raw_legs if isinstance(leg, dict)]
 
-        flight_no = (
-            segment.get("flightNo")
-            or segment.get("flight_no")
-            or segment.get("flightNumber")
-            or "UNKNOWN"
-        ).strip().upper()
+        # 旧版接口会直接返回扁平航班对象。
+        if not legs:
+            legs = [itinerary]
 
-        airline = (
-            (segment.get("marketAirlineInfo") or {}).get("airlineName")
-            or segment.get("marketAirlineName")   # batchSearch 字段名
-            or segment.get("airlineName")
-            or segment.get("airline")
-            or seg_airline                         # 航段级别备用
-            or "未知航空公司"
-        ).strip()
+        first_leg = legs[0]
+        last_leg = legs[-1]
+
+        flight_numbers: List[str] = []
+        airline_names: List[str] = []
+        for leg in legs:
+            raw_flight_no = (
+                leg.get("flightNo")
+                or leg.get("flight_no")
+                or leg.get("flightNumber")
+            )
+            if raw_flight_no:
+                normalized_flight_no = str(raw_flight_no).strip().upper()
+                if normalized_flight_no:
+                    flight_numbers.append(normalized_flight_no)
+
+            market_airline_info = leg.get("marketAirlineInfo")
+            raw_airline = (
+                market_airline_info.get("airlineName")
+                if isinstance(market_airline_info, dict)
+                else None
+            )
+            raw_airline = (
+                raw_airline
+                or leg.get("marketAirlineName")
+                or leg.get("airlineName")
+                or leg.get("airline")
+            )
+            if raw_airline:
+                airline_name = str(raw_airline).strip()
+                if airline_name and airline_name not in airline_names:
+                    airline_names.append(airline_name)
+
+        # 多航段只要丢失一个航班号，组合标识就不可靠，还可能与
+        # 共享首段的其他转机方案在去重或入库时碰撞。
+        if len(flight_numbers) != len(legs):
+            logger.debug("携程行程航段号不完整，跳过：%s", flight_numbers)
+            return []
+
+        flight_no = "+".join(flight_numbers)
+        if not airline_names and segment_airline:
+            fallback_airline = str(segment_airline).strip()
+            if fallback_airline:
+                airline_names.append(fallback_airline)
+        airline = "/".join(airline_names) or "未知航空公司"
 
         dep_dt_str = (
-            segment.get("departureDateTime")       # batchSearch 字段名
-            or segment.get("departureDate")
-            or segment.get("depDate")
-            or segment.get("departureTime")
+            first_leg.get("departureDateTime")       # batchSearch 字段名
+            or first_leg.get("departureDate")
+            or first_leg.get("depDate")
+            or first_leg.get("departureTime")
             or ""
         )
         arr_dt_str = (
-            segment.get("arrivalDateTime")         # batchSearch 字段名
-            or segment.get("arrivalDate")
-            or segment.get("arrDate")
-            or segment.get("arrivalTime")
+            last_leg.get("arrivalDateTime")         # batchSearch 字段名
+            or last_leg.get("arrivalDate")
+            or last_leg.get("arrDate")
+            or last_leg.get("arrivalTime")
             or ""
         )
         dep_time = self._extract_time_str(dep_dt_str)
         arr_time = self._extract_time_str(arr_dt_str)
+        arrival_date = self._extract_date_str(arr_dt_str)
+        if arrival_date is not None and arrival_date < params.departure_date:
+            # Some legacy/mock payloads carry a stale calendar date.  Keep it
+            # unknown so the shared filter can fall back to the two clock times
+            # instead of persisting a negative, misleading day offset.
+            arrival_date = None
 
         # ── 提取机场信息 ──────────────────────────────────────────────────
         dep_airport_code = (
-            segment.get("depAirportCode")
-            or segment.get("departureAirportCode")
+            first_leg.get("depAirportCode")
+            or first_leg.get("departureAirportCode")
             or ""
         )
         arr_airport_code = (
-            segment.get("arrAirportCode")
-            or segment.get("arrivalAirportCode")
+            last_leg.get("arrAirportCode")
+            or last_leg.get("arrivalAirportCode")
             or ""
         )
-        dep_airport = segment.get("depAirportName") or segment.get("departureAirportName")
-        arr_airport = segment.get("arrAirportName") or segment.get("arrivalAirportName")
+        dep_airport = first_leg.get("depAirportName") or first_leg.get(
+            "departureAirportName"
+        )
+        arr_airport = last_leg.get("arrAirportName") or last_leg.get(
+            "arrivalAirportName"
+        )
 
         flight_info = FlightInfo(
             flight_no=flight_no,
@@ -657,6 +700,7 @@ class CtripScraper(FlightScraper):
             arrival_airport=arr_airport,
             departure_airport_code=dep_airport_code or None,
             arrival_airport_code=arr_airport_code or None,
+            arrival_date=arrival_date,
         )
 
         # ── 往返搜索：构建标记信息 ──────────────────────────────────
@@ -785,6 +829,19 @@ class CtripScraper(FlightScraper):
         if m:
             return f"{int(m.group(1)):02d}:{m.group(2)}"
         return "00:00"
+
+    @staticmethod
+    def _extract_date_str(dt_str: str) -> Optional[date]:
+        """Extract a calendar date from Ctrip's common datetime strings."""
+        if not dt_str:
+            return None
+        match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", str(dt_str))
+        if not match:
+            return None
+        try:
+            return date(*(int(part) for part in match.groups()))
+        except ValueError:
+            return None
 
     # ── DOM 备用解析 ─────────────────────────────────────────────────────────
 
