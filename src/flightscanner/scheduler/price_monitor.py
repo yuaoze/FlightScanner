@@ -21,7 +21,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.orm import Session
 
-from flightscanner.models.database import PriceHistory, Route
+from flightscanner.models.database import Flight, PriceHistory, Route
 from flightscanner.core.route_filter import filter_prices_by_route
 from flightscanner.core.services import RouteService
 from flightscanner.scrapers import ScraperRegistry
@@ -570,24 +570,48 @@ class PriceMonitorScheduler:
             # ── 存库 ─────────────────────────────────────────────────────
             session = self._SessionLocal()
             try:
-                # 往返路线在保存前清理孤儿单程记录：之前版本的 _combine_roundtrip_prices
-                # 在配对失败时会原样返回单程列表，导致 ¥390 单程被当成"往返价"入库。
-                # 现在每次采集前主动清理 route_id 下 return_flight_id IS NULL 的脏数据，
-                # 让前端 latest_price 不再被旧的单程残留污染。
+                # 往返路线在保存前清理两类脏数据：
+                # 1. return_flight_id IS NULL 的孤儿单程 —— 之前版本的
+                #    _combine_roundtrip_prices 配对失败时原样返回单程列表，
+                #    导致 ¥390 单程被当成"往返价"入库。
+                # 2. 回程为零信息占位（航班号 UNKNOWN + 时刻 00:00/00:00）的记录 ——
+                #    爬虫价格解析失败产出 price=0 的假回程，配对后往返总价退化成
+                #    单程价（上海→曼谷往返被存成 ¥1720 单程价）。这类记录
+                #    return_flight_id 非空，第 1 条规则抓不到，必须单独清理。
+                #    注意：只清 qunar，Ctrip 的 VIRTUAL_RETURN 占位符是该平台
+                #    API 的已知局限，其 price 是真实的往返合计价，必须保留。
                 if trip_type == "roundtrip":
                     from sqlalchemy import and_ as _and
+                    from sqlalchemy import or_ as _or
+                    from sqlalchemy import select as _select
+                    placeholder_return_ids = (
+                        _select(Flight.id)
+                        .where(_and(
+                            Flight.flight_no == "UNKNOWN",
+                            Flight.departure_time == "00:00",
+                            Flight.arrival_time == "00:00",
+                        ))
+                    )
                     cleaned = (
                         session.query(PriceHistory)
                         .filter(_and(
                             PriceHistory.route_id == route.id,
-                            PriceHistory.return_flight_id.is_(None),
+                            _or(
+                                PriceHistory.return_flight_id.is_(None),
+                                _and(
+                                    PriceHistory.source == "qunar",
+                                    PriceHistory.return_flight_id.in_(
+                                        placeholder_return_ids
+                                    ),
+                                ),
+                            ),
                         ))
                         .delete(synchronize_session=False)
                     )
                     if cleaned:
                         session.commit()
                         logger.info(
-                            "路线 %s 清理 %d 条孤儿单程记录（roundtrip 路线下 return_flight_id IS NULL）",
+                            "路线 %s 清理 %d 条脏记录（孤儿单程 / 零信息占位回程）",
                             route.id, cleaned,
                         )
 
@@ -1220,7 +1244,19 @@ class PriceMonitorScheduler:
         combined_existing = [fp for fp in prices if fp.return_flight_info is not None]
 
         # 仅含单程记录（如 Qunar 国际往返降级搜索）：配对去程 + 回程
-        single_leg = [fp for fp in prices if fp.return_flight_info is None]
+        # 价格 <= 0 的记录一律剔除：这类记录是爬虫价格解析失败的产物，
+        # 若作为回程参与配对会成为"最便宜回程"，让往返总价退化成单程价。
+        single_leg = [
+            fp for fp in prices
+            if fp.return_flight_info is None and fp.price > 0
+        ]
+        unpriced = sum(
+            1 for fp in prices if fp.return_flight_info is None and fp.price <= 0
+        )
+        if unpriced:
+            logger.warning(
+                "往返配对剔除 %d 条价格<=0 的单程记录（爬虫价格解析失败）", unpriced
+            )
         outbound = [
             fp
             for fp in single_leg

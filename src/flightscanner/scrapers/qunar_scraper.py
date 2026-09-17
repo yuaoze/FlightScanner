@@ -2595,6 +2595,17 @@ class QunarScraper(FlightScraper):
                     if m:
                         price = Decimal(m.group(1))
 
+            if price <= Decimal("0"):
+                # 价格节点缺失/混淆解析失败时必须丢弃这条记录，不能返回 price=0。
+                # 否则该记录会作为"0 元回程"进入 _combine_roundtrip_prices()，
+                # 被选为最便宜回程，使往返总价 = 去程价 + 0 = 单程价
+                # （上海→曼谷往返被展示为 ¥1720 单程价）。
+                logger.warning(
+                    "跳过无价格的航班元素（%s，%s→%s）：价格节点缺失或解析失败",
+                    flight_no, params.departure_city, params.arrival_city,
+                )
+                return None
+
             # ── Seat class ───────────────────────────────────────────────────
             # Qunar doesn't expose cabin class in the list view; default to 经济舱
             seat_class = "经济舱"

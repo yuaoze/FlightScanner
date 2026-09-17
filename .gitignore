@@ -50,6 +50,7 @@ dmypy.json
 *.db-shm
 *.db-wal
 *.db.corrupt*
+*.db.bak*
 *.sqlite
 *.sqlite3
 

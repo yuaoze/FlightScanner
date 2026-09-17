@@ -6,7 +6,7 @@ API response parsing, and network interception fallback.
 """
 
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
@@ -16,7 +16,13 @@ import pytest
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
-from flightscanner.interfaces import SearchParams
+from flightscanner.interfaces import (
+    FlightDirection,
+    FlightInfo,
+    FlightPrice,
+    SearchParams,
+)
+from flightscanner.scheduler.price_monitor import PriceMonitorScheduler
 from flightscanner.scrapers.qunar_scraper import QunarScraper
 from flightscanner.utils.city_codes import CITY_CODE_MAP
 
@@ -699,3 +705,113 @@ class TestNetworkInterceptionFallback:
 
         mock_parse_api.assert_not_called()
         assert results == [dummy_fp]
+
+
+class TestUnpricedFlightElementRejected:
+    """价格解析失败的航班元素必须被丢弃，不能产生 price=0 的记录。
+
+    回归背景：`_parse_flight_element` 旧实现在价格节点缺失时返回
+    price=Decimal("0") 的记录。该记录作为回程进入
+    `PriceMonitorScheduler._combine_roundtrip_prices()` 后，会被选为
+    "最便宜回程"，使往返总价 = 去程价 + 0 = 单程价 —— 上海→曼谷往返
+    因此被展示为单程价格。
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_price_node_returns_none(
+        self, scraper: QunarScraper, one_way_params: SearchParams
+    ):
+        element = MagicMock()
+        element.query_selector = AsyncMock(return_value=None)
+
+        result = await scraper._parse_flight_element(
+            element, one_way_params, FlightDirection.DEPARTURE
+        )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_valid_price_still_parsed(
+        self, scraper: QunarScraper, one_way_params: SearchParams
+    ):
+        """价格可解析时仍正常返回，确认上面的守卫没有过度拦截。"""
+        price_node = MagicMock()
+        price_node.get_attribute = AsyncMock(return_value="499")
+
+        async def _query(selector: str):
+            return price_node if selector == "span.fix_price" else None
+
+        element = MagicMock()
+        element.query_selector = AsyncMock(side_effect=_query)
+
+        result = await scraper._parse_flight_element(
+            element, one_way_params, FlightDirection.DEPARTURE
+        )
+
+        assert result is not None
+        assert result.price == Decimal("499")
+
+
+class TestRoundtripPairingRejectsUnpricedLegs:
+    """配对层防御：price<=0 的单程记录不得参与往返配对。"""
+
+    @staticmethod
+    def _leg(flight_no, price, direction, dep_city, arr_city, dep_date):
+        return FlightPrice(
+            flight_info=FlightInfo(
+                flight_no=flight_no,
+                airline="测试航空",
+                departure_city=dep_city,
+                arrival_city=arr_city,
+                departure_time="10:00",
+                arrival_time="14:00",
+                departure_date=dep_date,
+                direction=direction,
+            ),
+            price=Decimal(price),
+            currency="CNY",
+            seat_class="经济舱",
+            available_seats=None,
+            scraped_at=datetime(2026, 9, 14, tzinfo=timezone.utc),
+            source="qunar",
+        )
+
+    def test_zero_price_return_leg_does_not_win_pairing(self):
+        outbound = self._leg(
+            "ZH9530", "1720", FlightDirection.DEPARTURE,
+            "上海", "曼谷", date(2026, 10, 1),
+        )
+        real_return = self._leg(
+            "FM848", "2100", FlightDirection.RETURN,
+            "曼谷", "上海", date(2026, 10, 6),
+        )
+        phantom_return = self._leg(
+            "UNKNOWN", "0", FlightDirection.RETURN,
+            "曼谷", "上海", date(2026, 10, 6),
+        )
+
+        combined = PriceMonitorScheduler._combine_roundtrip_prices(
+            [outbound, real_return, phantom_return]
+        )
+
+        assert len(combined) == 1
+        # 往返总价必须是去程+真实回程，而不是退化成去程单程价 1720
+        assert combined[0].price == Decimal("3820")
+        assert combined[0].return_flight_info.flight_no == "FM848"
+
+    def test_only_unpriced_return_yields_no_roundtrip(self):
+        """唯一回程无价格时宁可返回 0 条，也不能把单程价当往返价入库。"""
+        outbound = self._leg(
+            "ZH9530", "1720", FlightDirection.DEPARTURE,
+            "上海", "曼谷", date(2026, 10, 1),
+        )
+        phantom_return = self._leg(
+            "UNKNOWN", "0", FlightDirection.RETURN,
+            "曼谷", "上海", date(2026, 10, 6),
+        )
+
+        combined = PriceMonitorScheduler._combine_roundtrip_prices(
+            [outbound, phantom_return]
+        )
+
+        assert combined == []
