@@ -13,12 +13,27 @@ from typing import Dict, List, Optional
 from flightscanner.interfaces import FlightPrice, PriceAnalyzer, PriceTrend
 
 
+def _batch_snapshots(
+    price_records: List[FlightPrice],
+) -> List[tuple[Decimal, datetime]]:
+    """Return (minimum price, latest scrape time) in first-seen batch order."""
+    batches: Dict[tuple[str, str | datetime], tuple[Decimal, datetime]] = {}
+    for fp in price_records:
+        key = ("id", fp.batch_id) if fp.batch_id else ("time", fp.scraped_at)
+        if key in batches:
+            price, scraped_at = batches[key]
+            batches[key] = (min(price, fp.price), max(scraped_at, fp.scraped_at))
+        else:
+            batches[key] = (fp.price, fp.scraped_at)
+    return list(batches.values())
+
+
 def _batch_min_prices(price_records: List[FlightPrice]) -> List[float]:
     """Return the minimum price per scrape batch.
 
     Records that share a ``batch_id`` belong to the same scrape session.
-    For records without a ``batch_id`` (legacy data), each record is treated
-    as its own batch.
+    Records without a ``batch_id`` (legacy data) share a batch only when
+    their ``scraped_at`` timestamps are equal.
 
     Using per-batch minimums as the unit normalises sessions with different
     record counts and focuses analysis on the cheapest available fare.
@@ -27,15 +42,24 @@ def _batch_min_prices(price_records: List[FlightPrice]) -> List[float]:
         price_records: Price history records, in any order.
 
     Returns:
-        List of per-batch minimum prices (floats), one value per batch.
+        Per-batch minimum prices (floats), in first-seen batch order.
     """
-    batches: Dict[str, float] = {}
-    for fp in price_records:
-        key = fp.batch_id if fp.batch_id else f"_solo_{id(fp)}"
-        price = float(fp.price)
-        if key not in batches or price < batches[key]:
-            batches[key] = price
-    return list(batches.values())
+    return [float(price) for price, _ in _batch_snapshots(price_records)]
+
+
+def _latest_batch_snapshot(
+    price_records: List[FlightPrice],
+) -> Optional[tuple[Decimal, datetime]]:
+    """Return the latest batch's (minimum price, latest scrape time), or None.
+
+    Batch identity follows :func:`_batch_min_prices`. Equally recent batches
+    are resolved by lowest price so the result never depends on input order.
+    """
+    return max(
+        _batch_snapshots(price_records),
+        key=lambda snapshot: (snapshot[1], -snapshot[0]),
+        default=None,
+    )
 
 
 class RuleBasedAnalyzer(PriceAnalyzer):
@@ -63,7 +87,8 @@ class RuleBasedAnalyzer(PriceAnalyzer):
         Returns:
             PriceTrend with direction, confidence, and recommendations.
         """
-        if not historical_prices:
+        latest_batch = _latest_batch_snapshot(historical_prices)
+        if latest_batch is None:
             # No data available
             return PriceTrend(
                 direction="stable",
@@ -73,17 +98,15 @@ class RuleBasedAnalyzer(PriceAnalyzer):
                 best_booking_time=None,
             )
 
-        # 按采集时间降序排序，确保 sorted_prices[0] 为最新记录
-        sorted_prices = sorted(historical_prices, key=lambda fp: fp.scraped_at, reverse=True)
-
-        # Extract prices
-        prices = [float(fp.price) for fp in sorted_prices]
+        # Extract prices; current price is the latest batch's cheapest fare.
+        prices = [float(fp.price) for fp in historical_prices]
+        current_price = latest_batch[0]
 
         # Calculate statistics
         # avg_price is the median of per-batch minimum prices, which is robust
         # against outlier promotional fares and normalises sessions by count.
         batch_mins = _batch_min_prices(historical_prices)
-        avg_price = median(batch_mins) if batch_mins else prices[0]
+        avg_price = median(batch_mins)
         min_price = min(prices)
         max_price = max(prices)
 
@@ -92,9 +115,6 @@ class RuleBasedAnalyzer(PriceAnalyzer):
             price_stdev = stdev(prices)
         else:
             price_stdev = 0.0
-
-        # Get the most recent price
-        current_price = sorted_prices[0].price
 
         # Determine trend direction
         # Allow 10% deviation from average for "stable" classification

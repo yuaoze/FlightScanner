@@ -6,6 +6,7 @@ from typing import Generator
 from sqlalchemy.orm import Session
 
 from flightscanner.models.database import init_db
+from flightscanner.utils.config import settings
 
 _engine = None
 _SessionLocal = None
@@ -13,17 +14,12 @@ _db_init_lock = Lock()
 
 
 def _get_session_factory():
-    """Initialize the default database on first real request.
-
-    Importing an API router should be side-effect free.  The previous eager
-    initialization migrated/opened ``flightscanner.db`` during test discovery,
-    schema generation, and CLI imports even when ``get_db`` was overridden.
-    """
+    """Defer database initialization so router imports cannot open or migrate it."""
     global _engine, _SessionLocal
     if _SessionLocal is None:
         with _db_init_lock:
             if _SessionLocal is None:
-                _engine, _SessionLocal = init_db()
+                _engine, _SessionLocal = init_db(settings.database_url)
     return _SessionLocal
 
 

@@ -1,11 +1,12 @@
-"""Unit tests for PriceMonitorScheduler pinned-flight helpers."""
+"""Regression tests for pinned-flight helpers and the persisted scrape pipeline."""
 
 import sys
-from datetime import date, datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -13,7 +14,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
 from flightscanner.interfaces import FlightDirection, FlightInfo, FlightPrice
-from flightscanner.models.database import Route, init_db
+from flightscanner.models.database import Flight, PriceHistory, Route, init_db
 from flightscanner.core.services import RouteService
 from flightscanner.scheduler.price_monitor import (
     PriceMonitorScheduler,
@@ -156,6 +157,31 @@ class TestMatchPinnedFlight:
         fp, status = PriceMonitorScheduler._match_pinned_flight(prices, "CA953", None)
         assert status == "available"
         assert fp is not None
+
+    @pytest.mark.parametrize("invalid_price", [0, -50])
+    @pytest.mark.parametrize("has_valid_quote", [False, True])
+    def test_nonpositive_prices_are_not_available(self, invalid_price, has_valid_quote):
+        prices = [_make_flight_price("CA953", price=invalid_price)]
+        valid = _make_flight_price("CA953", price=500)
+        if has_valid_quote:
+            prices.append(valid)
+
+        fp, status = PriceMonitorScheduler._match_pinned_flight(prices, "CA953", None)
+
+        assert status == ("available" if has_valid_quote else "not_found")
+        assert fp is (valid if has_valid_quote else None)
+
+    @pytest.mark.parametrize("has_single_leg", [False, True])
+    def test_complete_roundtrip_is_not_a_single_leg(self, has_single_leg):
+        complete = _make_flight_price("CA953", price=100)
+        complete.return_flight_info = _make_flight_price("CA954").flight_info
+        single_leg = _make_flight_price("CA953", price=500)
+        prices = [complete, single_leg] if has_single_leg else [complete]
+
+        fp, status = PriceMonitorScheduler._match_pinned_flight(prices, "CA953", None)
+
+        assert status == ("available" if has_single_leg else "not_found")
+        assert fp is (single_leg if has_single_leg else None)
 
 
 # ── _determine_flight_status ────────────────────────────────────────────────
@@ -407,3 +433,370 @@ class TestCombineRoundtripPrices:
         assert len(result) == 1
         assert result[0].source == "tongcheng"
         assert result[0].price == Decimal("950")
+
+
+# ── pinned scrape integration (real SQLite, no external I/O) ─────────────────
+
+@pytest.fixture
+def pinned_scheduler():
+    engine, session_factory = init_db("sqlite:///:memory:")
+    scheduler = PriceMonitorScheduler.__new__(PriceMonitorScheduler)
+    scheduler._SessionLocal = session_factory
+    scheduler.scrapers = [MagicMock(max_results=20)]
+    scheduler.notifiers = [MagicMock()]
+    scheduler.analyzer = MagicMock()
+    scheduler._scrape_all_platforms = AsyncMock(return_value=[])
+    # Force the notification gate open: empty-result tests must stop upstream,
+    # not pass merely because no notifier or a cooldown suppressed an alert.
+    scheduler._should_notify = MagicMock(return_value=(True, "target_hit"))
+    scheduler._is_cooldown_active = MagicMock(return_value=False)
+    scheduler._get_ai_brief_for_notify = AsyncMock(return_value=None)
+    scheduler._send_alert = AsyncMock(return_value=True)
+    scheduler._maybe_log_prediction = AsyncMock()
+    scheduler._check_buy_plans = AsyncMock()
+    try:
+        yield scheduler
+    finally:
+        engine.dispose()
+
+
+def _persist_pinned_route(scheduler, **overrides):
+    values = dict(
+        origin="上海",
+        destination="北京",
+        target_date=date(2026, 10, 1),
+        return_date=date(2026, 10, 7),
+        target_price=Decimal("2000"),
+        scrape_interval=6,
+        is_active=1,
+        trip_type="roundtrip",
+        monitoring_mode="flight",
+        outbound_flight_no="CA953",
+        inbound_flight_no="CA954",
+    )
+    values.update(overrides)
+    with scheduler._SessionLocal() as session:
+        route = Route(**values)
+        session.add(route)
+        session.commit()
+        session.refresh(route)
+        return route
+
+
+def _pinned_leg(price, *, inbound=False, source="qunar", **kwargs):
+    """Model one-way search responses, including DEPARTURE on the return search."""
+    fp = _make_flight_price("CA954" if inbound else "CA953", price=price, **kwargs)
+    fp.source = source
+    if inbound:
+        fp.flight_info = replace(
+            fp.flight_info,
+            departure_city="北京",
+            arrival_city="上海",
+            departure_date=date(2026, 10, 7),
+            arrival_date=date(2026, 10, 7),
+            departure_time="18:00",
+            arrival_time="20:00",
+        )
+    else:
+        fp.flight_info = replace(fp.flight_info, arrival_date=date(2026, 10, 1))
+    return fp
+
+
+def _assert_no_pinned_quotes(scheduler, route, status):
+    with scheduler._SessionLocal() as session:
+        stored_route = session.get(Route, route.id)
+        assert stored_route.last_flight_status == status
+        assert session.query(PriceHistory).filter_by(route_id=route.id).count() == 0
+        assert session.query(Flight).count() == 0
+        assert stored_route.recent_3d_low is None
+        assert stored_route.last_notified_at is None
+    scheduler._should_notify.assert_not_called()
+    scheduler._get_ai_brief_for_notify.assert_not_called()
+    scheduler._send_alert.assert_not_called()
+    scheduler._maybe_log_prediction.assert_not_called()
+    scheduler._check_buy_plans.assert_not_called()
+
+
+def _assert_pinned_success(scheduler, route, expected_quotes, expected_status="available"):
+    """Downstream consumers must see only persisted, legal quotes and their best."""
+    scheduler._send_alert.assert_awaited_once()
+    scheduler._maybe_log_prediction.assert_awaited_once()
+    scheduler._check_buy_plans.assert_awaited_once()
+    scheduler._should_notify.assert_called_once()
+    best = scheduler._send_alert.await_args.args[0]
+    expected_best = min(expected_quotes, key=lambda quote: quote[1])
+    assert (best.source, best.price) == expected_best
+    assert scheduler._should_notify.call_args.args[1] == best.price
+    assert scheduler._check_buy_plans.await_args.args[2] is best
+
+    prediction_session, prediction_route, history = (
+        scheduler._maybe_log_prediction.await_args.args
+    )
+    assert prediction_session.get_bind().url.database == ":memory:"
+    assert prediction_route.id == route.id
+    assert sorted((fp.source, fp.price) for fp in history) == sorted(expected_quotes)
+    assert {fp.batch_id for fp in history} == {best.batch_id}
+    assert best.batch_id.startswith(f"route_{route.id}_")
+    assert scheduler._check_buy_plans.await_args.args[3] == history
+    assert scheduler._check_buy_plans.await_args.args[4]["batch_count"] == 1
+    assert scheduler._check_buy_plans.await_args.args[5] == 1
+    for fp in history:
+        assert fp.flight_info.direction == FlightDirection.DEPARTURE
+        if route.trip_type == "roundtrip":
+            assert fp.return_flight_info is not None
+            assert fp.return_flight_info.direction == FlightDirection.RETURN
+        else:
+            assert fp.return_flight_info is None
+
+    with scheduler._SessionLocal() as session:
+        rows = session.query(PriceHistory).filter_by(route_id=route.id).all()
+        assert sorted((row.source, row.price) for row in rows) == sorted(expected_quotes)
+        assert {row.batch_id for row in rows} == {best.batch_id}
+        stored_route = session.get(Route, route.id)
+        assert stored_route.last_flight_status == expected_status
+        assert stored_route.recent_3d_low == best.price
+        assert stored_route.last_notified_price == best.price
+
+
+async def test_pinned_roundtrip_keeps_legal_platform_pairs_and_selects_legal_best(
+    pinned_scheduler,
+):
+    scheduler = pinned_scheduler
+    route = _persist_pinned_route(scheduler, pinned_seat_class="经济舱")
+    cheapest_outbound = _pinned_leg(100)
+    # Even a wrongly labelled outbound response must be normalized by search leg.
+    cheapest_outbound.flight_info.direction = FlightDirection.RETURN
+    unrelated = _make_flight_price("CA999", price=1)
+    scheduler._scrape_all_platforms.side_effect = [
+        [
+            cheapest_outbound,
+            _pinned_leg(150),
+            _pinned_leg(300, source="ctrip"),
+            unrelated,
+            _pinned_leg(2, available_seats=0),
+            _pinned_leg(0),
+            _pinned_leg(-10),
+            _pinned_leg(10, seat_class="商务舱"),
+        ],
+        [
+            _pinned_leg(700, inbound=True, available_seats=3),
+            _pinned_leg(200, inbound=True, source="ctrip", available_seats=2),
+            _pinned_leg(1, inbound=True, available_seats=0),
+            _pinned_leg(0, inbound=True),
+            _pinned_leg(5, inbound=True, seat_class="商务舱"),
+        ],
+    ]
+
+    await scheduler.scrape_route(route)
+
+    _assert_pinned_success(scheduler, route, [
+        ("qunar", Decimal("800")),
+        ("qunar", Decimal("850")),
+        ("ctrip", Decimal("500")),
+    ])
+    # The tempting cross-platform 100 + 200 = 300 is not a purchasable quote.
+    with scheduler._SessionLocal() as session:
+        for row in session.query(PriceHistory).filter_by(route_id=route.id).all():
+            assert row.currency == "CNY"
+            assert row.seat_class == "经济舱"
+            assert row.available_seats == (3 if row.source == "qunar" else 2)
+            assert row.flight.flight_no == "CA953"
+            assert row.flight.direction == FlightDirection.DEPARTURE.value
+            assert row.flight.departure_city == route.origin
+            assert row.flight.arrival_city == route.destination
+            assert row.flight.departure_date == route.target_date
+            assert row.return_flight_id is not None
+            assert row.return_flight.flight_no == "CA954"
+            assert row.return_flight.direction == FlightDirection.RETURN.value
+            assert row.return_flight.departure_city == route.destination
+            assert row.return_flight.arrival_city == route.origin
+            assert row.return_flight.departure_date == route.return_date
+
+    calls = scheduler._scrape_all_platforms.await_args_list
+    assert len(calls) == 2
+    out_params, in_params = (call.args[0] for call in calls)
+    assert (out_params.departure_city, out_params.arrival_city) == ("上海", "北京")
+    assert out_params.departure_date == route.target_date
+    assert (in_params.departure_city, in_params.arrival_city) == ("北京", "上海")
+    assert in_params.departure_date == route.return_date
+    assert out_params.return_date is None and in_params.return_date is None
+    assert scheduler.scrapers[0].max_results == 100
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("source", "ctrip"), ("currency", "USD"), ("seat_class", "商务舱")],
+    ids=["cross-platform", "cross-currency", "cross-cabin"],
+)
+async def test_pinned_roundtrip_incompatible_scopes_never_persist_or_trigger_actions(
+    pinned_scheduler, field, value,
+):
+    scheduler = pinned_scheduler
+    route = _persist_pinned_route(scheduler)
+    inbound = _pinned_leg(200, inbound=True)
+    setattr(inbound, field, value)
+    scheduler._scrape_all_platforms.side_effect = [[_pinned_leg(100)], [inbound]]
+
+    await scheduler.scrape_route(route)
+
+    assert scheduler._scrape_all_platforms.await_count == 2
+    _assert_no_pinned_quotes(scheduler, route, "filtered_out")
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("departure_time", "16:00"),
+        ("arrival_time", "22:00"),
+        ("arrival_date", date(2026, 10, 9)),
+    ],
+    ids=["return-departure-window", "return-arrival-window", "return-arrival-day"],
+)
+async def test_pinned_roundtrip_filters_before_choosing_cheapest_return(
+    pinned_scheduler, field, invalid_value,
+):
+    scheduler = pinned_scheduler
+    route = _persist_pinned_route(
+        scheduler,
+        dep_time_from="08:00", dep_time_to="10:00",
+        arr_time_from="10:00", arr_time_to="12:00",
+        max_arrival_day_offset=0,
+        ret_dep_time_from="17:00", ret_dep_time_to="19:00",
+        ret_arr_time_from="19:00", ret_arr_time_to="21:00",
+        ret_max_arrival_day_offset=1,
+    )
+    valid_return = _pinned_leg(300, inbound=True)
+    # D+1 is legal for the return but not for the outbound.  Both search
+    # responses initially carry DEPARTURE, so direction normalization matters.
+    valid_return.flight_info.arrival_date = date(2026, 10, 8)
+    cheap_return = _pinned_leg(100, inbound=True)
+    cheap_return.flight_info = replace(valid_return.flight_info, **{field: invalid_value})
+    scheduler._scrape_all_platforms.side_effect = [
+        [_pinned_leg(500)], [cheap_return, valid_return],
+    ]
+
+    await scheduler.scrape_route(route)
+
+    _assert_pinned_success(scheduler, route, [("qunar", Decimal("800"))])
+    with scheduler._SessionLocal() as session:
+        row = session.query(PriceHistory).filter_by(route_id=route.id).one()
+        assert row.return_flight.departure_time == "18:00"
+        assert row.return_flight.arrival_time == "20:00"
+        assert row.return_flight.arrival_date == route.return_date + timedelta(days=1)
+
+
+@pytest.mark.parametrize(
+    ("reference_time", "expected_status"),
+    [("18:00", "available"), ("16:00", "schedule_changed")],
+)
+async def test_pinned_schedule_status_uses_filtered_quote(
+    pinned_scheduler, reference_time, expected_status,
+):
+    scheduler = pinned_scheduler
+    route = _persist_pinned_route(
+        scheduler, inbound_dep_time_ref=reference_time,
+        ret_dep_time_from="17:00", ret_dep_time_to="19:00",
+    )
+    invalid = _pinned_leg(100, inbound=True)
+    invalid.flight_info.departure_time = "16:00"
+    scheduler._scrape_all_platforms.side_effect = [
+        [_pinned_leg(500)], [invalid, _pinned_leg(300, inbound=True)],
+    ]
+
+    await scheduler.scrape_route(route)
+
+    _assert_pinned_success(
+        scheduler, route, [("qunar", Decimal("800"))], expected_status,
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "search_count"),
+    [
+        ("missing-number", "not_found", 1),
+        ("missing-date", "not_found", 1),
+        ("no-match", "not_found", 2),
+        ("sold-out", "sold_out", 2),
+        ("zero-price", "not_found", 2),
+        ("negative-price", "not_found", 2),
+        ("complete-roundtrip-only", "not_found", 2),
+    ],
+)
+async def test_pinned_roundtrip_unusable_return_overrides_outbound_schedule_change(
+    pinned_scheduler, failure, expected_status, search_count,
+):
+    scheduler = pinned_scheduler
+    overrides = {"outbound_dep_time_ref": "08:30"}
+    if failure == "missing-number":
+        overrides["inbound_flight_no"] = None
+    elif failure == "missing-date":
+        overrides["return_date"] = None
+    route = _persist_pinned_route(scheduler, **overrides)
+    outbound = _pinned_leg(500)
+    outbound.flight_info.departure_time = "11:00"  # >60-minute schedule change
+    inbound = _pinned_leg(200, inbound=True)
+    if failure == "no-match":
+        inbound.flight_info.flight_no = "CA999"
+    elif failure == "sold-out":
+        inbound.available_seats = 0
+    elif failure == "zero-price":
+        inbound.price = Decimal("0")
+    elif failure == "negative-price":
+        inbound.price = Decimal("-10")
+    elif failure == "complete-roundtrip-only":
+        inbound.return_flight_info = outbound.flight_info
+    scheduler._scrape_all_platforms.side_effect = [[outbound], [inbound]]
+
+    await scheduler.scrape_route(route)
+
+    assert scheduler._scrape_all_platforms.await_count == search_count
+    _assert_no_pinned_quotes(scheduler, route, expected_status)
+
+
+@pytest.mark.parametrize("complete_leg", ["outbound", "inbound"])
+async def test_pinned_roundtrip_does_not_add_complete_products_as_single_legs(
+    pinned_scheduler, complete_leg,
+):
+    scheduler = pinned_scheduler
+    route = _persist_pinned_route(scheduler)
+    outbound = _pinned_leg(500)
+    inbound = _pinned_leg(300, inbound=True)
+    complete = _pinned_leg(100, inbound=complete_leg == "inbound")
+    complete.return_flight_info = (
+        outbound.flight_info if complete_leg == "inbound" else inbound.flight_info
+    )
+    out_prices, in_prices = [outbound], [inbound]
+    (out_prices if complete_leg == "outbound" else in_prices).insert(0, complete)
+    scheduler._scrape_all_platforms.side_effect = [out_prices, in_prices]
+
+    await scheduler.scrape_route(route)
+
+    _assert_pinned_success(scheduler, route, [("qunar", Decimal("800"))])
+
+
+async def test_pinned_oneway_persists_single_legs_and_calls_prediction(pinned_scheduler):
+    scheduler = pinned_scheduler
+    route = _persist_pinned_route(
+        scheduler, trip_type="oneway", inbound_flight_no=None, return_date=None,
+    )
+    scheduler._scrape_all_platforms.return_value = [
+        _pinned_leg(500),
+        _pinned_leg(450, source="ctrip"),
+        _make_flight_price("CA999", price=1),
+        _pinned_leg(0),
+        _pinned_leg(-10),
+        _pinned_leg(100, available_seats=0),
+    ]
+
+    await scheduler.scrape_route(route)
+
+    scheduler._scrape_all_platforms.assert_awaited_once()
+    assert scheduler._scrape_all_platforms.await_args.args[0].return_date is None
+    _assert_pinned_success(scheduler, route, [
+        ("qunar", Decimal("500")), ("ctrip", Decimal("450")),
+    ])
+    with scheduler._SessionLocal() as session:
+        rows = session.query(PriceHistory).filter_by(route_id=route.id).all()
+        assert all(row.return_flight_id is None for row in rows)
+        assert all(row.flight.flight_no == "CA953" for row in rows)
+        assert all(row.flight.direction == FlightDirection.DEPARTURE.value for row in rows)

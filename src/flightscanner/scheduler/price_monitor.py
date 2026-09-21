@@ -11,7 +11,7 @@ import random
 import threading
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from statistics import median
@@ -26,7 +26,7 @@ from flightscanner.core.route_filter import filter_prices_by_route
 from flightscanner.core.services import RouteService
 from flightscanner.scrapers import ScraperRegistry
 from flightscanner.analyzers import RuleBasedAnalyzer
-from flightscanner.analyzers.rule_based_analyzer import _batch_min_prices
+from flightscanner.analyzers.rule_based_analyzer import _batch_min_prices, _latest_batch_snapshot
 from flightscanner.notifiers import build_notifiers
 from flightscanner.interfaces import FlightDirection, FlightPrice, FlightScraper, Notifier, PriceTrend, SearchParams
 from flightscanner.models.database import init_db
@@ -787,7 +787,8 @@ class PriceMonitorScheduler:
 
         # ── 往返程：回程搜索 ──────────────────────────────────────────────
         inbound_fp: Optional[FlightPrice] = None
-        in_status = "available"
+        in_prices: List[FlightPrice] = []
+        in_status = "not_found" if trip_type == "roundtrip" else "available"
         if trip_type == "roundtrip" and inbound_no and route.return_date:
             in_params = SearchParams(
                 departure_city=route.destination,
@@ -820,25 +821,26 @@ class PriceMonitorScheduler:
             )
             return
 
-        # ── 组合价格并存库 ────────────────────────────────────────────────
-        if trip_type == "roundtrip" and outbound_fp and inbound_fp:
-            total_price = outbound_fp.price + inbound_fp.price
-            prices_to_save: List[FlightPrice] = [
-                FlightPrice(
-                    flight_info=outbound_fp.flight_info,
-                    price=total_price,
-                    currency=outbound_fp.currency,
-                    seat_class=outbound_fp.seat_class,
-                    available_seats=outbound_fp.available_seats,
-                    scraped_at=outbound_fp.scraped_at,
-                    source=outbound_fp.source,
-                    return_flight_info=inbound_fp.flight_info,
-                )
-            ]
-        elif outbound_fp:
-            prices_to_save = [outbound_fp]
+        candidates: List[FlightPrice] = []
+        for leg_prices, flight_no, direction in (
+            (out_prices, outbound_no, FlightDirection.DEPARTURE),
+            (in_prices, inbound_no, FlightDirection.RETURN),
+        ):
+            if not flight_no:
+                continue
+            candidates.extend(
+                replace(fp, flight_info=replace(fp.flight_info, direction=direction))
+                for fp in self._pinned_flight_matches(leg_prices, flight_no, seat_class)
+                if fp.available_seats != 0 and fp.price > 0
+            )
+
+        candidates = filter_prices_by_route(
+            route, candidates, require_complete_roundtrip=False,
+        )
+        if trip_type == "roundtrip":
+            prices_to_save = self._combine_roundtrip_prices(candidates)
         else:
-            return
+            prices_to_save = candidates
 
         prices_to_save = self._apply_route_filters(route, prices_to_save)
         if not prices_to_save:
@@ -859,9 +861,18 @@ class PriceMonitorScheduler:
         for fp in prices_to_save:
             fp.batch_id = batch_id
 
+        best_fp = min(prices_to_save, key=lambda fp: fp.price)
+        best_return = (
+            replace(best_fp, flight_info=best_fp.return_flight_info, return_flight_info=None)
+            if best_fp.return_flight_info is not None else None
+        )
+        status = self._determine_flight_status(
+            route, best_fp, best_return, "available", "available", trip_type, inbound_no,
+        )
         session = self._SessionLocal()
         try:
             route_service = RouteService(session)
+            route_service.update_flight_status(route.id, status)
             for fp in prices_to_save:
                 route_service.save_price_for_route(route.id, fp)
             logger.info(
@@ -875,7 +886,6 @@ class PriceMonitorScheduler:
             )
             stats = self._compute_price_stats(history)
             price_count = int(stats.get("batch_count", len(history)))
-            best_fp = min(prices_to_save, key=lambda fp: fp.price)
 
             days_until_departure = (route.target_date - date.today()).days
             recent_3d_low = self._compute_recent_3d_low(history)
@@ -932,8 +942,7 @@ class PriceMonitorScheduler:
                         route.id,
                     )
 
-            # 精准航班模式也必须推进买入计划状态机。此前这里只执行价格告警，
-            # 导致同一计划在 route 模式能触发、切换到 flight 模式后却永久 pending。
+            await self._maybe_log_prediction(session, route, history)
             await self._check_buy_plans(
                 session,
                 route,
@@ -969,21 +978,34 @@ class PriceMonitorScheduler:
         Returns:
             (匹配到的最低价 FlightPrice 或 None, 状态字符串)
         """
-        target = target_flight_no.upper().strip()
-        all_matching = [
-            fp for fp in prices
-            if fp.flight_info.flight_no.upper().strip() == target
-            and (not seat_class_filter or fp.seat_class == seat_class_filter)
-        ]
-
+        all_matching = PriceMonitorScheduler._pinned_flight_matches(
+            prices, target_flight_no, seat_class_filter,
+        )
         if not all_matching:
             return None, "not_found"
 
         available = [fp for fp in all_matching if fp.available_seats != 0]
         if not available:
             return None, "sold_out"
+        priced = [fp for fp in available if fp.price > 0]
+        if not priced:
+            return None, "not_found"
 
-        return min(available, key=lambda fp: fp.price), "available"
+        return min(priced, key=lambda fp: fp.price), "available"
+
+    @staticmethod
+    def _pinned_flight_matches(
+        prices: List[FlightPrice],
+        target_flight_no: str,
+        seat_class_filter: Optional[str],
+    ) -> List[FlightPrice]:
+        target = target_flight_no.upper().strip()
+        return [
+            fp for fp in prices
+            if fp.flight_info.flight_no.upper().strip() == target
+            and (not seat_class_filter or fp.seat_class == seat_class_filter)
+            and fp.return_flight_info is None
+        ]
 
     @staticmethod
     def _determine_flight_status(
@@ -1007,6 +1029,12 @@ class PriceMonitorScheduler:
         if out_status == "not_found":
             return "not_found"
 
+        if trip_type == "roundtrip":
+            if in_status == "sold_out":
+                return "sold_out"
+            if not inbound_flight_no or inbound_fp is None or in_status == "not_found":
+                return "not_found"
+
         # 检查去程时刻是否变动（与参考时刻偏差 > 60 分钟）
         outbound_dep_time_ref = getattr(route, "outbound_dep_time_ref", None)
         if outbound_fp and outbound_dep_time_ref:
@@ -1014,12 +1042,7 @@ class PriceMonitorScheduler:
             if actual and _time_diff_minutes(outbound_dep_time_ref, actual) > 60:
                 return "schedule_changed"
 
-        # 往返程：检查回程
-        if trip_type == "roundtrip" and inbound_flight_no:
-            if in_status == "sold_out":
-                return "sold_out"
-            if in_status == "not_found":
-                return "not_found"
+        if trip_type == "roundtrip":
             inbound_dep_time_ref = getattr(route, "inbound_dep_time_ref", None)
             if inbound_fp and inbound_dep_time_ref:
                 actual = inbound_fp.flight_info.departure_time
@@ -1671,12 +1694,14 @@ class PriceMonitorScheduler:
             AI 简报 dict 或 None。
         """
         from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback_async
+        from flightscanner.analyzers.evolution_engine import build_evolved_context
         from flightscanner.core.services import build_experience_context
 
         try:
             session = self._SessionLocal()
             try:
                 experience_ctx = build_experience_context(session, route)
+                evolution_ctx = build_evolved_context(session, route.id)
             finally:
                 session.close()
             brief = await generate_brief_with_fallback_async(
@@ -1687,6 +1712,7 @@ class PriceMonitorScheduler:
                 base_url=settings.deepseek_base_url,
                 model=settings.deepseek_model,
                 experience_context=experience_ctx,
+                evolution_context=evolution_ctx,
             )
             return brief
         except Exception as exc:
@@ -2219,7 +2245,7 @@ class PriceMonitorScheduler:
             route: 路线对象。
             price_history: 最新价格历史列表。
         """
-        from flightscanner.analyzers.evolution_engine import log_prediction  # lazy import
+        from flightscanner.analyzers.evolution_engine import build_evolved_context, log_prediction
         from ui.components.ai_brief import _should_auto_trigger  # 复用已有逻辑
 
         try:
@@ -2243,6 +2269,7 @@ class PriceMonitorScheduler:
             from flightscanner.core.services import build_experience_context
 
             experience_ctx = build_experience_context(session, route)
+            evolution_ctx = build_evolved_context(session, route.id)
             brief = await generate_brief_with_fallback_async(
                 price_history=price_history,
                 target_date=route.target_date,
@@ -2251,8 +2278,9 @@ class PriceMonitorScheduler:
                 base_url=settings.deepseek_base_url,
                 model=settings.deepseek_model,
                 experience_context=experience_ctx,
+                evolution_context=evolution_ctx,
             )
-            current_price = float(min(fp.price for fp in price_history))
+            current_price = float(_latest_batch_snapshot(price_history)[0])
             days_until = (route.target_date - date.today()).days
             log_prediction(session, route.id, brief, current_price, days_until)
             logger.info("[G1] 预测已记录 route_id=%d action=%s", route.id, brief.get("action"))
@@ -2289,15 +2317,16 @@ class PriceMonitorScheduler:
                     route,
                     route_service.get_route_price_history(route_id, days=30),
                 )
-                if len(history) < 7:
-                    logger.info("[G1-refresh] 路线 %s 历史不足 7 条，跳过 AI 重预测", route_id)
+                if len(_batch_min_prices(history)) < 7:
+                    logger.info("[G1-refresh] 路线 %s 历史不足 7 批，跳过 AI 重预测", route_id)
                     return
 
                 from flightscanner.analyzers.deepseek_analyzer import generate_brief_with_fallback_async
-                from flightscanner.analyzers.evolution_engine import log_prediction
+                from flightscanner.analyzers.evolution_engine import build_evolved_context, log_prediction
                 from flightscanner.core.services import build_experience_context
 
                 experience_ctx = build_experience_context(session, route)
+                evolution_ctx = build_evolved_context(session, route.id)
                 brief = await generate_brief_with_fallback_async(
                     price_history=history,
                     target_date=route.target_date,
@@ -2306,8 +2335,9 @@ class PriceMonitorScheduler:
                     base_url=settings.deepseek_base_url,
                     model=settings.deepseek_model,
                     experience_context=experience_ctx,
+                    evolution_context=evolution_ctx,
                 )
-                current_price = float(min(fp.price for fp in history))
+                current_price = float(_latest_batch_snapshot(history)[0])
                 days_until = (route.target_date - date.today()).days
                 log_prediction(session, route_id, brief, current_price, days_until)
                 logger.info(

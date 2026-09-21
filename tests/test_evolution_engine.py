@@ -7,6 +7,7 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -210,6 +211,114 @@ class TestG1LogPrediction:
         assert log.llm_source == "deepseek"
 
 
+@pytest.mark.parametrize("entrypoint", ["automatic", "refresh", "notify"])
+@pytest.mark.parametrize("reverse_history", [False, True])
+@pytest.mark.parametrize("tied_batches", [False, True])
+async def test_prediction_entrypoints_use_current_batch_and_feedback(
+    session_factory, monkeypatch, entrypoint, reverse_history, tied_batches,
+):
+    from unittest.mock import AsyncMock
+
+    from flightscanner.analyzers import deepseek_analyzer
+    from flightscanner.core.services import RouteService
+    from flightscanner.scheduler.price_monitor import PriceMonitorScheduler
+
+    now = datetime.now(timezone.utc)
+    with session_factory() as session:
+        route = RouteService(session).add_route(
+            origin="北京", destination="上海",
+            target_date=date.today() + timedelta(days=30), target_price=Decimal("500"),
+        )
+        flight = FlightInfo(
+            flight_no="CA1234", airline="国航", departure_city=route.origin,
+            arrival_city=route.destination, departure_time="08:00", arrival_time="10:00",
+            departure_date=route.target_date, direction=FlightDirection.DEPARTURE,
+        )
+        for index, price in enumerate([800, 900, 1000, 1100, 1000, 1100, 1200, 1600]):
+            batch = min(index, 6)
+            record = FlightPrice(
+                flight_info=flight, price=Decimal(price), currency="CNY", seat_class="经济舱",
+                available_seats=5, source="qunar", batch_id=f"batch-{index if tied_batches else batch}",
+                scraped_at=now - timedelta(hours=(6 - batch) * 6)
+                + timedelta(seconds=0 if tied_batches else index),
+            )
+            RouteService(session).save_price_for_route(route.id, record)
+        for index in range(3):
+            session.add(AIPredictionLog(
+                route_id=route.id, predicted_at=now - timedelta(days=10 + index),
+                price_at_prediction=1000, days_until_flight=40 + index,
+                recommended_action="Wait", outcome_status="loss", pain_index=350,
+                actual_final_price=1350, llm_source="deepseek",
+            ))
+        session.commit()
+        history = RouteService(session).get_route_price_history(route.id, days=30)
+        if reverse_history:
+            history.reverse()
+        generate = AsyncMock(return_value=_make_brief())
+        monkeypatch.setattr(deepseek_analyzer, "generate_brief_with_fallback_async", generate)
+        scheduler = PriceMonitorScheduler.__new__(PriceMonitorScheduler)
+        scheduler._SessionLocal = session_factory
+
+        if entrypoint == "automatic":
+            await scheduler._maybe_log_prediction(session, route, history)
+            await scheduler._maybe_log_prediction(session, route, history)
+        elif entrypoint == "refresh":
+            await scheduler.refresh_prediction_for_route(route.id)
+        else:
+            await scheduler._get_ai_brief_for_notify(history, route)
+
+        generate.assert_awaited_once()
+        assert "胜率" in generate.call_args.kwargs["evolution_context"]
+        assert "experience_context" in generate.call_args.kwargs
+        logs = session.query(AIPredictionLog).filter_by(outcome_status="pending").all()
+        if entrypoint == "notify":
+            assert logs == []
+        else:
+            assert len(logs) == 1
+            assert float(logs[0].price_at_prediction) == 1200
+            assert logs[0].recommended_action == "Wait"
+
+
+@pytest.mark.parametrize("entrypoint", ["automatic", "refresh"])
+@pytest.mark.parametrize("record_count", [0, 10])
+async def test_prediction_entrypoints_require_distinct_batches(
+    session_factory, monkeypatch, entrypoint, record_count,
+):
+    from unittest.mock import AsyncMock
+
+    from flightscanner.analyzers import deepseek_analyzer
+    from flightscanner.core.services import RouteService
+    from flightscanner.scheduler.price_monitor import PriceMonitorScheduler
+
+    with session_factory() as session:
+        route = RouteService(session).add_route(
+            origin="北京", destination="上海", target_date=date.today() + timedelta(days=30),
+            target_price=Decimal("500"),
+        )
+        flight = FlightInfo(
+            flight_no="CA1234", airline="国航", departure_city=route.origin,
+            arrival_city=route.destination, departure_time="08:00", arrival_time="10:00",
+            departure_date=route.target_date, direction=FlightDirection.DEPARTURE,
+        )
+        for index in range(record_count):
+            RouteService(session).save_price_for_route(route.id, FlightPrice(
+                flight_info=flight, price=Decimal(1000 + index), currency="CNY",
+                seat_class="经济舱", available_seats=5, source="qunar", batch_id="one-batch",
+                scraped_at=datetime.now(timezone.utc),
+            ))
+        generate = AsyncMock()
+        monkeypatch.setattr(deepseek_analyzer, "generate_brief_with_fallback_async", generate)
+        scheduler = PriceMonitorScheduler.__new__(PriceMonitorScheduler)
+        scheduler._SessionLocal = session_factory
+        if entrypoint == "automatic":
+            history = RouteService(session).get_route_price_history(route.id, days=30)
+            await scheduler._maybe_log_prediction(session, route, history)
+        else:
+            await scheduler.refresh_prediction_for_route(route.id)
+        generate.assert_not_awaited()
+        assert session.query(AIPredictionLog).count() == 0
+
+
 # ── TestG2Backtesting ─────────────────────────────────────────────────────────
 
 class TestG2Backtesting:
@@ -343,6 +452,101 @@ class TestG2Backtesting:
         assert log.outcome_status == "neutral"
         assert float(log.pain_index or 0) == pytest.approx(0.0)
 
+    @pytest.mark.parametrize("low_prices", [(800.0,), (850.0, 800.0)])
+    def test_buy_loss_when_price_drops_then_returns_to_base(
+        self, db_session, sample_route, sample_flight, low_prices
+    ):
+        """A rebound must not erase Buy opportunity loss, even for a single low batch."""
+        predicted_at = datetime.now(timezone.utc) - timedelta(days=6)
+        log = self._setup_prediction(
+            db_session, sample_route, sample_flight, "Buy", 1000.0, predicted_at
+        )
+        self._add_price_records(db_session, sample_route.id, sample_flight.id, [
+            (price, f"batch{i}", predicted_at + timedelta(hours=i + 1))
+            for i, price in enumerate((*low_prices, 1000.0))
+        ])
+
+        _evaluate_prediction(db_session, log)
+
+        assert log.outcome_status == "loss"
+        assert float(log.actual_min_price) == pytest.approx(800.0)
+        assert float(log.actual_final_price) == pytest.approx(1000.0)
+        assert float(log.pain_index) == pytest.approx(140.0)
+        assert log.catchable_low_exists == int(len(low_prices) >= 2)
+
+    @pytest.mark.parametrize("legacy", [False, True], ids=["batch-id", "legacy-second"])
+    @pytest.mark.parametrize("latest_prices", [(900.0, 1200.0), (1200.0, 900.0)])
+    @pytest.mark.parametrize("stagger_timestamps", [False, True], ids=["same-time", "staggered"])
+    def test_final_price_is_latest_batch_minimum(
+        self, db_session, sample_route, sample_flight,
+        legacy, latest_prices, stagger_timestamps,
+    ):
+        """Final price uses the latest batch minimum, not quote or insertion order."""
+        predicted_at = (datetime.now(timezone.utc) - timedelta(days=6)).replace(microsecond=0)
+        log = self._setup_prediction(
+            db_session, sample_route, sample_flight, "Wait", 1000.0, predicted_at
+        )
+        latest_at = predicted_at + timedelta(hours=12)
+        # Real batches may span seconds; legacy quotes share a second despite microseconds.
+        offset = timedelta(microseconds=500000) if legacy else timedelta(seconds=2)
+        if not stagger_timestamps:
+            offset = timedelta(0)
+        latest_batch = None if legacy else "a_latest"
+        self._add_price_records(db_session, sample_route.id, sample_flight.id, [
+            (latest_prices[0], latest_batch, latest_at),
+            (latest_prices[1], latest_batch, latest_at + offset),
+            # Insert the earlier, cheaper batch last to distinguish time from row order.
+            (700.0, None if legacy else "z_earlier", predicted_at + timedelta(hours=6)),
+        ])
+
+        _evaluate_prediction(db_session, log)
+
+        assert float(log.actual_min_price) == pytest.approx(700.0)
+        assert float(log.actual_final_price) == pytest.approx(900.0)
+        assert log.outcome_status == "win"
+        assert float(log.pain_index) == pytest.approx(0.0)
+        assert log.catchable_low_exists == 1
+
+    @pytest.mark.parametrize("prices", [(900, 1200), (1200, 900)])
+    def test_final_price_is_deterministic_for_simultaneous_batches(
+        self, db_session, sample_route, sample_flight, prices,
+    ):
+        predicted_at = datetime.now(timezone.utc) - timedelta(days=6)
+        log = self._setup_prediction(
+            db_session, sample_route, sample_flight, "Wait", 1000, predicted_at,
+        )
+        self._add_price_records(db_session, sample_route.id, sample_flight.id, [
+            (price, f"batch-{price}", predicted_at + timedelta(hours=6))
+            for price in prices
+        ])
+
+        _evaluate_prediction(db_session, log)
+
+        assert float(log.actual_final_price) == 900
+        assert log.outcome_status == "win"
+        assert float(log.pain_index) == 0
+
+    @pytest.mark.parametrize("batch_id", ["single-batch", None], ids=["batch-id", "legacy-second"])
+    def test_multiple_quotes_in_one_batch_are_insufficient(
+        self, db_session, sample_route, sample_flight, batch_id
+    ):
+        """Multiple quotes, including legacy quotes within one second, count once."""
+        predicted_at = (datetime.now(timezone.utc) - timedelta(days=6)).replace(microsecond=0)
+        log = self._setup_prediction(
+            db_session, sample_route, sample_flight, "Wait", 1000.0, predicted_at
+        )
+        scraped_at = predicted_at + timedelta(hours=6)
+        self._add_price_records(db_session, sample_route.id, sample_flight.id, [
+            (900.0, batch_id, scraped_at),
+            (1200.0, batch_id, scraped_at + timedelta(microseconds=500000)),
+        ])
+
+        _evaluate_prediction(db_session, log)
+
+        assert log.outcome_status == "skipped"
+        assert log.actual_min_price is None
+        assert log.actual_final_price is None
+
     def test_skipped_when_insufficient_data(self, db_session, sample_route, sample_flight):
         """Only 1 batch of price data → outcome=skipped (insufficient for backtesting)."""
         predicted_at = datetime.now(timezone.utc) - timedelta(days=6)
@@ -370,8 +574,9 @@ class TestG2Backtesting:
         _evaluate_prediction(db_session, log)
         assert log.outcome_status == "skipped"
 
-    def test_7day_window_used_for_active_routes(self, db_session):
-        """Prediction 7+ days old on a future route → uses 7-day window only."""
+    @pytest.mark.parametrize("action", ["Buy", "Wait"])
+    def test_7day_window_used_for_active_routes(self, db_session, action):
+        """Only prices strictly after prediction and up to day 7 affect evaluation."""
         # Create a route with a FUTURE target_date (flight hasn't departed)
         future_route = Route(
             origin="北京",
@@ -404,47 +609,30 @@ class TestG2Backtesting:
             predicted_at=predicted_at,
             price_at_prediction=Decimal("800.00"),
             days_until_flight=38,
-            recommended_action="Buy",
+            recommended_action=action,
             outcome_status="pending",
             llm_source="rule_based",
         )
         db_session.add(log)
         db_session.flush()
 
-        # Add 2 price records within the 7-day window (days 1-6 after prediction)
-        for i, (price, batch_id) in enumerate([(780.0, "b1"), (760.0, "b2")]):
-            rec = PriceHistory(
-                flight_id=future_flight.id,
-                route_id=future_route.id,
-                price=Decimal(str(price)),
-                currency="CNY",
-                seat_class="经济舱",
-                source="qunar",
-                scraped_at=predicted_at + timedelta(days=i + 1),
-                batch_id=batch_id,
-            )
-            db_session.add(rec)
-
-        # Add a price record OUTSIDE the 7-day window (day 9) — should be ignored
-        rec_outside = PriceHistory(
-            flight_id=future_flight.id,
-            route_id=future_route.id,
-            price=Decimal("500.00"),  # extreme drop outside window
-            currency="CNY",
-            seat_class="经济舱",
-            source="qunar",
-            scraped_at=predicted_at + timedelta(days=9),
-            batch_id="b_outside",
-        )
-        db_session.add(rec_outside)
-        db_session.commit()
+        cutoff = predicted_at + timedelta(days=7)
+        self._add_price_records(db_session, future_route.id, future_flight.id, [
+            (100.0, "at_prediction", predicted_at),  # excluded start boundary
+            (780.0, "b1", predicted_at + timedelta(days=1)),
+            (760.0, "b2", cutoff),  # included end boundary
+            # Even another quote in the final batch must not leak past the cutoff.
+            (500.0, "b2", cutoff + timedelta(microseconds=1)),
+            (1500.0, "b_outside", predicted_at + timedelta(days=9)),
+        ])
 
         _evaluate_prediction(db_session, log)
 
-        # Should be evaluated (not skipped) and actual_min should NOT include 500
-        assert log.outcome_status != "skipped"
-        assert log.actual_min_price is not None
-        assert float(log.actual_min_price) > 500.0  # 500 record should be excluded
+        assert log.outcome_status == "neutral"
+        assert float(log.actual_min_price) == pytest.approx(760.0)
+        assert float(log.actual_final_price) == pytest.approx(760.0)
+        assert float(log.pain_index) == pytest.approx(0.0)
+        assert log.catchable_low_exists == 0
 
 
 # ── TestDetectCatchableLow ────────────────────────────────────────────────────
@@ -683,18 +871,16 @@ class TestRunBacktesting:
     """Integration test for run_backtesting() using async."""
 
     @pytest.mark.asyncio
-    async def test_7day_trigger_only_backtests_latest_prediction(self, session_factory):
-        """7-day window: only the latest pending prediction per route is backtested.
-
-        If a route has two old predictions (both ≥7 days), the older one should
-        remain 'pending' (not evaluated) — only the newest gets the 7-day backtest.
-        """
-        session = session_factory()
-        try:
+    @pytest.mark.parametrize("new_age_days", [8, 1], ids=["all-mature", "new-pending"])
+    async def test_7day_trigger_backtests_all_mature_predictions(
+        self, session_factory, monkeypatch, new_age_days
+    ):
+        """Each mature prediction is evaluated once, regardless of newer pending logs."""
+        with session_factory() as session:
             route = Route(
                 origin="北京",
                 destination="杭州",
-                target_date=date.today() + timedelta(days=60),  # future route
+                target_date=date.today() + timedelta(days=60),
                 target_price=Decimal("500.00"),
                 scrape_interval=6,
                 is_active=1,
@@ -716,8 +902,6 @@ class TestRunBacktesting:
             session.flush()
 
             now = datetime.now(timezone.utc)
-
-            # Older prediction: 20 days ago (≥7 days, but NOT the latest)
             old_log = AIPredictionLog(
                 route_id=route.id,
                 predicted_at=now - timedelta(days=20),
@@ -727,61 +911,59 @@ class TestRunBacktesting:
                 outcome_status="pending",
                 llm_source="rule_based",
             )
-            # Newer prediction: 8 days ago (≥7 days and IS the latest)
             new_log = AIPredictionLog(
                 route_id=route.id,
-                predicted_at=now - timedelta(days=8),
+                predicted_at=now - timedelta(days=new_age_days),
                 price_at_prediction=Decimal("850.00"),
-                days_until_flight=68,
+                days_until_flight=60 + new_age_days,
                 recommended_action="Wait",
                 outcome_status="pending",
                 llm_source="rule_based",
             )
-            session.add(old_log)
-            session.add(new_log)
+            session.add_all([old_log, new_log])
             session.flush()
 
-            # Add 2 price batches within the 7-day window of the NEWER prediction
-            for i, (price, bid) in enumerate([(830.0, "b1"), (820.0, "b2")]):
-                rec = PriceHistory(
-                    flight_id=flight.id,
-                    route_id=route.id,
-                    price=Decimal(str(price)),
-                    currency="CNY",
-                    seat_class="经济舱",
-                    source="qunar",
-                    scraped_at=new_log.predicted_at + timedelta(hours=(i + 1) * 12),
-                    batch_id=bid,
-                )
-                session.add(rec)
+            # Separate windows also ensure old prices cannot affect the newer prediction.
+            for log, prices in [(old_log, [700.0, 800.0]), (new_log, [830.0, 820.0])]:
+                for i, price in enumerate(prices):
+                    _make_price_record(
+                        session, route.id, flight.id, price, f"{log.id}_b{i}",
+                        log.predicted_at + timedelta(hours=(i + 1) * 6),
+                    )
 
-            session.commit()
             old_log_id = old_log.id
             new_log_id = new_log.id
-        finally:
-            session.close()
 
-        await run_backtesting(session_factory)
+        evaluate = Mock(wraps=_evaluate_prediction)
+        monkeypatch.setattr(
+            "flightscanner.analyzers.evolution_engine._evaluate_prediction", evaluate
+        )
+        expected_count = 2 if new_age_days >= 7 else 1
+        assert await run_backtesting(session_factory) == expected_count
+        assert evaluate.call_count == expected_count
 
-        verify = session_factory()
-        try:
-            refreshed_old = verify.query(AIPredictionLog).filter(
-                AIPredictionLog.id == old_log_id
-            ).first()
-            refreshed_new = verify.query(AIPredictionLog).filter(
-                AIPredictionLog.id == new_log_id
-            ).first()
+        with session_factory() as verify:
+            refreshed_old = verify.get(AIPredictionLog, old_log_id)
+            refreshed_new = verify.get(AIPredictionLog, new_log_id)
 
-            # Older prediction should still be pending (not selected for 7-day backtest)
-            assert refreshed_old.outcome_status == "pending", (
-                "Older prediction should remain pending — only the latest is selected"
-            )
-            # Newer (latest) prediction should have been evaluated
-            assert refreshed_new.outcome_status != "pending", (
-                "Latest prediction should have been backtested via the 7-day window"
-            )
-        finally:
-            verify.close()
+            assert refreshed_old.outcome_status == "loss"
+            assert float(refreshed_old.actual_min_price) == pytest.approx(700.0)
+            assert float(refreshed_old.actual_final_price) == pytest.approx(800.0)
+            assert float(refreshed_old.pain_index) == pytest.approx(140.0)
+            if new_age_days >= 7:
+                assert refreshed_new.outcome_status == "neutral"
+                assert float(refreshed_new.actual_min_price) == pytest.approx(820.0)
+                assert float(refreshed_new.actual_final_price) == pytest.approx(820.0)
+                assert float(refreshed_new.pain_index) == pytest.approx(0.0)
+            else:
+                assert refreshed_new.outcome_status == "pending"
+                assert refreshed_new.actual_min_price is None
+                assert refreshed_new.actual_final_price is None
+                assert refreshed_new.pain_index is None
+
+        evaluate.reset_mock()
+        assert await run_backtesting(session_factory) == 0
+        evaluate.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_backtesting_processes_pending_records(self, session_factory):

@@ -53,6 +53,65 @@ async def api_client(api_context):
         yield client, session
 
 
+def test_importing_api_dependencies_does_not_initialize_database(monkeypatch):
+    import importlib.util
+    from unittest.mock import Mock
+
+    from flightscanner.api import deps
+    from flightscanner.models import database
+
+    initialize = Mock(side_effect=AssertionError("Database initialization during import"))
+    monkeypatch.setattr(database, "init_db", initialize)
+    spec = importlib.util.spec_from_file_location("isolated_api_deps", deps.__file__)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    initialize.assert_not_called()
+    assert module._engine is None
+    assert module._SessionLocal is None
+
+
+def test_api_and_scheduler_share_configured_database(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+
+    from flightscanner.api import deps
+    from flightscanner.core.services import RouteService
+    from flightscanner.scheduler import price_monitor
+
+    database_path = tmp_path / "configured.sqlite"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(deps, "_engine", None)
+    monkeypatch.setattr(deps, "_SessionLocal", None)
+    monkeypatch.setattr(deps.settings, "database_url", f"sqlite:///{database_path}")
+    init_spy = Mock(wraps=init_db)
+    monkeypatch.setattr(deps, "init_db", init_spy)
+    monkeypatch.setattr(
+        price_monitor.PriceMonitorScheduler, "_build_configured_scrapers", lambda *_: [],
+    )
+    monkeypatch.setattr(price_monitor, "build_notifiers", lambda *_: [])
+
+    assert not database_path.exists()
+    dependency = deps.get_db()
+    session = next(dependency)
+    route = RouteService(session).add_route(
+        origin="上海", destination="北京",
+        target_date=date.today() + timedelta(days=30), target_price=Decimal("800"),
+    )
+    route_id = route.id
+    dependency.close()
+    factory = deps._get_session_factory()
+    assert factory is deps._get_session_factory()
+    init_spy.assert_called_once_with(f"sqlite:///{database_path}")
+
+    scheduler = price_monitor.PriceMonitorScheduler(enable_notifications=False)
+    try:
+        with scheduler._SessionLocal() as scheduler_session:
+            assert scheduler_session.get(Route, route_id).origin == "上海"
+        assert not (tmp_path / "flightscanner.db").exists()
+    finally:
+        scheduler._engine.dispose()
+        deps._engine.dispose()
+
+
 def _route_payload(
     *,
     outbound_limit: int | None,
@@ -185,6 +244,43 @@ async def test_create_route_persists_arrival_day_limits(
     stored = session.query(Route).filter_by(id=response.json()["id"]).one()
     assert stored.max_arrival_day_offset == outbound_limit
     assert stored.ret_max_arrival_day_offset == return_limit
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "expected_rate"),
+    [
+        (["win", "loss", "neutral", "pending", "skipped"], 50.0),
+        (["neutral"], 50.0),
+        (["pending", "skipped"], None),
+        (["win"] * 51 + ["loss", "neutral"], 97.2),
+    ],
+)
+async def test_prediction_api_uses_feedback_win_rate(api_client, outcomes, expected_rate):
+    from flightscanner.analyzers.evolution_engine import get_route_credibility
+
+    client, session = api_client
+    response = await client.post(
+        "/api/routes", json=_route_payload(outbound_limit=None, return_limit=None),
+    )
+    assert response.status_code == 201
+    route_id = response.json()["id"]
+    now = datetime.now(timezone.utc)
+    for index, outcome in enumerate(outcomes):
+        session.add(AIPredictionLog(
+            route_id=route_id, predicted_at=now - timedelta(days=index),
+            price_at_prediction=1000, days_until_flight=30 + index,
+            recommended_action="Wait", outcome_status=outcome, llm_source="rule_based",
+        ))
+    session.commit()
+
+    response = await client.get(f"/api/routes/{route_id}/predictions")
+
+    assert response.status_code == 200
+    assert response.json()["win_rate"] == expected_rate
+    assert response.json()["total"] == len(outcomes)
+    assert len(response.json()["predictions"]) == min(50, len(outcomes))
+    if expected_rate is not None:
+        assert round(get_route_credibility(session, route_id)["win_rate"] * 100, 1) == expected_rate
 
 
 _TIME_WINDOW_PREFIXES = ("dep_time", "arr_time", "ret_dep_time", "ret_arr_time")

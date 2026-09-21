@@ -847,22 +847,13 @@ def get_route_predictions(
         .scalar()
         or 0
     )
-    win_count = (
-        db.query(func.count(AIPredictionLog.id))
-        .filter(AIPredictionLog.route_id == route_id, AIPredictionLog.outcome_status == "win")
-        .scalar()
-        or 0
+    from flightscanner.analyzers.evolution_engine import get_route_credibility
+
+    credibility = get_route_credibility(db, route_id)
+    win_rate = (
+        round(credibility["win_rate"] * 100, 1)
+        if credibility["evaluated_count"] > 0 else None
     )
-    resolved = (
-        db.query(func.count(AIPredictionLog.id))
-        .filter(
-            AIPredictionLog.route_id == route_id,
-            AIPredictionLog.outcome_status.in_(["win", "loss", "neutral"]),
-        )
-        .scalar()
-        or 0
-    )
-    win_rate = round(win_count / resolved * 100, 1) if resolved > 0 else None
 
     return RoutePredictionsResponse(
         route_id=route_id,

@@ -13,7 +13,7 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from flightscanner.models.database import AIPredictionLog, PriceHistory, Route
@@ -113,8 +113,9 @@ async def run_backtesting(session_factory: Any) -> int:
     触发条件（满足任一即回测）：
     - 对应路线已出发（Route.target_date < today）：该路线所有 pending 记录均可评估，
       使用完整出发前价格窗口。
-    - 预测写入距今已满 7 天（predicted_at ≤ now - 7d）：仅对**该路线最新一条** pending
-      记录触发，使用预测后 7 天价格窗口（防止历史旧记录反复触发大量回测）。
+    - 预测写入距今已满 7 天（predicted_at ≤ now - 7d）：每条满龄 pending 记录均触发，
+      使用各自预测后 7 天价格窗口，不受同路线更新预测影响。
+    已评估记录不再为 pending，重复运行不会重新回测。
 
     Args:
         session_factory: SQLAlchemy SessionLocal 工厂。
@@ -127,38 +128,17 @@ async def run_backtesting(session_factory: Any) -> int:
     processed = 0
 
     with session_factory() as session:
-        # 子查询：每条路线在 pending 记录中最新的 predicted_at
-        latest_subq = (
-            session.query(
-                AIPredictionLog.route_id,
-                func.max(AIPredictionLog.predicted_at).label("latest_predicted_at"),
-            )
-            .filter(AIPredictionLog.outcome_status == "pending")
-            .group_by(AIPredictionLog.route_id)
-            .subquery()
-        )
-
         # 查询所有 pending 且满足以下任一条件的记录：
         # ① 对应路线已出发（全量 pending 记录均可回测）
-        # ② 该记录是本路线最新的 pending 预测，且写入已满 7 天
+        # ② 该记录自身写入已满 7 天
         pending_logs = (
             session.query(AIPredictionLog)
             .join(Route, AIPredictionLog.route_id == Route.id)
-            .outerjoin(
-                latest_subq,
-                and_(
-                    AIPredictionLog.route_id == latest_subq.c.route_id,
-                    AIPredictionLog.predicted_at == latest_subq.c.latest_predicted_at,
-                ),
-            )
             .filter(
                 AIPredictionLog.outcome_status == "pending",
                 or_(
                     Route.target_date < today,
-                    and_(
-                        AIPredictionLog.predicted_at <= seven_days_ago,
-                        latest_subq.c.latest_predicted_at.isnot(None),
-                    ),
+                    AIPredictionLog.predicted_at <= seven_days_ago,
                 ),
             )
             .all()
@@ -227,23 +207,25 @@ def _evaluate_prediction(session: Session, log_entry: AIPredictionLog) -> None:
         log_entry.id, window_label, len(price_records),
     )
 
-    # 按批次 ID 去重，统计唯一批次数量
-    batch_ids = set()
+    # 按批次统计最低价；无 batch_id 时仍以 scraped_at 秒级精度作为伪批次 ID。
+    batch_min_prices: Dict[str, float] = {}
     for rec in price_records:
-        if rec.batch_id:
-            batch_ids.add(rec.batch_id)
-        else:
-            # 无 batch_id 的记录，以 scraped_at 秒级精度作为伪批次 ID
-            batch_ids.add(str(rec.scraped_at.replace(microsecond=0)))
+        bid = rec.batch_id or str(rec.scraped_at.replace(microsecond=0))
+        price = float(rec.price)
+        batch_min_prices[bid] = min(batch_min_prices.get(bid, price), price)
 
-    if len(batch_ids) < 2:
+    if len(batch_min_prices) < 2:
         log_entry.outcome_status = "skipped"
         session.commit()
         return
 
-    prices = [float(rec.price) for rec in price_records]
-    actual_min = min(prices)
-    actual_final = float(price_records[-1].price)
+    actual_min = min(batch_min_prices.values())
+    latest_time = price_records[-1].scraped_at
+    latest_bids = {
+        rec.batch_id or str(rec.scraped_at.replace(microsecond=0))
+        for rec in price_records if rec.scraped_at == latest_time
+    }
+    actual_final = min(batch_min_prices[bid] for bid in latest_bids)
 
     log_entry.actual_min_price = actual_min
     log_entry.actual_final_price = actual_final
@@ -267,17 +249,17 @@ def _evaluate_prediction(session: Session, log_entry: AIPredictionLog) -> None:
         if rise_pct > SIGNIFICANCE_THRESHOLD:
             pain = rise * 1.0
 
-    # 判断结果
+    # 已产生的损失优先于最终价格变化，避免价格回升掩盖 Buy 的机会成本。
     change_pct = abs(actual_final - base_price) / base_price if base_price > 0 else 0.0
-    if change_pct <= SIGNIFICANCE_THRESHOLD:
-        log_entry.outcome_status = "neutral"
-        log_entry.pain_index = 0.0
-    elif pain <= 0:
-        log_entry.outcome_status = "win"
-        log_entry.pain_index = 0.0
-    else:
+    if pain > 0:
         log_entry.outcome_status = "loss"
         log_entry.pain_index = pain
+    elif change_pct <= SIGNIFICANCE_THRESHOLD:
+        log_entry.outcome_status = "neutral"
+        log_entry.pain_index = 0.0
+    else:
+        log_entry.outcome_status = "win"
+        log_entry.pain_index = 0.0
 
     # ── 可捕捉低价检测 ────────────────────────────────────────────────────────
     log_entry.catchable_low_exists = _detect_catchable_low(price_records, base_price)
@@ -500,7 +482,7 @@ def get_route_credibility(session: Session, route_id: int) -> Dict[str, Any]:
 
 
 def build_evolved_context(session: Session, route_id: int) -> str:
-    """G4：拼接历史失误摘要，作为 system prompt 后缀注入 AI 简报生成。
+    """G4：拼接历史失误摘要，供 AI 简报作为参考数据使用。
 
     Args:
         session: SQLAlchemy 会话。
