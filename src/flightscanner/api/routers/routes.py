@@ -1,11 +1,12 @@
 """Routes API endpoints for Dashboard data."""
 
+import re
 from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from flightscanner.analyzers.rule_based_analyzer import RuleBasedAnalyzer
@@ -307,6 +308,10 @@ class CreateRouteRequest(BaseModel):
     dep_time_to: Optional[str] = None
     arr_time_from: Optional[str] = None
     arr_time_to: Optional[str] = None
+    ret_dep_time_from: Optional[str] = None
+    ret_dep_time_to: Optional[str] = None
+    ret_arr_time_from: Optional[str] = None
+    ret_arr_time_to: Optional[str] = None
     max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
     ret_max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
     max_results: int = 20
@@ -314,6 +319,27 @@ class CreateRouteRequest(BaseModel):
     outbound_flight_no: Optional[str] = None
     inbound_flight_no: Optional[str] = None
     pinned_seat_class: Optional[str] = None
+
+    @field_validator(
+        "dep_time_from", "dep_time_to", "arr_time_from", "arr_time_to",
+        "ret_dep_time_from", "ret_dep_time_to", "ret_arr_time_from", "ret_arr_time_to",
+    )
+    @classmethod
+    def validate_time(cls, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
+            raise ValueError("Time must be HH:MM between 00:00 and 23:59")
+        return value
+
+    @model_validator(mode="after")
+    def validate_time_windows(self) -> "CreateRouteRequest":
+        for prefix in ("dep_time", "arr_time", "ret_dep_time", "ret_arr_time"):
+            time_from = getattr(self, f"{prefix}_from")
+            time_to = getattr(self, f"{prefix}_to")
+            if time_from is not None and time_to is not None and time_from > time_to:
+                raise ValueError(f"{prefix}_from must be <= {prefix}_to")
+        return self
 
 
 class CreateRouteResponse(BaseModel):
@@ -342,6 +368,10 @@ def create_route(
             dep_time_to=body.dep_time_to,
             arr_time_from=body.arr_time_from,
             arr_time_to=body.arr_time_to,
+            ret_dep_time_from=body.ret_dep_time_from,
+            ret_dep_time_to=body.ret_dep_time_to,
+            ret_arr_time_from=body.ret_arr_time_from,
+            ret_arr_time_to=body.ret_arr_time_to,
             max_arrival_day_offset=body.max_arrival_day_offset,
             ret_max_arrival_day_offset=body.ret_max_arrival_day_offset,
             max_results=body.max_results,

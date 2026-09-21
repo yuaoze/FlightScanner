@@ -187,6 +187,124 @@ async def test_create_route_persists_arrival_day_limits(
     assert stored.ret_max_arrival_day_offset == return_limit
 
 
+_TIME_WINDOW_PREFIXES = ("dep_time", "arr_time", "ret_dep_time", "ret_arr_time")
+_TIME_FIELDS = tuple(
+    f"{prefix}_{bound}" for prefix in _TIME_WINDOW_PREFIXES for bound in ("from", "to")
+)
+
+
+async def _assert_created_time_windows(api_client, payload: dict) -> None:
+    client, session = api_client
+    response = await client.post("/api/routes", json=payload)
+    assert response.status_code == 201, response.text
+    route_id = response.json()["id"]
+    expected = {field: payload.get(field) or None for field in _TIME_FIELDS}
+
+    session.expire_all()
+    stored = session.query(Route).filter_by(id=route_id).one()
+    assert {field: getattr(stored, field) for field in _TIME_FIELDS} == expected
+
+    detail = await client.get(f"/api/routes/{route_id}/detail")
+    assert detail.status_code == 200, detail.text
+    assert {field: detail.json()[field] for field in _TIME_FIELDS} == expected
+    assert detail.json()["trip_type"] == payload["trip_type"]
+
+
+@pytest.mark.parametrize("trip_type", ["oneway", "roundtrip"])
+async def test_create_route_persists_independent_time_windows(
+    api_client, trip_type: str,
+) -> None:
+    payload = _route_payload(outbound_limit=None, return_limit=None)
+    payload.update(
+        trip_type=trip_type,
+        dep_time_from="06:15",
+        dep_time_to="09:30",
+        arr_time_from="11:45",
+        arr_time_to="14:20",
+    )
+    if trip_type == "roundtrip":
+        payload.update(
+            ret_dep_time_from="16:10",
+            ret_dep_time_to="18:25",
+            ret_arr_time_from="20:40",
+            ret_arr_time_to="22:55",
+        )
+    else:
+        payload.pop("return_date")
+
+    await _assert_created_time_windows(api_client, payload)
+
+
+@pytest.mark.parametrize("unlimited", ["omitted", None, ""])
+async def test_create_route_time_windows_default_to_unlimited(
+    api_client, unlimited: str | None,
+) -> None:
+    payload = _route_payload(outbound_limit=None, return_limit=None)
+    if unlimited != "omitted":
+        payload.update({field: unlimited for field in _TIME_FIELDS})
+
+    await _assert_created_time_windows(api_client, payload)
+
+
+@pytest.mark.parametrize("prefix", _TIME_WINDOW_PREFIXES)
+@pytest.mark.parametrize(
+    ("time_from", "time_to"),
+    [
+        ("06:15", None),
+        (None, "18:45"),
+        ("06:15", ""),
+        ("", "18:45"),
+        ("00:00", "23:59"),
+        ("00:00", "00:00"),
+        ("23:59", "23:59"),
+    ],
+)
+async def test_create_route_accepts_open_and_inclusive_time_windows(
+    api_client, prefix: str, time_from: str | None, time_to: str | None,
+) -> None:
+    payload = _route_payload(outbound_limit=None, return_limit=None)
+    payload.update({f"{prefix}_from": time_from, f"{prefix}_to": time_to})
+
+    await _assert_created_time_windows(api_client, payload)
+
+
+@pytest.mark.parametrize("field_name", _TIME_FIELDS)
+@pytest.mark.parametrize(
+    "invalid_value",
+    ["24:00", "23:60", "-1:00", "8:00", "08:0", "08:00:00", " 08:00", "08:00\n", "invalid", 800],
+)
+async def test_create_route_rejects_invalid_time_values(
+    api_client, field_name: str, invalid_value: str | int,
+) -> None:
+    client, session = api_client
+    payload = _route_payload(outbound_limit=None, return_limit=None)
+    payload[field_name] = invalid_value
+
+    response = await client.post("/api/routes", json=payload)
+
+    assert response.status_code == 422, response.text
+    assert any(error["loc"] == ["body", field_name] for error in response.json()["detail"])
+    assert session.query(Route).count() == 0
+
+
+@pytest.mark.parametrize("prefix", _TIME_WINDOW_PREFIXES)
+@pytest.mark.parametrize(
+    ("time_from", "time_to"),
+    [("18:00", "08:00"), ("23:59", "00:00"), ("08:01", "08:00")],
+)
+async def test_create_route_rejects_reversed_time_windows(
+    api_client, prefix: str, time_from: str, time_to: str,
+) -> None:
+    client, session = api_client
+    payload = _route_payload(outbound_limit=None, return_limit=None)
+    payload.update({f"{prefix}_from": time_from, f"{prefix}_to": time_to})
+
+    response = await client.post("/api/routes", json=payload)
+
+    assert response.status_code == 422, response.text
+    assert session.query(Route).count() == 0
+
+
 @pytest.mark.parametrize(
     ("outbound_limit", "return_limit"),
     [

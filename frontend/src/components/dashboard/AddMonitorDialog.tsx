@@ -64,6 +64,90 @@ function CityInput({
   );
 }
 
+type TimeRange = [number, number];
+
+function formatTimeStep(step: number): string {
+  const minutes = Math.min(step * 15, 1439);
+  return `${Math.floor(minutes / 60).toString().padStart(2, '0')}:${(minutes % 60).toString().padStart(2, '0')}`;
+}
+
+function TimeRangeBar({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: TimeRange;
+  onChange: (value: TimeRange) => void;
+}) {
+  const [from, to] = value;
+  const unrestricted = from === 0 && to === 96;
+
+  return (
+    <div role="group" aria-label={label} className="min-w-0">
+      <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs font-medium text-gray-600">{label}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium tabular-nums text-blue-700">
+            {unrestricted ? '全天不限' : `${formatTimeStep(from)} – ${formatTimeStep(to)}`}
+          </span>
+          <button
+            type="button"
+            onClick={() => onChange([0, 96])}
+            disabled={unrestricted}
+            aria-label={`${label}恢复全天`}
+            className="rounded px-1 py-0.5 text-[11px] text-gray-500 hover:bg-blue-50 hover:text-blue-700 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:invisible"
+          >
+            重置
+          </button>
+        </div>
+      </div>
+      <div className="relative mx-2.5 h-8">
+        <div className="absolute inset-x-0 top-3.5 h-1.5 rounded-full bg-gray-200" aria-hidden="true">
+          <div
+            className="absolute h-full rounded-full bg-blue-500"
+            style={{ left: `${from / 96 * 100}%`, right: `${(96 - to) / 96 * 100}%` }}
+          />
+        </div>
+        <input
+          type="range"
+          min={0}
+          max={96}
+          step={1}
+          value={from}
+          aria-label={`${label}最早时间`}
+          aria-valuemin={0}
+          aria-valuemax={to - 1}
+          aria-valuetext={formatTimeStep(from)}
+          onChange={(event) => onChange([Math.min(Number(event.target.value), to - 1), to])}
+          className="time-range-thumb"
+          style={{ zIndex: from > 90 ? 2 : 1 }}
+        />
+        <input
+          type="range"
+          min={0}
+          max={96}
+          step={1}
+          value={to}
+          aria-label={`${label}最晚时间`}
+          aria-valuemin={from + 1}
+          aria-valuemax={96}
+          aria-valuetext={formatTimeStep(to)}
+          onChange={(event) => onChange([from, Math.max(Number(event.target.value), from + 1)])}
+          className="time-range-thumb"
+        />
+      </div>
+      <div className="flex justify-between text-[10px] tabular-nums text-gray-400" aria-hidden="true">
+        <span>00:00</span>
+        <span>06:00</span>
+        <span>12:00</span>
+        <span>18:00</span>
+        <span>23:59</span>
+      </div>
+    </div>
+  );
+}
+
 interface AddMonitorDialogProps {
   open: boolean;
   onClose: () => void;
@@ -82,8 +166,10 @@ export function AddMonitorDialog({ open, onClose, cities }: AddMonitorDialogProp
   const [targetPrice, setTargetPrice] = useState('');
   const [scrapeInterval, setScrapeInterval] = useState(6);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [depTimeFrom, setDepTimeFrom] = useState('');
-  const [depTimeTo, setDepTimeTo] = useState('');
+  const [depTimeRange, setDepTimeRange] = useState<TimeRange>([0, 96]);
+  const [arrTimeRange, setArrTimeRange] = useState<TimeRange>([0, 96]);
+  const [retDepTimeRange, setRetDepTimeRange] = useState<TimeRange>([0, 96]);
+  const [retArrTimeRange, setRetArrTimeRange] = useState<TimeRange>([0, 96]);
   const [depAirport, setDepAirport] = useState('');
   const [arrAirport, setArrAirport] = useState('');
   const [maxArrivalDayOffset, setMaxArrivalDayOffset] = useState<ArrivalDayLimit>(null);
@@ -106,8 +192,17 @@ export function AddMonitorDialog({ open, onClose, cities }: AddMonitorDialogProp
         ret_max_arrival_day_offset: isRoundTrip ? retMaxArrivalDayOffset : null,
       };
       if (isRoundTrip && returnDate) body.return_date = returnDate;
-      if (depTimeFrom) body.dep_time_from = depTimeFrom;
-      if (depTimeTo) body.dep_time_to = depTimeTo;
+      const timeRanges: [string, TimeRange][] = [
+        ['dep_time', depTimeRange],
+        ['arr_time', arrTimeRange],
+      ];
+      if (isRoundTrip) {
+        timeRanges.push(['ret_dep_time', retDepTimeRange], ['ret_arr_time', retArrTimeRange]);
+      }
+      for (const [field, [from, to]] of timeRanges) {
+        body[`${field}_from`] = from === 0 ? null : formatTimeStep(from);
+        body[`${field}_to`] = to === 96 ? null : formatTimeStep(to);
+      }
       if (depAirport) body.dep_airport_code = depAirport;
       if (arrAirport) body.arr_airport_code = arrAirport;
 
@@ -129,6 +224,7 @@ export function AddMonitorDialog({ open, onClose, cities }: AddMonitorDialogProp
   });
 
   const canSubmit = origin && destination && targetDate && targetPrice
+    && (!isRoundTrip || (returnDate && returnDate >= targetDate))
     && (monitoringMode === 'route' || outboundFlightNo);
 
   if (!open) return null;
@@ -136,10 +232,10 @@ export function AddMonitorDialog({ open, onClose, cities }: AddMonitorDialogProp
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto mx-4">
-        <div className="sticky top-0 bg-white border-b border-gray-100 px-6 py-4 rounded-t-2xl">
+      <div role="dialog" aria-modal="true" aria-labelledby="add-monitor-title" className="relative bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto mx-4">
+        <div className="sticky top-0 z-10 bg-white border-b border-gray-100 px-6 py-4 rounded-t-2xl">
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-gray-900">添加监控</h2>
+            <h2 id="add-monitor-title" className="text-lg font-semibold text-gray-900">添加监控</h2>
             <button
               type="button"
               onClick={onClose}
@@ -236,11 +332,29 @@ export function AddMonitorDialog({ open, onClose, cities }: AddMonitorDialogProp
                 type="date"
                 value={returnDate}
                 onChange={(e) => setReturnDate(e.target.value)}
+                min={targetDate || undefined}
                 disabled={!isRoundTrip}
                 className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-400 disabled:bg-gray-50 disabled:text-gray-300"
               />
             </div>
           </div>
+
+          <section className="rounded-xl border border-blue-100 bg-blue-50/40 p-4" aria-label="期望起降时间">
+            <h3 className="text-sm font-medium text-gray-700">期望起降时间</h3>
+            <p className="mt-1 text-[11px] leading-5 text-gray-500">
+              拖动两端选择时间 · 15 分钟步进 · 默认不限
+            </p>
+            <div className="mt-4 grid grid-cols-1 gap-5 sm:grid-cols-2">
+              <TimeRangeBar label="去程起飞" value={depTimeRange} onChange={setDepTimeRange} />
+              <TimeRangeBar label="去程降落" value={arrTimeRange} onChange={setArrTimeRange} />
+            </div>
+            {isRoundTrip && (
+              <div className="mt-5 grid grid-cols-1 gap-5 border-t border-blue-100 pt-4 sm:grid-cols-2">
+                <TimeRangeBar label="回程起飞" value={retDepTimeRange} onChange={setRetDepTimeRange} />
+                <TimeRangeBar label="回程降落" value={retArrTimeRange} onChange={setRetArrTimeRange} />
+              </div>
+            )}
+          </section>
 
           {/* Arrival-day limit */}
           <div className="rounded-lg border border-gray-100 bg-gray-50 p-4">
@@ -359,24 +473,6 @@ export function AddMonitorDialog({ open, onClose, cities }: AddMonitorDialogProp
             </button>
             {showAdvanced && (
               <div className="mt-3 grid grid-cols-1 gap-4 rounded-lg bg-gray-50 p-4 sm:grid-cols-2">
-                <div>
-                  <label className="block text-xs font-medium text-gray-500 mb-1.5">起飞时间从</label>
-                  <input
-                    type="time"
-                    value={depTimeFrom}
-                    onChange={(e) => setDepTimeFrom(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-100"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-500 mb-1.5">起飞时间到</label>
-                  <input
-                    type="time"
-                    value={depTimeTo}
-                    onChange={(e) => setDepTimeTo(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-100"
-                  />
-                </div>
                 <div>
                   <label className="block text-xs font-medium text-gray-500 mb-1.5">出发机场 (IATA)</label>
                   <input

@@ -19,3 +19,66 @@ body {
 #root {
   min-height: 100vh;
 }
+
+.time-range-thumb {
+  position: absolute;
+  top: 0;
+  left: -10px;
+  width: calc(100% + 20px);
+  height: 32px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  pointer-events: none;
+}
+
+.time-range-thumb:focus-visible {
+  outline: none;
+}
+
+.time-range-thumb::-webkit-slider-runnable-track {
+  height: 6px;
+  background: transparent;
+}
+
+.time-range-thumb::-moz-range-track {
+  height: 6px;
+  background: transparent;
+}
+
+.time-range-thumb::-webkit-slider-thumb {
+  width: 20px;
+  height: 20px;
+  margin-top: -7px;
+  appearance: none;
+  border: 2px solid #3b82f6;
+  border-radius: 50%;
+  background: white;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 12%);
+  cursor: ew-resize;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.time-range-thumb::-moz-range-thumb {
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  border: 2px solid #3b82f6;
+  border-radius: 50%;
+  background: white;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 12%);
+  cursor: ew-resize;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.time-range-thumb:focus-visible::-webkit-slider-thumb {
+  outline: 3px solid #bfdbfe;
+  outline-offset: 2px;
+}
+
+.time-range-thumb:focus-visible::-moz-range-thumb {
+  outline: 3px solid #bfdbfe;
+  outline-offset: 2px;
+}
