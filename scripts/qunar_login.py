@@ -21,8 +21,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -46,6 +48,33 @@ QR_PNG_PATH = str(_project_root / "qunar_qr_login.png")
 
 # 检测登录成功的特征 Cookie（继承自 QunarScraper.refresh_cookies_via_login）
 _LOGIN_COOKIES = {"QN44", "quinn", "_qnauthtoken"}
+
+
+def _has_authenticated_cookie(cookies: list[dict]) -> bool:
+    return any(
+        cookie.get("name") in _LOGIN_COOKIES
+        and str(cookie.get("value", "")).strip().lower() not in {"", "0", "null", "none"}
+        for cookie in cookies
+    )
+
+
+def _write_cookies_atomically(output_path: str, cookies: list[dict]) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=str(output.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(cookies, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _print_qr_terminal(png_path: str) -> None:
@@ -281,7 +310,6 @@ async def qr_login(
                 elapsed = i * 2
                 print(f"  等待中... {elapsed}/{timeout}s — 请打开去哪儿 APP 扫码")
 
-        # ── 保存 Cookie（无论是否检测到登录成功，均落盘）────────────────
         all_cookies = await context.cookies()
         # 仅保留 qunar.com 相关域名的 Cookie（与 QunarScraper 行为一致）
         qunar_cookies = [
@@ -299,17 +327,17 @@ async def qr_login(
             if "qunar.com" in c.get("domain", "")
         ]
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(qunar_cookies, f, ensure_ascii=False, indent=2)
+        has_login_cookie = _has_authenticated_cookie(qunar_cookies)
+        if has_login_cookie:
+            _write_cookies_atomically(output_path, qunar_cookies)
 
         await browser.close()
 
     # ── 输出结果 ──────────────────────────────────────────────────────────────
     cookie_names = {c["name"] for c in qunar_cookies if c["value"]}
-    has_login_cookie = bool(_LOGIN_COOKIES & cookie_names)
 
     print(f"\n{'='*60}")
-    if has_login_cookie or login_success:
+    if has_login_cookie:
         username = next(
             (c["value"] for c in qunar_cookies if c["name"] == "QN44"),
             "（未知）",
@@ -323,10 +351,10 @@ async def qr_login(
         print(f"{'='*60}\n")
         return True
     else:
-        print("✗ 未检测到登录成功状态（二维码可能已过期或未扫码）")
-        print(f"  Cookie 仍已保存（{len(qunar_cookies)} 条），可手动检查 {output_path}")
+        print("✗ 未检测到有效登录 Cookie（二维码可能已过期或未扫码）")
+        print("  未写入 Cookie 文件，已有登录状态保持不变")
         print(f"{'='*60}\n")
-        return len(qunar_cookies) > 5
+        return False
 
 
 async def main() -> int:

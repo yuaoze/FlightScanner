@@ -1,6 +1,6 @@
 # 通知渠道接入指南
 
-FlightScanner 支持以下四种通知渠道，可通过 `.env` 文件配置。所有渠道均可同时启用，价格提醒会并行发送到所有已配置的渠道。
+FlightScanner 支持以下三种通知渠道，可通过 `.env` 文件配置。所有渠道均可同时启用，价格提醒会并行发送到所有已配置的渠道。企业微信接入已从 v2.2.1 移除。
 
 ---
 
@@ -35,22 +35,6 @@ FlightScanner 支持以下四种通知渠道，可通过 `.env` 文件配置。�
 ```env
 FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx
 FEISHU_WEBHOOK_SECRET=your_secret_key   # 可选，开启签名校验时填写
-```
-
----
-
-## 企业微信机器人
-
-发送 Markdown 格式消息，包含价格统计和买点建议。
-
-### 接入步骤
-
-1. 打开企业微信群 → 右键群名 → **添加机器人**
-2. 填写机器人名称，复制生成的 **Webhook URL**
-3. 在 `.env` 中填入：
-
-```env
-WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx
 ```
 
 ---

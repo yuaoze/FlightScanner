@@ -1,8 +1,8 @@
 """Routes API endpoints for Dashboard data."""
 
-import re
 from datetime import date, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -27,6 +27,9 @@ from flightscanner.api.schemas import (
     ScrapeTaskResponse,
     SparklinePoint,
     UpdateRouteRequest,
+    validate_hh_mm,
+    validate_route_dates,
+    validate_time_windows,
 )
 from flightscanner.api.status_resolver import (
     STATUS_PRIORITY,
@@ -298,7 +301,7 @@ class CreateRouteRequest(BaseModel):
     origin: str
     destination: str
     target_date: date
-    target_price: float
+    target_price: float = Field(gt=0, allow_inf_nan=False)
     scrape_interval: int = 6
     return_date: Optional[date] = None
     trip_type: str = "oneway"
@@ -326,19 +329,12 @@ class CreateRouteRequest(BaseModel):
     )
     @classmethod
     def validate_time(cls, value: Optional[str]) -> Optional[str]:
-        if not value:
-            return None
-        if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
-            raise ValueError("Time must be HH:MM between 00:00 and 23:59")
-        return value
+        return validate_hh_mm(value)
 
     @model_validator(mode="after")
-    def validate_time_windows(self) -> "CreateRouteRequest":
-        for prefix in ("dep_time", "arr_time", "ret_dep_time", "ret_arr_time"):
-            time_from = getattr(self, f"{prefix}_from")
-            time_to = getattr(self, f"{prefix}_to")
-            if time_from is not None and time_to is not None and time_from > time_to:
-                raise ValueError(f"{prefix}_from must be <= {prefix}_to")
+    def validate_route(self) -> "CreateRouteRequest":
+        validate_time_windows(self)
+        validate_route_dates(self.target_date, self.return_date, self.trip_type)
         return self
 
 
@@ -639,25 +635,51 @@ def update_route(
         raise HTTPException(status_code=404, detail="Route not found")
 
     payload = body.model_dump(exclude_unset=True)
+    time_fields = (
+        "dep_time_from", "dep_time_to", "arr_time_from", "arr_time_to",
+        "ret_dep_time_from", "ret_dep_time_to", "ret_arr_time_from", "ret_arr_time_to",
+    )
+    merged_times = SimpleNamespace(
+        **{
+            field: payload.get(field, getattr(route, field))
+            for field in time_fields
+        }
+    )
+    try:
+        validate_time_windows(merged_times)
+        if {"target_date", "return_date", "trip_type"}.intersection(payload):
+            validate_route_dates(
+                payload.get("target_date", route.target_date),
+                payload.get("return_date", route.return_date),
+                payload.get("trip_type", route.trip_type),
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     interval_changed = (
         "scrape_interval" in payload and payload["scrape_interval"] is not None
         and payload["scrape_interval"] != route.scrape_interval
     )
-    active_changed = "is_active" in payload and payload["is_active"] is not None
+    active_changed = (
+        "is_active" in payload
+        and payload["is_active"] is not None
+        and int(payload["is_active"]) != route.is_active
+    )
 
     if "target_price" in payload and payload["target_price"] is not None:
         route.target_price = Decimal(str(payload["target_price"]))
+    if payload.get("target_date") is not None:
+        route.target_date = payload["target_date"]
+    if "return_date" in payload:
+        route.return_date = payload["return_date"]
+    if payload.get("trip_type") is not None:
+        route.trip_type = payload["trip_type"]
     if "scrape_interval" in payload and payload["scrape_interval"] is not None:
         route.scrape_interval = payload["scrape_interval"]
     if "is_active" in payload and payload["is_active"] is not None:
         route.is_active = 1 if payload["is_active"] else 0
 
     # Time windows: explicit empty-string clears, HH:MM sets, omitted leaves alone.
-    time_fields = (
-        "dep_time_from", "dep_time_to", "arr_time_from", "arr_time_to",
-        "ret_dep_time_from", "ret_dep_time_to", "ret_arr_time_from", "ret_arr_time_to",
-    )
     for f in time_fields:
         if f in payload:
             v = payload[f]

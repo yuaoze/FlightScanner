@@ -95,6 +95,29 @@ class TestDirectFlightFilter:
         assert _is_direct_flight("CA1234+MU5678") is False
 
 
+def test_streamlit_radar_does_not_fabricate_historical_value_tags():
+    from ui.components.weekend_radar import (
+        _compute_value_tags,
+        _enrich_with_display_meta,
+    )
+
+    deal = WeekendDeal(
+        destination="成都",
+        outbound_flight=MagicMock(),
+        return_flight=MagicMock(),
+        total_price=Decimal("800"),
+        historical_avg=None,
+    )
+
+    _, meta = _enrich_with_display_meta([deal])[0]
+    tags = _compute_value_tags(deal, meta, is_international=False)
+
+    assert meta.daily_avg == Decimal("0")
+    assert meta.weekend_prices == []
+    assert meta.is_cheapest_weekend is False
+    assert not any("近四周最低" in tag or "均价" in tag for tag in tags)
+
+
 # ── 到达时间截止过滤 ────────────────────────────────────────────────────────────
 
 class TestArrivalBeforeCutoff:

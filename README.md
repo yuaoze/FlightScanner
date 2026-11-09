@@ -6,13 +6,13 @@
 
 > 定时/实时监控国内外机票价格，结合 AI 分析历史波动，在更合适的买点自动推送提醒。
 
-**当前版本：v2.1.0**（详见 [feature_log/v2.1.0.md](feature_log/v2.1.0.md)）
+**当前版本：v2.2.1**（详见 [feature_log/v2.2.1.md](feature_log/v2.2.1.md)）
 
 ---
 
 ## 项目简介
 
-FlightScanner 是一套面向个人用户的机票价格智能监控系统。它通过 Playwright 抓取多平台票价，使用 SQLite 持久化价格历史，并结合规则分析与 AI 大模型（DeepSeek）输出趋势判断，在价格达到目标区间时通过 Email、Telegram、飞书、企业微信等渠道发送提醒。
+FlightScanner 是一套面向个人用户的机票价格智能监控系统。它通过 Playwright 抓取多平台票价，使用 SQLite 持久化价格历史，并结合规则分析与 AI 大模型（DeepSeek）输出趋势判断，在价格达到目标区间时通过 Email、Telegram、飞书等渠道发送提醒。
 
 适用场景：
 
@@ -25,10 +25,10 @@ FlightScanner 是一套面向个人用户的机票价格智能监控系统。它
 ## 核心功能
 
 - **路线监控 + 精准航班监控**：支持按航线监控，也支持按航班号固定监控去程/回程与舱位
-- **多平台采集与定时调度**：基于 Playwright + APScheduler，支持去哪儿、携程、同程旅行；同程覆盖国内、港澳台和国际单程/往返，按路线独立间隔自动采集
+- **多平台采集与定时调度**：基于 Playwright + APScheduler，支持飞猪、携程、同程旅行；同程覆盖国内、港澳台和国际单程/往返，按路线独立间隔自动采集
 - **价格历史与 AI 决策**：保存历史票价，结合规则分析与 DeepSeek 输出趋势判断与建议操作
 - **现代化 Web 控制台**：React + FastAPI 前后端分离，支持监控总览、路线详情、提醒记录、设置中心、周末雷达
-- **多渠道通知**：支持 Email、Telegram、飞书、企业微信等提醒方式
+- **多渠道通知**：支持 Email、Telegram、飞书等提醒方式
 
 ---
 
@@ -41,9 +41,9 @@ React + Vite 前端
 FastAPI API / 调度入口
         │
         ├── PriceMonitorScheduler（定时采集 / 通知 / AI 预测）
-        ├── Playwright Scrapers（Qunar / Ctrip / Tongcheng）
+        ├── Playwright Scrapers（Fliggy / Ctrip / Tongcheng）
         ├── Analyzers（规则分析 / DeepSeek）
-        └── Notifiers（Email / Telegram / 飞书 / 企业微信）
+        └── Notifiers（Email / Telegram / 飞书）
         │
         ▼
 SQLite + SQLAlchemy
@@ -87,7 +87,7 @@ cp .env.example .env
 ### 3. 获取 Cookie
 
 ```bash
-python scripts/qunar_login.py
+python scripts/fliggy_login.py
 python scripts/ctrip_login.py
 python scripts/tongcheng_login.py
 ```
@@ -140,7 +140,7 @@ pytest tests/test_qunar_scraper.py -q
 ```ini
 DATABASE_URL=sqlite:///flightscanner.db
 
-SCRAPER_TYPE=qunar,ctrip,tongcheng
+SCRAPER_TYPE=fliggy,ctrip,tongcheng
 SCRAPER_HEADLESS=true
 SCRAPER_TIMEOUT=30000
 SCRAPER_RETRY_COUNT=3
@@ -159,26 +159,25 @@ TELEGRAM_CHAT_ID=
 
 FEISHU_WEBHOOK_URL=
 FEISHU_WEBHOOK_SECRET=
-
-WECOM_WEBHOOK_URL=
 ```
 
 说明：
 
 - `python-dotenv` 不会自动忽略值后面的内联 `# 注释`，注释建议单独占一行
 - 通知渠道无需全部填写，但至少配置一个才有告警意义
-- `SCRAPER_TYPE` 支持 `qunar`、`ctrip`、`tongcheng` 或逗号组合
+- `SCRAPER_TYPE` 支持 `fliggy`、`ctrip`、`tongcheng` 或逗号组合；去哪儿已停止网页版机票服务，旧价格记录仍保留原来源
+- 飞猪国内票价加机建和燃油后入库，国际接口的分单位含税价换算为元；往返分别采集真实单程并配对，不使用未经确认的往返起价
 
 ### Cookie 文件
 
-- `qunar_cookies.json`：去哪儿登录 Cookie
+- `fliggy_cookies.json`：飞猪/淘宝登录 Cookie，请使用淘宝 App 扫码；遇到滑块或登录限制时会提示，不自动弹出浏览器窗口
 - `ctrip_cookies.json`：携程登录 Cookie
 - `tongcheng_cookies.json`：同程旅行 Cookie（可选；默认可匿名采集，风控时建议通过官方微信 OAuth 扫码刷新）
 
 推荐通过扫码脚本生成；同程脚本展示的是官方微信登录二维码，请使用微信“扫一扫”：
 
 ```bash
-python scripts/qunar_login.py
+python scripts/fliggy_login.py
 python scripts/ctrip_login.py
 python scripts/tongcheng_login.py
 ```

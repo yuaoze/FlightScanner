@@ -18,6 +18,7 @@ import logging
 import signal
 import sys
 
+from flightscanner import __version__
 from flightscanner.scheduler import PriceMonitorScheduler
 
 # Configure logging
@@ -47,7 +48,7 @@ async def main(headless: bool, enable_notifications: bool) -> None:
         enable_notifications: Whether to send email notifications.
     """
     logger.info("=" * 60)
-    logger.info("FlightScanner Price Monitor v1.0")
+    logger.info(f"FlightScanner Price Monitor v{__version__}")
     logger.info("=" * 60)
     logger.info(f"Headless mode: {headless}")
     logger.info(f"Notifications: {enable_notifications}")
@@ -77,6 +78,7 @@ async def main(headless: bool, enable_notifications: bool) -> None:
 
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
+        raise
 
     finally:
         # Cleanup

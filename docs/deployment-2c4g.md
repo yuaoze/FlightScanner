@@ -101,8 +101,10 @@ sudo apt install -y \
   libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
   libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
   libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
-  fonts-noto-cjk    # 中文字体 — 不装会导致页面渲染没字，影响 DOM 解析
+  xvfb xauth fonts-noto-cjk
 ```
+
+携程在 `SCRAPER_HEADLESS=true` 时使用独立、带认证的 Xvfb 显示环境，不会弹出桌面窗口；缺少 `xvfb` 或 `xauth` 会明确报错。中文字体用于保证 DOM 页面正常渲染。
 
 ---
 
@@ -173,7 +175,7 @@ DATABASE_URL=sqlite:////var/lib/flightscanner/flightscanner.db
 
 # 必须 headless（服务器无图形）
 SCRAPER_HEADLESS=true
-SCRAPER_TYPE=qunar,ctrip,tongcheng
+SCRAPER_TYPE=fliggy,ctrip,tongcheng
 SCRAPER_TIMEOUT=30000
 MAX_RESULTS_PER_PLATFORM=15      # 4G 内存建议从 15 起，跑稳后再调
 
@@ -265,7 +267,14 @@ curl -s http://127.0.0.1:8000/api/stats | head -c 200
 
 ## 9. nginx 反向代理
 
+公网部署必须同时启用访问认证和 HTTPS，不能直接暴露无认证的管理 API。
+先创建独立密码文件（不要复用服务器登录密码）：
+
 ```bash
+sudo apt install -y apache2-utils
+sudo htpasswd -c /etc/nginx/flightscanner.htpasswd flightscanner
+sudo chown root:www-data /etc/nginx/flightscanner.htpasswd
+sudo chmod 640 /etc/nginx/flightscanner.htpasswd
 sudo nano /etc/nginx/sites-available/flightscanner
 ```
 
@@ -273,6 +282,9 @@ sudo nano /etc/nginx/sites-available/flightscanner
 server {
     listen 80;
     server_name your-domain.com;       # 没域名暂时填 _ 或 ECS 公网 IP
+
+    auth_basic "FlightScanner";
+    auth_basic_user_file /etc/nginx/flightscanner.htpasswd;
 
     # 前端静态资源
     root /home/flightscanner/FlightScanner/frontend/dist;
@@ -323,11 +335,12 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-打开浏览器访问 `http://your-server-ip` 应该能看到 FlightScanner 界面（无 HTTPS）。
+此时仅用于确认反向代理已连通。Basic Auth 不能保护明文 HTTP 中的凭据，
+公网开放前必须完成下面的 HTTPS 配置。
 
 ---
 
-## 10. HTTPS（强烈建议）
+## 10. HTTPS（公网必需）
 
 仅当域名已解析到此服务器 IP（A 记录）后再做：
 
@@ -358,9 +371,9 @@ sudo certbot renew --dry-run
 或本地获取 Cookie 后通过「手动上传」粘贴：
 
 ```bash
-# 本地机器：
-python scripts/qunar_login.py
-cat qunar_cookies.json
+# 本地机器，使用淘宝 App 扫码：
+python scripts/fliggy_login.py
+cat fliggy_cookies.json
 # 复制内容 → 设置页粘贴 → 保存
 ```
 

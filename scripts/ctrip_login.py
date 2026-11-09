@@ -20,7 +20,9 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -112,6 +114,12 @@ SUCCESS_URL_PATTERNS = [
     "passport.ctrip.com/user/sec/",
 ]
 
+QR_CODE_SELECTORS = [
+    "[data-testid='qrCodeBox']",
+    ".qrcode-box",
+    "canvas",
+]
+
 
 async def _try_click(page, selectors: list[str], label: str) -> bool:
     """尝试多个选择器依次点击，成功则返回 True。
@@ -158,12 +166,47 @@ async def _screenshot(page, name: str) -> None:
         pass
 
 
-async def _save_cookies(context, output_path: str) -> list[dict]:
-    """保存当前 BrowserContext 的全部 Cookie 到文件。"""
-    cookies = await context.cookies()
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(cookies, f, ensure_ascii=False, indent=2)
-    return cookies
+async def _save_qr_png(page, output_path: str) -> bool:
+    for selector in QR_CODE_SELECTORS:
+        try:
+            for element in await page.query_selector_all(selector):
+                if not await element.is_visible():
+                    continue
+                await element.screenshot(path=output_path)
+                if Path(output_path).stat().st_size > 0:
+                    logger.info("  ✓ 提取二维码: %s", selector)
+                    return True
+        except Exception as exc:
+            logger.warning("  二维码提取失败（%s）: %s", selector, exc)
+    return False
+
+
+def _has_authenticated_cookie(cookies: list[dict]) -> bool:
+    login_indicators = {"cticket", "ibu_uid", "login_uid"}
+    return any(
+        str(cookie.get("name", "")).lower() in login_indicators
+        and str(cookie.get("value", "")).strip().lower() not in {"", "0", "null", "none"}
+        for cookie in cookies
+    )
+
+
+def _write_cookies_atomically(output_path: str, cookies: list[dict]) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=str(output.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(cookies, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _get_key_cookies(cookies: list[dict]) -> dict:
@@ -217,7 +260,7 @@ async def qr_login(
 
     流程：
       1. 打开登录页，切换到「扫码登录」
-      2. 提取 canvas 二维码 → 保存 PNG + 终端打印
+      2. 提取 canvas/SVG 二维码 → 保存 PNG + 终端打印
       3. 拦截 qrCodeLogin API，等待 returnCode=0（扫码确认）
       4. 保存 Cookie
 
@@ -229,7 +272,6 @@ async def qr_login(
     Returns:
         登录成功返回 True。
     """
-    import base64
     import subprocess
     from playwright.async_api import async_playwright
 
@@ -317,24 +359,13 @@ async def qr_login(
             await browser.close()
             return False
 
-        await asyncio.sleep(2)  # 等待 canvas 渲染
+        await asyncio.sleep(2)  # 等待二维码渲染
 
-        # 提取 canvas 二维码
-        canvas = await page.query_selector("canvas")
-        if not canvas or not await canvas.is_visible():
-            logger.error("  未找到二维码 canvas")
+        if not await _save_qr_png(page, qr_png_path):
+            logger.error("  未找到可见二维码（canvas/SVG）")
             await browser.close()
             return False
 
-        data_url = await canvas.evaluate("c => c.toDataURL('image/png')")
-        if not data_url or data_url == "data:,":
-            logger.error("  canvas 内容为空")
-            await browser.close()
-            return False
-
-        _, b64 = data_url.split(",", 1)
-        with open(qr_png_path, "wb") as f:
-            f.write(base64.b64decode(b64))
         logger.info("  ✓ 二维码 PNG 已保存 → %s", qr_png_path)
         if on_qr_ready:
             on_qr_ready(qr_png_path)  # 通知调用方 QR 已就绪，Streamlit 可立即显示
@@ -388,31 +419,28 @@ async def qr_login(
 
         await _screenshot(page, "qr_final")
 
-        # ── 保存 Cookie ───────────────────────────────────────────────
-        cookies = await _save_cookies(context, output_path)
+        cookies = await context.cookies()
         key_cookies = _get_key_cookies(cookies)
-        login_indicators = {"ibu_uid", "login_uid", "uID", "uin"}
-        has_login_cookie = any(c["name"] in login_indicators for c in cookies
-                                if c["value"] and c["value"] != "0")
+        has_login_cookie = _has_authenticated_cookie(cookies)
+        if has_login_cookie:
+            _write_cookies_atomically(output_path, cookies)
 
         await browser.close()
 
         # ── 输出结果 ──────────────────────────────────────────────────
         print(f"\n{'='*60}")
-        if has_login_cookie or login_success:
+        if has_login_cookie:
             print(f"✓ 登录成功！Cookie 已保存 → {output_path}")
             print(f"  共保存 {len(cookies)} 条 Cookie")
             if key_cookies:
-                print("  关键 Cookie:")
-                for name, val in key_cookies.items():
-                    print(f"    {name}: {val}")
+                print(f"  关键 Cookie: {', '.join(sorted(key_cookies))}")
             print(f"{'='*60}\n")
             return True
         else:
-            print("✗ 未检测到登录成功状态（二维码可能已过期或未扫码）")
-            print(f"  Cookie 仍已保存（{len(cookies)} 条），可手动检查 {output_path}")
+            print("✗ 未检测到有效登录 Cookie（二维码可能已过期或未扫码）")
+            print("  未写入 Cookie 文件，已有登录状态保持不变")
             print(f"{'='*60}\n")
-            return len(cookies) > 10
+            return False
 
 
 async def login(
@@ -591,35 +619,29 @@ async def login(
 
         await _screenshot(page, "6_final")
 
-        # ── 保存 Cookie（无论是否检测到登录成功）──────────────────────────
-        cookies = await _save_cookies(context, output_path)
-
-        # 判断关键 Cookie 是否存在
+        cookies = await context.cookies()
         key_cookies = _get_key_cookies(cookies)
-        login_indicators = {"ibu_uid", "login_uid", "uID", "uin"}
-        has_login_cookie = any(c["name"] in login_indicators for c in cookies
-                                if c["value"] and c["value"] != "0")
+        has_login_cookie = _has_authenticated_cookie(cookies)
+        if has_login_cookie:
+            _write_cookies_atomically(output_path, cookies)
 
         await browser.close()
 
         # ── 输出结果 ──────────────────────────────────────────────────────
         print(f"\n{'='*60}")
-        if has_login_cookie or login_success:
+        if has_login_cookie:
             print(f"✓ 登录成功！Cookie 已保存 → {output_path}")
             print(f"  共保存 {len(cookies)} 条 Cookie")
             if key_cookies:
-                print("  关键 Cookie:")
-                for name, val in key_cookies.items():
-                    print(f"    {name}: {val}")
+                print(f"  关键 Cookie: {', '.join(sorted(key_cookies))}")
             print(f"{'='*60}\n")
             return True
         else:
-            print("✗ 未检测到登录成功状态")
-            print(f"  Cookie 仍已保存（{len(cookies)} 条），可手动检查 {output_path}")
+            print("✗ 未检测到有效登录 Cookie")
+            print("  未写入 Cookie 文件，已有登录状态保持不变")
             print(f"  调试截图保存在项目根目录（ctrip_login_*.png）")
             print(f"{'='*60}\n")
-            # 仍返回 True——Cookie 已落盘，让调用方自行判断
-            return len(cookies) > 10
+            return False
 
 
 async def main() -> int:

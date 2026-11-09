@@ -15,6 +15,7 @@ from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import List
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -27,7 +28,6 @@ from flightscanner.interfaces import (
     FlightDirection,
     FlightInfo,
     FlightPrice,
-    SearchParams,
 )
 from flightscanner.models import Flight, PriceHistory, init_db
 
@@ -378,6 +378,32 @@ def test_complete_pipeline(db_session):
     )
 
     assert len(return_prices) > 0, "Should find return flights"
+
+
+def test_database_url_masks_password():
+    from flightscanner.api.routers.settings import _mask_database_url
+
+    masked = _mask_database_url("postgresql://scanner:secret@db.example.com/flights")
+
+    assert "secret" not in masked
+    assert masked == "postgresql://scanner:***@db.example.com/flights"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_fatal_error_is_reraised_after_cleanup():
+    import main as scheduler_main
+
+    monitor = Mock()
+    monitor.start.side_effect = RuntimeError("startup failed")
+
+    with (
+        patch.object(scheduler_main, "PriceMonitorScheduler", return_value=monitor),
+        patch.object(scheduler_main.signal, "signal"),
+        pytest.raises(RuntimeError, match="startup failed"),
+    ):
+        await scheduler_main.main(headless=True, enable_notifications=False)
+
+    monitor.stop.assert_called_once_with()
 
 
 if __name__ == "__main__":

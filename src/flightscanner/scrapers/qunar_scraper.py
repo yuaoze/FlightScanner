@@ -8,15 +8,15 @@ import asyncio
 import logging
 import random
 import base64
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import List, Optional, Dict
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from flightscanner.interfaces import (
     FlightDirection,
@@ -316,8 +316,12 @@ class QunarScraper(FlightScraper):
                 logged_in = False
                 for _ in range(timeout_seconds * 2):
                     all_cookies = await context.cookies()
-                    cookie_names = {c["name"] for c in all_cookies}
-                    if cookie_names & _LOGIN_COOKIES:
+                    if any(
+                        c.get("name") in _LOGIN_COOKIES
+                        and str(c.get("value", "")).strip().lower()
+                        not in {"", "0", "null", "none"}
+                        for c in all_cookies
+                    ):
                         logged_in = True
                         break
                     await asyncio.sleep(0.5)
@@ -342,8 +346,28 @@ class QunarScraper(FlightScraper):
                     if "qunar.com" in c.get("domain", "")
                 ]
 
-                with open(output_path, "w", encoding="utf-8") as _f:
-                    _json.dump(qunar_cookies, _f, ensure_ascii=False, indent=2)
+                import os as _os
+                import tempfile as _tempfile
+                from pathlib import Path as _Path
+
+                output = _Path(output_path)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                fd, temporary_name = _tempfile.mkstemp(
+                    prefix=f".{output.name}.",
+                    suffix=".tmp",
+                    dir=str(output.parent),
+                )
+                temporary = _Path(temporary_name)
+                try:
+                    with _os.fdopen(fd, "w", encoding="utf-8") as stream:
+                        _json.dump(qunar_cookies, stream, ensure_ascii=False, indent=2)
+                        stream.write("\n")
+                        stream.flush()
+                        _os.fsync(stream.fileno())
+                    _os.replace(temporary, output)
+                except BaseException:
+                    temporary.unlink(missing_ok=True)
+                    raise
 
                 username = next(
                     (c["value"] for c in all_cookies if c["name"] == "QN44"),
@@ -377,6 +401,7 @@ class QunarScraper(FlightScraper):
                     "--start-maximized",
                 ],
             )
+        if self._context is None:
             self._context = await self._browser.new_context(
                 # Typical macOS laptop resolution — consistent with macOS UA
                 viewport={"width": 1440, "height": 900},
@@ -487,6 +512,7 @@ class QunarScraper(FlightScraper):
                 logger.info(f"Injected {len(self.cookies)} cookies")
 
     @retry(
+        retry=retry_if_exception_type(NetworkTimeoutError),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         reraise=True,
@@ -546,6 +572,7 @@ class QunarScraper(FlightScraper):
 
         page: Optional[Page] = None
         captured_api_responses: List[Dict] = []
+        fallback_errors: List[ScraperError] = []
 
         try:
             # Create new page
@@ -709,11 +736,10 @@ class QunarScraper(FlightScraper):
                 if api_flights_via_wbd:
                     api_flights_via_wbd.sort(key=lambda fp: fp.price)
                     logger.info(
-                        "wbdflightlist API 解析得到 %d 条，保留最低 %d 条",
-                        len(api_flights_via_wbd), self.max_results,
+                        "wbdflightlist API 解析得到 %d 条，交由调度器过滤后截断",
+                        len(api_flights_via_wbd),
                     )
-                    logger.info(f"Found {len(api_flights_via_wbd[:self.max_results])} flights")
-                    return api_flights_via_wbd[: self.max_results]
+                    return api_flights_via_wbd
             # ─────────────────────────────────────────────────────────────────
 
             # Parse flight data from DOM (fallback when API not available)
@@ -744,18 +770,23 @@ class QunarScraper(FlightScraper):
                 if self.cookies:
                     # 优先：HTTP 直连 touchInnerList（绕过 Playwright 指纹检测）
                     logger.info("已检测到 Cookie，尝试 HTTP 直连 touchInnerList...")
-                    flight_prices = await self._search_domestic_via_http(params)
+                    try:
+                        flight_prices = await self._search_domestic_via_http(params)
+                    except ScraperError as exc:
+                        fallback_errors.append(exc)
+                        logger.warning("HTTP 直连失败，切换 Playwright 移动端页面：%s", exc)
 
                     # 降级：Playwright 移动端页面
                     if not flight_prices:
                         logger.info("HTTP 直连无结果，切换 Playwright 移动端页面...")
-                        flight_prices = await self._search_via_mobile_api(params)
+                        try:
+                            flight_prices = await self._search_via_mobile_api(params)
+                        except ScraperError as exc:
+                            fallback_errors.append(exc)
+                            logger.warning("移动端页面搜索失败：%s", exc)
 
                     if not flight_prices:
-                        logger.warning(
-                            "移动端 API 也未返回数据。"
-                            "请确认 Cookie 是否有效且未过期。"
-                        )
+                        logger.warning("去哪儿移动端接口未返回航班数据")
                         flight_prices = await self._maybe_refresh_and_retry(
                             params, page
                         )
@@ -767,6 +798,9 @@ class QunarScraper(FlightScraper):
                     flight_prices = await self._maybe_refresh_and_retry(
                         params, page
                     )
+
+            if not flight_prices and fallback_errors:
+                raise ParseError("所有去哪儿降级采集路径均失败") from fallback_errors[-1]
 
             logger.info(f"Found {len(flight_prices)} flights")
 
@@ -782,6 +816,8 @@ class QunarScraper(FlightScraper):
             logger.error(f"Timeout while loading page: {e}")
             raise NetworkTimeoutError(f"Page load timeout: {e}") from e
         except (AntiCrawlerDetectedError, LoginRequiredError):
+            raise
+        except ScraperError:
             raise
         except Exception as e:
             logger.error(f"Error searching flights: {e}")
@@ -908,6 +944,11 @@ class QunarScraper(FlightScraper):
             f"cabinClass="
         )
 
+    @staticmethod
+    def _is_homepage_redirect(url: str) -> bool:
+        parsed = urlsplit(url)
+        return parsed.netloc == "www.qunar.com" and parsed.path in {"", "/"}
+
     def _build_mobile_search_url(self, params: SearchParams) -> str:
         """构建移动端去哪儿机票搜索 URL。
 
@@ -942,7 +983,7 @@ class QunarScraper(FlightScraper):
             params: 搜索参数。
 
         Returns:
-            解析得到的 FlightPrice 列表，失败时返回空列表。
+            解析得到的 FlightPrice 列表；明确成功但无航班时返回空列表。
         """
         if not self.cookies:
             logger.warning("[HTTP直连] 无 Cookie，跳过 HTTP 直连尝试")
@@ -964,22 +1005,24 @@ class QunarScraper(FlightScraper):
                 "AppleWebKit/605.1.15 (KHTML, like Gecko) "
                 "Version/16.0 Mobile/15E148 Safari/604.1"
             ),
-            "Referer": (
-                f"https://m.flight.qunar.com/ncs/page/flightlist"
-                f"?depCity={quote(dep_city)}&arrCity={quote(arr_city)}"
-                f"&goDate={go_date}"
-            ),
+            "Referer": self._build_mobile_search_url(params),
+            "Origin": "https://m.flight.qunar.com",
             "Cookie": cookie_str,
             "Accept": "application/json, text/plain, */*",
         }
-
-        # touchInnerList API URL（移动端去哪儿航班列表接口）
-        api_url = (
-            f"https://m.flight.qunar.com/ncs/page/touchInnerList"
-            f"?depCity={quote(dep_city)}&arrCity={quote(arr_city)}"
-            f"&goDate={go_date}&child=0&baby=0&cabinType=0"
-            f"&from=touch_index_search&queryType=0"
-        )
+        api_url = "https://m.flight.qunar.com/flight/api/touchInnerList"
+        payload = {
+            "depCity": dep_city,
+            "arrCity": arr_city,
+            "goDate": go_date,
+            "child": "0",
+            "baby": "0",
+            "cabinType": "0",
+            "from": "touch_index_search",
+            "startNum": 0,
+            "sort": 5,
+            "_v": 2,
+        }
 
         logger.info("[HTTP直连] 调用 touchInnerList: %s → %s, %s", dep_city, arr_city, go_date)
 
@@ -987,13 +1030,14 @@ class QunarScraper(FlightScraper):
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                 # 首次请求可能返回空 data（搜索中），需要轮询
                 for attempt in range(6):
-                    resp = await client.get(api_url, headers=headers)
+                    payload["firstRequest"] = attempt == 0
+                    resp = await client.post(api_url, headers=headers, json=payload)
                     if resp.status_code != 200:
                         logger.warning(
                             "[HTTP直连] HTTP %d, 响应: %s",
                             resp.status_code, resp.text[:200],
                         )
-                        return []
+                        raise ScraperError(f"touchInnerList HTTP {resp.status_code}")
 
                     data = resp.json()
                     # 检查是否是有效响应（data 字段非空）
@@ -1007,21 +1051,26 @@ class QunarScraper(FlightScraper):
 
                     # data 为空字符串 = 搜索中，等待后重试
                     if data.get("ret") is False:
-                        logger.warning("[HTTP直连] ret=false: %s", data.get("msg", ""))
-                        return []
+                        message = data.get("msg") or "接口返回失败"
+                        if data.get("code") == -1 and data.get("data") is None:
+                            logger.info("[HTTP直连] 接口明确返回无航班: %s", message)
+                            return []
+                        logger.warning("[HTTP直连] ret=false: %s", message)
+                        raise ScraperError(f"touchInnerList 返回失败: {message}")
 
                     logger.debug("[HTTP直连] 搜索中（data为空），等待 3s 后重试...")
                     await asyncio.sleep(3)
 
-                logger.warning("[HTTP直连] 轮询 6 次后仍无有效数据")
-                return []
+                raise ScraperError("touchInnerList 轮询 6 次后仍无有效数据")
 
         except httpx.HTTPError as e:
             logger.warning("[HTTP直连] HTTP 请求异常: %s", e)
-            return []
+            raise ScraperError(f"touchInnerList 请求失败: {e}") from e
+        except ScraperError:
+            raise
         except Exception as e:
-            logger.error("[HTTP直连] 未知异常: %s", e)
-            return []
+            logger.error("[HTTP直连] 响应解析异常: %s", e)
+            raise ParseError(f"touchInnerList 响应解析失败: {e}") from e
 
     async def _maybe_refresh_and_retry(
         self, params: "SearchParams", page: "Page"
@@ -1036,8 +1085,7 @@ class QunarScraper(FlightScraper):
             空列表。
         """
         logger.warning(
-            "[去哪儿] 未获取到航班数据，Cookie 可能已失效。"
-            "如需刷新 Cookie，可运行: python scripts/qunar_login.py"
+            "[去哪儿] 未获取到航班数据，可能是当前路线无结果、网页接口不可用或 Cookie 失效"
         )
         return []
 
@@ -1055,7 +1103,11 @@ class QunarScraper(FlightScraper):
             params: 搜索参数。
 
         Returns:
-            解析得到的 FlightPrice 列表，失败时返回空列表。
+            解析得到的 FlightPrice 列表；有效响应确认无航班时返回空列表。
+
+        Raises:
+            ScraperError: 页面请求失败或未捕获到接口响应。
+            ParseError: 响应或页面解析失败。
         """
         page: Optional[Page] = None
         intercepted: List[Dict] = []
@@ -1170,6 +1222,22 @@ class QunarScraper(FlightScraper):
                 if _has_valid_response():
                     logger.info(f"[移动端] 有效响应已就绪，轮询退出（第{_poll_i+1}次）")
                     break
+                empty_response = next(
+                    (
+                        resp["data"]
+                        for resp in intercepted
+                        if resp.get("data", {}).get("ret") is False
+                        and resp.get("data", {}).get("code") == -1
+                        and resp.get("data", {}).get("data") is None
+                    ),
+                    None,
+                )
+                if empty_response is not None:
+                    logger.info(
+                        "[移动端] 接口明确返回无航班: %s",
+                        empty_response.get("msg") or "无航班",
+                    )
+                    return []
                 # 若已有响应但 data 字段无法解析（很可能是国内线反爬混淆），
                 # 再等下去也是徒劳——提前退出去走 DOM 路径。
                 if _poll_i >= 6 and intercepted:
@@ -1202,7 +1270,7 @@ class QunarScraper(FlightScraper):
 
             if not intercepted:
                 logger.warning("[移动端] 未捕获到 touchInnerList 响应")
-                return []
+                raise ScraperError("移动端未捕获到 touchInnerList 响应")
 
             # ── 选择有效响应：跳过 status code / 空响应，取真正的航班 JSON ──
             # 首个 touchInnerList 调用可能返回 data: "18"（状态码），
@@ -1279,15 +1347,17 @@ class QunarScraper(FlightScraper):
                     f"[移动端] 所有 {len(intercepted)} 条响应均无有效航班数据，"
                     "可能 Cookie 已失效或需要重新登录"
                 )
-                return []
+                raise ParseError("移动端 touchInnerList 响应无法解析")
 
             result = self._parse_touch_inner_list_response(target, params)
             logger.info(f"[移动端] 解析得到 {len(result)} 条航班")
             return result
 
+        except ScraperError:
+            raise
         except Exception as e:
             logger.error(f"[移动端] 搜索异常: {e}")
-            return []
+            raise ParseError(f"移动端航班搜索失败: {e}") from e
         finally:
             if page:
                 await page.close()
@@ -1970,6 +2040,12 @@ class QunarScraper(FlightScraper):
         Args:
             page: Playwright page object.
         """
+        if self._is_homepage_redirect(page.url):
+            raise ScraperError(
+                "去哪儿网页版机票查询及预订服务已停止提供，搜索入口跳转官网首页；"
+                "请使用去哪儿 App 或另接授权数据源，刷新 Cookie 无法恢复网页采集"
+            )
+
         # Strategy 1: wait for Qunar's domestic flight card element
         try:
             await page.wait_for_selector(".b-airfly", timeout=20000)
@@ -2195,54 +2271,14 @@ class QunarScraper(FlightScraper):
     async def _search_inter_single_via_roundtrip(
         self, params: SearchParams
     ) -> List[FlightPrice]:
-        """国际单程降级搜索：通过 interroundtrip_compare.htm 获取航班数据。
-
-        当 oneway_list_inter.htm 的 wwwsearch API 返回空数据时（常见于会话被风控），
-        构造一个假往返请求（回程 = 去程日期 + 3 天），使用 interroundtrip_compare.htm
-        的不同后端 API 端点获取航班数据，只取去程单腿价格返回。
-
-        注：返回的 price 是往返总价（含税），比单程价略高，但对于周末雷达
-        的价格排序和筛选来说足够用。
-
-        Args:
-            params: 单程搜索参数。
-
-        Returns:
-            去程单腿 FlightPrice 列表，失败时返回空列表。
-        """
-        return_date = params.departure_date + timedelta(days=3)
-        fake_roundtrip_params = SearchParams(
-            departure_city=params.departure_city,
-            arrival_city=params.arrival_city,
-            departure_date=params.departure_date,
-            return_date=return_date,
+        """国际往返接口不能提供单程报价，因此不用于单程降级。"""
+        logger.warning(
+            "[国际单程降级] 已跳过假往返请求：%s→%s（%s）的往返总价不能作为单程价",
+            params.departure_city,
+            params.arrival_city,
+            params.departure_date,
         )
-        logger.info(
-            "[国际单程降级] 构造假往返 %s→%s, 去程 %s 回程 %s",
-            params.departure_city, params.arrival_city,
-            params.departure_date, return_date,
-        )
-        roundtrip_results = await self._search_inter_roundtrip(fake_roundtrip_params)
-        if not roundtrip_results:
-            logger.warning("[国际单程降级] interroundtrip_compare 也未返回数据")
-            return []
-
-        # 只取去程（trips[0]）信息，price 是往返含税总价
-        outbound_only: List[FlightPrice] = []
-        for fp in roundtrip_results:
-            outbound_only.append(
-                FlightPrice(
-                    flight_info=fp.flight_info,
-                    price=fp.price,
-                    currency=fp.currency,
-                    seat_class=fp.seat_class,
-                    available_seats=fp.available_seats,
-                    scraped_at=fp.scraped_at,
-                    source=fp.source,
-                )
-            )
-        logger.info("[国际单程降级] 获取到 %d 条去程航班（价格=往返总价）", len(outbound_only))
-        return outbound_only
+        return []
 
     async def _search_inter_roundtrip(self, params: SearchParams) -> List[FlightPrice]:
         """通过 interroundtrip_compare.htm 页面采集国际往返航班价格。
@@ -2315,6 +2351,12 @@ class QunarScraper(FlightScraper):
             except Exception as exc:
                 logger.debug("[往返] goto 异常（忽略）: %s", exc)
 
+            if self._is_homepage_redirect(page.url):
+                raise ScraperError(
+                    "去哪儿网页版机票查询及预订服务已停止提供，搜索入口跳转官网首页；"
+                    "请使用去哪儿 App 或另接授权数据源，刷新 Cookie 无法恢复网页采集"
+                )
+
             # ── 等待初始数据，然后点击价格升序排序 ───────────────────────────
             # 等待约 5s 让页面完成初始 API 请求，然后点击价格升序按钮；
             # 如按钮触发新 API 请求则再等 10s 捕获排序后的数据，
@@ -2344,6 +2386,8 @@ class QunarScraper(FlightScraper):
                         [r["url"] for r in captured_responses[:10]],
                     )
 
+        except ScraperError:
+            raise
         except Exception as exc:
             logger.error("[往返] 采集异常: %s", exc, exc_info=True)
         finally:
@@ -2464,13 +2508,10 @@ class QunarScraper(FlightScraper):
             # Get all flight elements using Qunar's actual CSS class
             flight_elements = await page.query_selector_all(".b-airfly")
 
-            # ── 滚动加载：持续滚动直到采集到目标数量 ──────────────────────────
-            target = self.max_results
+            # ── 滚动加载：路线过滤前不按最低价或数量截断 ──────────────────────
             MAX_SCROLLS, NO_NEW_THRESHOLD = 8, 2
             no_new_count = 0
             for _ in range(MAX_SCROLLS):
-                if len(flight_elements) >= target:
-                    break
                 prev = len(flight_elements)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -2481,7 +2522,6 @@ class QunarScraper(FlightScraper):
                         break
                 else:
                     no_new_count = 0
-            flight_elements = flight_elements[:target]
             # ──────────────────────────────────────────────────────────────────
 
             if not flight_elements:
@@ -2768,6 +2808,9 @@ class QunarScraper(FlightScraper):
                                 or record.get("flightNumber")
                                 or "UNKNOWN"
                             ).strip()
+                            second_flight_no = str(binfo2.get("airCode") or "").strip()
+                            if not binfo and second_flight_no:
+                                flight_no = f"{flight_no}/{second_flight_no}"
 
                             # Airline name — seg1.fullName
                             airline = str(

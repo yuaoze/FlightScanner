@@ -1,10 +1,12 @@
-"""Cookie management API endpoints (Qunar / Ctrip / Tongcheng)."""
+"""Cookie management API endpoints (Fliggy / Ctrip / Tongcheng)."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
+import os
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Coroutine
@@ -25,33 +27,33 @@ router = APIRouter()
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 _COOKIE_FILES: dict[str, Path] = {
-    "qunar": _PROJECT_ROOT / "qunar_cookies.json",
+    "fliggy": _PROJECT_ROOT / "fliggy_cookies.json",
     "ctrip": _PROJECT_ROOT / "ctrip_cookies.json",
     "tongcheng": _PROJECT_ROOT / "tongcheng_cookies.json",
 }
 
 _KEY_COOKIES: dict[str, set] = {
-    "qunar": {"QN42", "JSESSIONID", "ctt_june"},
-    "ctrip": {"ibu_uid", "UBT_VID", "uid", "suid"},
+    "fliggy": {"cookie2", "unb"},
+    "ctrip": {"cticket", "ibu_uid", "UBT_VID", "uid", "suid"},
     # 同程的公开机票列表接口无需固定登录 Cookie；只要上传内容可解析即可
     # 注入浏览器，因此不以不稳定的营销/会话 Cookie 名误判有效性。
     "tongcheng": set(),
 }
 
 _PLATFORM_LABEL = {
-    "qunar": "去哪儿",
+    "fliggy": "飞猪",
     "ctrip": "携程",
     "tongcheng": "同程旅行",
 }
 _COOKIE_DOMAINS = {
-    "qunar": ".qunar.com",
+    "fliggy": ".fliggy.com",
     "ctrip": ".ctrip.com",
     "tongcheng": ".ly.com",
 }
-_LOGIN_SUPPORTED = {"qunar", "ctrip", "tongcheng"}
-_LOGIN_TIMEOUT = 120  # default for the existing Qunar/Ctrip flows
+_LOGIN_SUPPORTED = {"fliggy", "ctrip", "tongcheng"}
+_LOGIN_TIMEOUT = 120  # default for the existing Fliggy/Ctrip flows
 _LOGIN_TIMEOUTS = {
-    "qunar": _LOGIN_TIMEOUT,
+    "fliggy": _LOGIN_TIMEOUT,
     "ctrip": _LOGIN_TIMEOUT,
     # The official WeChat OAuth QR remains valid for roughly five minutes.
     "tongcheng": 300,
@@ -74,6 +76,24 @@ def _check_login_supported(platform: str) -> None:
 
 
 # ── Cookie file I/O ───────────────────────────────────────────────────────
+
+
+def _write_cookies(path: Path, cookies: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(cookies, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _read_cookies(platform: str) -> list[dict]:
@@ -171,11 +191,23 @@ def get_cookies_status() -> list[CookieStatus]:
     result: list[CookieStatus] = []
     for platform, path in _COOKIE_FILES.items():
         cookies = _read_cookies(platform)
-        names = {c.get("name") for c in cookies if c.get("value")}
+        if platform == "fliggy":
+            from flightscanner.scrapers.fliggy_scraper import FliggyScraper
+
+            cookies = FliggyScraper._normalize_cookies(cookies)
+            names = {
+                c["name"] for c in cookies
+                if c["value"].strip().lower() not in {"", "0", "null", "none"}
+            }
+        else:
+            names = {c.get("name") for c in cookies if c.get("value")}
         key_set = _KEY_COOKIES[platform]
         present = sorted(key_set & names)
         missing = sorted(key_set - names)
-        valid = bool(cookies) if not key_set else bool(present)
+        if platform == "fliggy":
+            valid = not missing
+        else:
+            valid = bool(cookies) if not key_set else bool(present)
         mtime_dt: datetime | None = None
         if path.exists():
             mtime_dt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
@@ -218,7 +250,7 @@ def upload_cookies(platform: str, body: UploadCookieRequest) -> UploadCookieResp
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     path = _COOKIE_FILES[platform]
-    path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_cookies(path, cookies)
 
     # 主动通知正在运行的 scraper 立即热重载，无需等下一轮采集
     _notify_scrapers_reload(platform)
@@ -286,7 +318,7 @@ class LoginState:
 
 
 _login_states: dict[str, LoginState] = {
-    "qunar": LoginState(),
+    "fliggy": LoginState(),
     "ctrip": LoginState(),
     "tongcheng": LoginState(),
 }
@@ -308,8 +340,8 @@ def _reset_state(platform: str) -> None:
 
 def _load_qr_login(platform: str) -> QRLogin:
     """Load a platform's QR-login coroutine without importing Playwright eagerly."""
-    if platform == "qunar":
-        from scripts.qunar_login import qr_login
+    if platform == "fliggy":
+        from scripts.fliggy_login import qr_login
     elif platform == "ctrip":
         from scripts.ctrip_login import qr_login
     elif platform == "tongcheng":
@@ -357,11 +389,12 @@ def _start_login_thread(platform: str, state: LoginState) -> None:
                 return
             state.qr_base64 = qr_base64
             state.status = "qr_ready"
-            state.message = (
-                "请使用微信“扫一扫”并确认登录同程旅行"
-                if platform == "tongcheng"
-                else "请使用对应手机 App 扫描二维码"
-            )
+            if platform == "fliggy":
+                state.message = "请使用淘宝 App 扫码并确认登录飞猪"
+            elif platform == "tongcheng":
+                state.message = "请使用微信“扫一扫”并确认登录同程旅行"
+            else:
+                state.message = "请使用对应手机 App 扫描二维码"
 
     def _runner() -> None:
         try:

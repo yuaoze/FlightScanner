@@ -52,9 +52,8 @@
 
 #### 2.4 多渠道通知
 - [x] **Telegram Bot**：`TelegramNotifier`，通过 Telegram Bot API 发送 Markdown 格式提醒
-- [x] **WeCom 企业微信 Webhook**：`WeComNotifier`，群机器人一行 POST 推送 Markdown
 - [x] **飞书 Webhook**：`FeiShuNotifier`，Post 富文本格式 + 可选 HMAC-SHA256 签名
-- [x] **通知器工厂**：`build_notifiers()` 统一管理四渠道（Email / Telegram / WeCom / 飞书）
+- [x] **通知器工厂**：`build_notifiers()` 统一管理三渠道（Email / Telegram / 飞书）
 - [ ] 仪表板：通知渠道配置面板（填写 Bot Token / Webhook URL）
 
 #### 2.5 过滤条件
@@ -70,7 +69,7 @@
 |------|------|
 | 携程反爬比去哪儿更严 | 考虑引入 camoufox 或 stealth 插件，或改用官方 API |
 | 灵活日期产生大量查询 | 每日期独立 job，加入随机延迟（3~8s）避免封号 |
-| Telegram 国内访问 | 代理配置（`httpx.Client(proxies=...)`）或使用 WeCom 替代 |
+| Telegram 国内访问 | 代理配置（`httpx.Client(proxies=...)`）或使用飞书替代 |
 
 ---
 

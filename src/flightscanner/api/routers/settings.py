@@ -8,6 +8,7 @@ from typing import Optional
 from dotenv import set_key
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.engine import make_url
 
 from flightscanner.utils.config import Settings, get_settings
 from flightscanner.utils.config import settings as live_settings
@@ -21,6 +22,16 @@ _SCRAPER_RUNTIME_FIELDS = {
     "scraper_timeout",
     "scraper_retry_count",
     "max_results_per_platform",
+}
+_NOTIFIER_RUNTIME_FIELDS = {
+    "smtp_host",
+    "smtp_port",
+    "smtp_user",
+    "smtp_password",
+    "telegram_bot_token",
+    "telegram_chat_id",
+    "feishu_webhook_url",
+    "feishu_webhook_secret",
 }
 
 
@@ -50,6 +61,31 @@ def _schedule_scraper_reconfigure() -> bool:
         return False
 
 
+def _schedule_notifier_reconfigure() -> bool:
+    try:
+        from flightscanner.api import main as api_main
+
+        monitor = api_main._monitor
+        loop = getattr(monitor, "_loop", None) if monitor is not None else None
+        if monitor is None or loop is None or not loop.is_running():
+            return False
+        future = asyncio.run_coroutine_threadsafe(
+            monitor.reconfigure_notifiers(), loop
+        )
+
+        def _log_result(done) -> None:
+            try:
+                done.result()
+            except Exception:
+                logger.exception("运行中通知渠道热重配失败；已保存配置将在重启后生效")
+
+        future.add_done_callback(_log_result)
+        return True
+    except Exception:
+        logger.exception("提交通知渠道热重配任务失败；已保存配置将在重启后生效")
+        return False
+
+
 def _mask(value: Optional[str]) -> Optional[str]:
     """Mask sensitive values, showing only first 4 chars."""
     if not value:
@@ -57,6 +93,10 @@ def _mask(value: Optional[str]) -> Optional[str]:
     if len(value) <= 6:
         return "***"
     return value[:4] + "***"
+
+
+def _mask_database_url(value: str) -> str:
+    return make_url(value).render_as_string(hide_password=True)
 
 
 # ── Read schemas ────────────────────────────────────────────────────────
@@ -73,7 +113,6 @@ class ScraperSettings(BaseModel):
 class NotificationChannelStatus(BaseModel):
     email: bool
     telegram: bool
-    wecom: bool
     feishu: bool
 
 
@@ -116,7 +155,6 @@ def get_current_settings() -> SettingsResponse:
         notifications=NotificationChannelStatus(
             email=bool(s.smtp_host and s.smtp_user),
             telegram=bool(s.telegram_bot_token and s.telegram_chat_id),
-            wecom=bool(s.wecom_webhook_url),
             feishu=bool(s.feishu_webhook_url),
         ),
         cooldowns=CooldownSettings(
@@ -132,7 +170,7 @@ def get_current_settings() -> SettingsResponse:
             base_url=s.deepseek_base_url,
             api_key_configured=bool(s.deepseek_api_key),
         ),
-        database_url=s.database_url,
+        database_url=_mask_database_url(s.database_url),
         notify_below_avg_threshold=s.notify_below_avg_threshold,
     )
 
@@ -177,7 +215,6 @@ class UpdateSettingsRequest(BaseModel):
     smtp_password: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
-    wecom_webhook_url: Optional[str] = None
     feishu_webhook_url: Optional[str] = None
     feishu_webhook_secret: Optional[str] = None
 
@@ -207,7 +244,6 @@ _ENV_KEYS = {
     "smtp_password": "SMTP_PASSWORD",
     "telegram_bot_token": "TELEGRAM_BOT_TOKEN",
     "telegram_chat_id": "TELEGRAM_CHAT_ID",
-    "wecom_webhook_url": "WECOM_WEBHOOK_URL",
     "feishu_webhook_url": "FEISHU_WEBHOOK_URL",
     "feishu_webhook_secret": "FEISHU_WEBHOOK_SECRET",
 }
@@ -282,5 +318,7 @@ def update_settings(body: UpdateSettingsRequest) -> SettingsResponse:
 
     if _SCRAPER_RUNTIME_FIELDS.intersection(payload):
         _schedule_scraper_reconfigure()
+    if _NOTIFIER_RUNTIME_FIELDS.intersection(payload):
+        _schedule_notifier_reconfigure()
 
     return get_current_settings()

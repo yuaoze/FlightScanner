@@ -173,6 +173,18 @@ def test_arrival_limit_is_a_cumulative_upper_bound(
     assert accepted == expected_offsets
 
 
+def test_live_filters_reject_missing_configured_fields_but_history_remains_readable() -> None:
+    route = SimpleNamespace(
+        dep_airport_code="PVG",
+        dep_time_from="08:00",
+        dep_time_to="10:00",
+    )
+    price = _price(_flight("MISSING", 0, departure_time="invalid"))
+
+    assert filter_prices_by_route(route, [price]) == [price]
+    assert filter_prices_by_route(route, [price], strict=True) == []
+
+
 def test_zero_is_an_active_same_day_only_constraint() -> None:
     prices = [
         _price(_flight("D0", 0)),

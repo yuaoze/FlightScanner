@@ -8,10 +8,8 @@
 """
 
 import asyncio
-import hashlib
 import json
 import logging
-import random
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -50,59 +48,34 @@ _APPROX_ONE_WAY_HOURS: Dict[str, float] = {
 }
 
 
-# ── Mock 显示元数据（确定性随机，刷新不跳变）──────────────────────────────────
+# ── 展示元数据 ────────────────────────────────────────────────────────────────
 
 @dataclass
 class _DealMeta:
-    """供超值标签计算用的展示元数据（可来自 DB 或 Mock 生成）。"""
-    daily_avg: Decimal          # 当日该航线市场均价（参考值）
-    weekend_prices: List[Decimal]   # 未来4个周末的参考价格列表
-    round_trip_hours: float         # 往返总飞行小时数
-    is_cheapest_weekend: bool = False  # 是否近4周最低
-
-
-def _det_rng(destination: str, salt: str = "") -> random.Random:
-    """基于目的地名称 + 盐值生成确定性随机器，保证每次展示结果一致。"""
-    seed = int(hashlib.md5(f"{destination}{salt}".encode()).hexdigest()[:8], 16)
-    return random.Random(seed)
+    """供超值标签计算用的真实或明确标识为估算的展示元数据。"""
+    daily_avg: Decimal
+    weekend_prices: List[Decimal]
+    round_trip_hours: float
+    is_cheapest_weekend: bool = False
 
 
 def _enrich_with_display_meta(
     deals: List[WeekendDeal],
 ) -> List[Tuple[WeekendDeal, _DealMeta]]:
-    """为每个 WeekendDeal 注入 Mock 元数据，供超值标签计算使用。
-
-    当 deal.historical_avg 已存在（数据库有历史数据）时优先使用；
-    否则通过确定性随机生成合理的参考价格，保证卡片视觉效果。
-    """
+    """仅使用已有历史数据生成标签，数据不足时不制造历史低点或均价。"""
     enriched: List[Tuple[WeekendDeal, _DealMeta]] = []
     for deal in deals:
-        rng = _det_rng(deal.destination)
-
-        # 日均价：优先使用 historical_avg，否则 Mock 1.2-2.1 倍
-        if deal.historical_avg and deal.historical_avg > 0:
-            daily_avg = deal.historical_avg
-        else:
-            mult = Decimal(str(round(rng.uniform(1.2, 2.1), 2)))
-            daily_avg = (deal.total_price * mult).quantize(Decimal("1"))
-
-        # 未来4周参考价格列表（当前周已包含在内，可能是最低）
-        base = float(deal.total_price)
-        weekend_prices: List[Decimal] = [deal.total_price]
-        for _ in range(3):
-            weekend_prices.append(
-                Decimal(str(round(base * rng.uniform(1.05, 1.65))))
-            )
-        rng.shuffle(weekend_prices)
-
+        daily_avg = (
+            deal.historical_avg
+            if deal.historical_avg and deal.historical_avg > 0
+            else Decimal("0")
+        )
         rt_hours = _APPROX_ONE_WAY_HOURS.get(deal.destination, 2.5) * 2.0
-        is_cheapest = deal.total_price <= min(weekend_prices)
-
         enriched.append((deal, _DealMeta(
             daily_avg=daily_avg,
-            weekend_prices=weekend_prices,
+            weekend_prices=[],
             round_trip_hours=rt_hours,
-            is_cheapest_weekend=is_cheapest,
+            is_cheapest_weekend=False,
         )))
     return enriched
 

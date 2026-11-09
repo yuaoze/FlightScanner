@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { AnimatePresence } from 'framer-motion';
 import { apiClient } from '../api/client';
@@ -15,6 +15,9 @@ export function RadarPage() {
   const [visaFreeOnly, setVisaFreeOnly] = useState(false);
   const [excludeRedEye, setExcludeRedEye] = useState(false);
   const [scanMessage, setScanMessage] = useState<string | null>(null);
+  const [awaitingScan, setAwaitingScan] = useState(false);
+  const [scanBaseline, setScanBaseline] = useState<string | null>(null);
+  const [scanTimedOut, setScanTimedOut] = useState(false);
 
   const { data, isLoading } = useQuery({
     queryKey: ['radar', 'deals', selectedWeekend, maxBudget, visaFreeOnly, excludeRedEye],
@@ -28,7 +31,30 @@ export function RadarPage() {
       const { data } = await apiClient.get<RadarDealsResponse>('/radar/deals', { params });
       return data;
     },
+    refetchInterval: (query) =>
+      awaitingScan &&
+      !scanTimedOut &&
+      (query.state.data?.latest_scan_at ?? null) === scanBaseline
+        ? 5000
+        : false,
+    refetchIntervalInBackground: true,
   });
+
+  const scanCompleted =
+    awaitingScan && (data?.latest_scan_at ?? null) !== scanBaseline;
+  const pollingScan = awaitingScan && !scanCompleted && !scanTimedOut;
+
+  useEffect(() => {
+    if (!pollingScan) return;
+    const timeout = window.setTimeout(() => setScanTimedOut(true), 120000);
+    return () => window.clearTimeout(timeout);
+  }, [pollingScan]);
+
+  useEffect(() => {
+    if (!scanCompleted) return;
+    const timeout = window.setTimeout(() => setAwaitingScan(false), 6000);
+    return () => window.clearTimeout(timeout);
+  }, [scanCompleted]);
 
   const scanMutation = useMutation({
     mutationFn: async () => {
@@ -37,10 +63,18 @@ export function RadarPage() {
     },
     onSuccess: (res) => {
       setScanMessage(res.message);
+      if (res.status === 'queued') {
+        setScanBaseline(data?.latest_scan_at ?? null);
+        setScanTimedOut(false);
+        setAwaitingScan(true);
+        queryClient.invalidateQueries({ queryKey: ['radar'] });
+      } else {
+        setAwaitingScan(false);
+      }
       setTimeout(() => setScanMessage(null), 6000);
-      queryClient.invalidateQueries({ queryKey: ['radar'] });
     },
     onError: () => {
+      setAwaitingScan(false);
       setScanMessage('扫描请求失败，请稍后重试');
       setTimeout(() => setScanMessage(null), 6000);
     },
@@ -48,19 +82,24 @@ export function RadarPage() {
 
   const deals = data?.deals ?? [];
   const weekends = data?.weekends ?? [];
+  const visibleScanMessage = scanCompleted
+    ? '扫描结果已更新'
+    : scanTimedOut
+      ? '扫描仍在后台执行，请稍后手动刷新'
+      : scanMessage;
 
   return (
     <div>
       <RadarHero
         total={deals.length}
         latestScanAt={data?.latest_scan_at ?? null}
-        isScanning={scanMutation.isPending}
+        isScanning={scanMutation.isPending || pollingScan}
         onScan={() => scanMutation.mutate()}
       />
 
-      {scanMessage && (
+      {visibleScanMessage && (
         <div className="mb-4 bg-purple-50 border border-purple-200 rounded-lg px-4 py-2.5 text-xs text-purple-800">
-          {scanMessage}
+          {visibleScanMessage}
         </div>
       )}
 

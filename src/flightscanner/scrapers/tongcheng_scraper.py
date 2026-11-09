@@ -748,7 +748,7 @@ class TongchengScraper(FlightScraper):
             return False
 
     def _normalise_results(self, prices: Sequence[FlightPrice]) -> list[FlightPrice]:
-        """同航班/方向/舱等只保留最低公开价格，然后按价格截断。"""
+        """同航班/方向/舱等只保留最低公开价格，路线过滤由调度器执行。"""
         best: dict[tuple[Any, ...], FlightPrice] = {}
         for item in prices:
             key = (
@@ -762,7 +762,7 @@ class TongchengScraper(FlightScraper):
             old = best.get(key)
             if old is None or item.price < old.price:
                 best[key] = item
-        return sorted(best.values(), key=lambda item: item.price)[: self.max_results]
+        return sorted(best.values(), key=lambda item: item.price)
 
     # ------------------------------------------------------------------
     # 国际机票 API 解析

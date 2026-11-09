@@ -6,11 +6,11 @@
 用法::
 
     # 获取单个爬虫实例
-    scraper = ScraperRegistry.get("qunar", headless=True)
+    scraper = ScraperRegistry.get("fliggy", headless=True)
 
     # 批量构建多个爬虫（多源聚合场景）
     scrapers = ScraperRegistry.build_enabled(
-        ["qunar", "ctrip", "tongcheng"], headless=True
+        ["fliggy", "ctrip", "tongcheng"], headless=True
     )
 """
 
@@ -46,11 +46,11 @@ class ScraperRegistry:
         """
         if cls._registry is None:
             from flightscanner.scrapers.ctrip_scraper import CtripScraper
-            from flightscanner.scrapers.qunar_scraper import QunarScraper
+            from flightscanner.scrapers.fliggy_scraper import FliggyScraper
             from flightscanner.scrapers.tongcheng_scraper import TongchengScraper
 
             cls._registry = {
-                "qunar": QunarScraper,
+                "fliggy": FliggyScraper,
                 "ctrip": CtripScraper,
                 "tongcheng": TongchengScraper,
             }
@@ -61,7 +61,7 @@ class ScraperRegistry:
         """返回所有已注册的平台名称列表（字母升序）。
 
         Returns:
-            平台名字符串列表，例如 ``["ctrip", "qunar"]``。
+            平台名字符串列表，例如 ``["ctrip", "fliggy"]``。
         """
         return sorted(cls._get_registry().keys())
 
@@ -70,7 +70,7 @@ class ScraperRegistry:
         """按平台名实例化并返回对应爬虫。
 
         Args:
-            platform: 平台名称（不区分大小写），如 ``"qunar"``、``"ctrip"``、
+            platform: 平台名称（不区分大小写），如 ``"fliggy"``、``"ctrip"``、
                 ``"tongcheng"``。
             **kwargs: 透传给爬虫构造函数的关键字参数，例如
                 ``headless=True``、``timeout=30000``。
@@ -105,7 +105,7 @@ class ScraperRegistry:
 
         Args:
             platforms: 需要启用的平台名称列表，例如
-                ``["qunar", "ctrip", "tongcheng"]``。
+                ``["fliggy", "ctrip", "tongcheng"]``。
             **kwargs: 透传给所有爬虫构造函数的关键字参数。
 
         Returns:

@@ -1,24 +1,27 @@
-"""携程（Ctrip）机票爬虫实现。
-
-采用双策略架构：
-1. API 拦截（主路径）：监听携程 XHR 响应，解析 JSON 格式的航班数据；
-2. DOM 解析（备用路径）：当 API 未返回有效数据时，解析页面 DOM 元素。
-
-反爬对抗措施：
-- 注入 JS 隐藏 navigator.webdriver 等自动化特征；
-- 设置真实 User-Agent 与中文地区信息；
-- 随机延迟避免频率过高被封。
-"""
+"""携程机票采集：被动读取官网响应及完整往返选择结果。"""
 
 import asyncio
 import logging
-import random
+import os
 import re
-from datetime import date, datetime, timezone
+import secrets
+import shutil
+import sys
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 from flightscanner.interfaces import (
     AntiCrawlerDetectedError,
@@ -28,6 +31,7 @@ from flightscanner.interfaces import (
     FlightScraper,
     NetworkTimeoutError,
     ParseError,
+    ScraperError,
     SearchParams,
 )
 from flightscanner.utils.city_codes import get_city_code
@@ -112,6 +116,8 @@ class CtripScraper(FlightScraper):
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
+        self._display_process: Optional[asyncio.subprocess.Process] = None
+        self._display_directory: Optional[TemporaryDirectory] = None
 
     def _get_cookies_mtime(self) -> Optional[float]:
         """Return mtime of the cookie file, or None if path unset / file missing."""
@@ -245,52 +251,66 @@ class CtripScraper(FlightScraper):
 
     # ── 浏览器生命周期 ───────────────────────────────────────────────────────
 
+    async def _start_virtual_display(self) -> Dict[str, str]:
+        search_path = os.pathsep.join((str(Path(sys.executable).parent), os.defpath, os.getenv("PATH", "")))
+        xvfb = shutil.which("Xvfb", path=search_path)
+        xauth = shutil.which("xauth", path=search_path)
+        if not xvfb or not xauth:
+            raise ScraperError("携程后台采集需要 Xvfb 和 xauth；缺少组件，不会打开桌面浏览器")
+        self._display_directory = TemporaryDirectory(prefix="flightscanner-xvfb-")
+        auth_file = str(Path(self._display_directory.name) / "Xauthority")
+        token = secrets.token_hex(16)
+
+        # Xvfb 启动时先读取认证密钥，再为自动分配的显示编号登记同一密钥。
+        for display in (":0", None):
+            if display is None:
+                self._display_process = await asyncio.create_subprocess_exec(
+                    xvfb, "-displayfd", "1", "-screen", "0", "1440x900x24",
+                    "-nolisten", "tcp", "-auth", auth_file,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                number = await asyncio.wait_for(self._display_process.stdout.readline(), 10)
+                if not number.strip().isdigit():
+                    raise ScraperError("携程后台虚拟显示启动失败，不会打开桌面浏览器")
+                display = f":{int(number)}"
+            auth = await asyncio.create_subprocess_exec(
+                xauth, "-f", auth_file, "source", "-",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await auth.communicate(f"add {display} . {token}\n".encode())
+            if auth.returncode != 0:
+                raise ScraperError("携程后台虚拟显示认证初始化失败")
+
+        environment = os.environ.copy()
+        environment.update(DISPLAY=display, XAUTHORITY=auth_file)
+        environment.pop("WAYLAND_DISPLAY", None)
+        return environment
+
     async def _ensure_browser(self) -> None:
         """按需初始化 Playwright 浏览器（仅首次调用时执行）。"""
-        if self._browser:
+        if not self._browser:
+            try:
+                environment = None
+                virtual = self.headless and sys.platform.startswith("linux")
+                if virtual:
+                    environment = await self._start_virtual_display()
+                self._playwright = await async_playwright().start()
+                self._browser = await self._playwright.chromium.launch(
+                    headless=False if virtual else self.headless,
+                    env=environment,
+                )
+            except (Exception, asyncio.CancelledError):
+                await self.close()
+                raise
+        if self._context is not None:
             return
-
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-web-security",
-            ],
-        )
         self._context = await self._browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            viewport={"width": 1440, "height": 900},
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
-        )
-        # 注入反爬 JS：对每个新页面隐藏 webdriver 特征
-        await self._context.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined,
-                configurable: true,
-            });
-            // 清除 CDP 注入的 cdc_ 属性
-            const _windowKeys = Object.keys(window);
-            for (const key of _windowKeys) {
-                if (key.startsWith('cdc_')) {
-                    delete window[key];
-                }
-            }
-            // 模拟真实 Chrome 对象
-            window.chrome = {
-                runtime: {},
-                loadTimes: function() { return {}; },
-                csi: function() { return {}; },
-            };
-            """
         )
         # 注入 Cookie（若已加载）— 必须在首次导航前注入才能生效
         if self.cookies:
@@ -312,6 +332,14 @@ class CtripScraper(FlightScraper):
         except Exception as exc:
             logger.error("关闭浏览器时出错：%s", exc)
         finally:
+            if self._display_process is not None:
+                if self._display_process.returncode is None:
+                    self._display_process.terminate()
+                await self._display_process.communicate()
+                self._display_process = None
+            if self._display_directory is not None:
+                self._display_directory.cleanup()
+                self._display_directory = None
             self._context = None
             self._browser = None
             self._playwright = None
@@ -339,49 +367,29 @@ class CtripScraper(FlightScraper):
         page: Optional[Page] = None
         # 捕获格式：{"url": ..., "data": ...}，方便调试时定位具体接口
         captured: List[Dict[str, Any]] = []
+        capture_tasks: List[asyncio.Task] = []
+
+        async def capture_response(response) -> None:
+            try:
+                data = await response.json()
+                if isinstance(data, dict):
+                    captured.append({"url": response.url.split("?")[0], "data": data})
+            except Exception as exc:
+                logger.debug("携程响应读取失败，保留 DOM 解析路径：%s", exc)
+
+        def on_response(response) -> None:
+            parsed = urlsplit(response.url)
+            if parsed.hostname != "flights.ctrip.com" or not response.ok:
+                return
+            if any(part in parsed.path for part in (
+                "/international/search/api/", "/restapi/soa2/",
+                "/online/process", "/itinerary/api/",
+            )):
+                capture_tasks.append(asyncio.create_task(capture_response(response)))
 
         try:
             page = await self._context.new_page()
-
-            # 使用 page.route() 拦截 API 请求，避免 inspector cache 逐出大响应
-            # （batchSearch 接口响应体约 11MB，page.on("response") 无法可靠读取）
-            import json as _json_mod
-
-            async def _api_route(route) -> None:
-                """拦截携程 API 请求，读取并缓存响应体，再原样转发给浏览器。"""
-                try:
-                    response = await route.fetch()
-                    body_bytes = await response.body()
-                    body = body_bytes.decode("utf-8", errors="replace")
-                    stripped = body.lstrip()
-                    if (stripped.startswith("{") or stripped.startswith("[")) and len(body) > 200:
-                        try:
-                            data = _json_mod.loads(body)
-                            if isinstance(data, dict):
-                                url = route.request.url
-                                captured.append({"url": url, "data": data})
-                                logger.debug(
-                                    "携程 API 已捕获：%s (%d bytes)",
-                                    url.split("?")[0], len(body),
-                                )
-                        except Exception:
-                            pass
-                    await route.fulfill(response=response, body=body_bytes)
-                except Exception:
-                    # 若 fetch/fulfill 失败，让请求正常通过
-                    try:
-                        await route.continue_()
-                    except Exception:
-                        pass
-
-            # 只拦截携程 JSON API 路径（不拦截 JS/CSS/图片，避免性能损失）
-            for pattern in (
-                "**/international/search/api/**",
-                "**/restapi/soa2/**",
-                "**/online/process**",
-                "**/itinerary/api/**",
-            ):
-                await page.route(pattern, _api_route)
+            page.on("response", on_response)
 
             url = self._build_search_url(params)
             logger.info("携程搜索：%s → %s，%s，URL: %s",
@@ -389,27 +397,35 @@ class CtripScraper(FlightScraper):
                         params.departure_date, url)
 
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
-            except asyncio.TimeoutError as exc:
+                response = await page.goto(
+                    url, wait_until="domcontentloaded", timeout=self.timeout
+                )
+            except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
                 raise NetworkTimeoutError(f"携程页面加载超时：{exc}") from exc
+            if response is not None and response.status in {403, 432}:
+                raise AntiCrawlerDetectedError(
+                    f"携程拒绝浏览器访问（HTTP {response.status}）；"
+                    "需要人工登录或验证，后台采集不会自动打开桌面窗口"
+                )
 
-            # Cookie 注入时携程需要更多时间执行 JS 并发起认证 API 请求
-            wait_secs = random.uniform(7, 10) if self.cookies else random.uniform(5, 8)
-            logger.debug("等待 %.1f 秒让页面 API 请求完成…", wait_secs)
-            await asyncio.sleep(wait_secs)
-
-            if await self._is_blocked(page):
-                raise AntiCrawlerDetectedError("携程反爬机制已触发（CAPTCHA / 验证页面）")
+            await self._wait_for_search_results(page)
+            if params.return_date is not None:
+                return await self._parse_roundtrip_from_dom(page, params)
+            if capture_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*capture_tasks), timeout=self.timeout / 1000
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("携程部分响应读取超时，继续解析已完成响应和页面数据")
 
             # ── 优先：解析捕获的 API 响应 ────────────────────────────────
             flight_prices = self._parse_api_responses(captured, params)
             if flight_prices:
                 flight_prices.sort(key=lambda fp: fp.price)
-                total_api = len(flight_prices)
-                flight_prices = flight_prices[: self.max_results]
                 logger.info(
-                    "API 解析得到 %d 条，按价格升序保留最低 %d 条",
-                    total_api, len(flight_prices),
+                    "API 解析得到 %d 条，交由调度器过滤后截断",
+                    len(flight_prices),
                 )
 
             # ── 备用：DOM 解析 ───────────────────────────────────────────
@@ -441,7 +457,94 @@ class CtripScraper(FlightScraper):
             raise ParseError(f"携程数据解析失败：{exc}") from exc
         finally:
             if page:
+                page.remove_listener("response", on_response)
                 await page.close()
+            for task in capture_tasks:
+                if not task.done():
+                    task.cancel()
+            if capture_tasks:
+                await asyncio.gather(*capture_tasks, return_exceptions=True)
+
+    async def _wait_for_search_results(self, page: Page, return_selection: bool = False) -> None:
+        try:
+            await page.wait_for_function(
+                """returnSelection => (
+                    document.querySelector('.flight-item .plane-No')
+                    && (!returnSelection || (
+                        document.querySelector('.segment_tab_selected_flight')
+                        && [...document.querySelectorAll('.flight-item .btn-book')]
+                            .some(button => button.textContent.includes('订票'))
+                    ))
+                ) || document.body.innerText.includes('为保障您的安全访问')
+                  || document.body.innerText.includes('依次点击图标验证')""",
+                arg=return_selection,
+                timeout=self.timeout,
+            )
+        except PlaywrightTimeoutError:
+            logger.debug("携程等待航班列表超时")
+        if await self._is_blocked(page):
+            if self.headless:
+                raise AntiCrawlerDetectedError(
+                    "携程搜索需要人工验证，后台采集已停止；不会自动打开桌面窗口"
+                )
+            await self._wait_for_manual_verification(page)
+
+    async def _wait_for_manual_verification(self, page: Page, timeout: float = 120) -> None:
+        logger.warning("请在携程浏览器窗口完成验证，当前搜索会话将保留 %s 秒", timeout)
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline and not page.is_closed():
+            if not await self._is_blocked(page) and await page.locator(".flight-item").count():
+                return
+            await asyncio.sleep(1)
+        raise AntiCrawlerDetectedError("携程人工验证未完成，请重新采集并在浏览器中完成验证")
+
+    async def _parse_roundtrip_from_dom(
+        self, page: Page, params: SearchParams
+    ) -> List[FlightPrice]:
+        results: List[FlightPrice] = []
+        outbound_count = await page.locator(".flight-item").count()
+        return_params = SearchParams(
+            departure_city=params.arrival_city,
+            arrival_city=params.departure_city,
+            departure_date=params.return_date,
+        )
+        for index in range(outbound_count):
+            cards = page.locator(".flight-item")
+            if index >= await cards.count():
+                break
+            card = cards.nth(index)
+            outbound = await self._parse_flight_element(await card.element_handle(), params)
+            if outbound is None:
+                continue
+            await card.get_by_text("选为去程", exact=False).click()
+            await self._wait_for_search_results(page, return_selection=True)
+            await page.locator(".segment_tab_selected_flight").wait_for(timeout=self.timeout)
+            await page.locator(".flight-item .btn-book").filter(
+                has_text="订票"
+            ).first.wait_for(timeout=self.timeout)
+            return_cards = page.locator(".flight-item")
+            for return_index in range(await return_cards.count()):
+                return_card = return_cards.nth(return_index)
+                if "往返含税价" not in await return_card.inner_text():
+                    continue
+                inbound = await self._parse_flight_element(
+                    await return_card.element_handle(), return_params
+                )
+                if inbound is None:
+                    continue
+                # 回程选择页标价已包含已选去程，不能再相加。
+                results.append(replace(
+                    inbound,
+                    flight_info=outbound.flight_info,
+                    return_flight_info=replace(
+                        inbound.flight_info, direction=FlightDirection.RETURN
+                    ),
+                ))
+            await page.locator(".segment_tab_selected_flight .research_link").click()
+            await page.get_by_text("选为去程", exact=False).first.wait_for(timeout=self.timeout)
+        results.sort(key=lambda fp: fp.price)
+        logger.info("携程完成去回程选择，取得 %d 条完整往返报价", len(results))
+        return results
 
     # ── URL 构建 ─────────────────────────────────────────────────────────────
 
@@ -493,7 +596,12 @@ class CtripScraper(FlightScraper):
                 ".captcha, .verify-code, #captcha, "
                 "[class*='captcha'], [class*='verify']"
             )
-            return captcha is not None
+            if captcha is not None:
+                return True
+            for text in ("为保障您的安全访问", "依次点击图标验证"):
+                if await page.query_selector(f"text={text}") is not None:
+                    return True
+            return False
         except Exception:
             return False
 
@@ -580,6 +688,8 @@ class CtripScraper(FlightScraper):
         Returns:
             该行程对应的 FlightPrice 列表（按舱位分）。
         """
+        if params.return_date is not None:
+            return []
         prices: List[FlightPrice] = []
 
         # ── 提取航班信息 ─────────────────────────────────────────────────────
@@ -703,29 +813,7 @@ class CtripScraper(FlightScraper):
             arrival_date=arrival_date,
         )
 
-        # ── 往返搜索：构建标记信息 ──────────────────────────────────
-        # 携程往返搜索时 API 只返回去程航班信息，回程信息被合并到 adultPrice 中。
-        # 无法从 API 提取真实的回程航班，但可以创建虚拟的占位符来标记这是已合并的往返记录，
-        # 防止下游 _combine_roundtrip_prices() 误将其当作单程去程记录处理。
-        return_flight_info: Optional[FlightInfo] = None
-        if params.return_date is not None:
-            # 创建虚拟的回程航班占位符
-            # 这是 Ctrip API 的局限：返回合计价但不返回回程航班细节
-            return_flight_info = FlightInfo(
-                flight_no="VIRTUAL_RETURN",  # 虚拟占位
-                airline="",  # 不可知
-                departure_city=params.arrival_city,
-                arrival_city=params.departure_city,
-                departure_time="00:00",
-                arrival_time="00:00",
-                departure_date=params.return_date,
-                direction=FlightDirection.RETURN,
-            )
-
         # ── 提取最低价格 ─────────────────────────────────────────────────────
-        # batchSearch 每个行程（itinerary）含多个价格档位（priceList），每档对应
-        # 不同的退改签套餐；价格监控只关心最低价，因此每个行程只保留一条记录。
-        # 往返搜索时 adultPrice = 两程合计；设置 return_flight_info 标记已合并。
         price_list = (
             itinerary.get("priceList")
             or itinerary.get("prices")
@@ -734,50 +822,23 @@ class CtripScraper(FlightScraper):
         if not isinstance(price_list, list):
             price_list = [itinerary]
 
-        is_roundtrip = params.return_date is not None
-
         best_price: Optional[Decimal] = None
         best_cabin_code = "Y"
         best_seats: Optional[int] = None
 
         for price_entry in price_list:
             try:
-                # price_is_total=True 表示 raw_price 已是含税总价，不应再加 adultTax
-                price_is_total = False
-                if is_roundtrip:
-                    # 优先使用明确为"总价"的字段；这些字段通常已含税，不应再叠加 adultTax
-                    for field in ("roundTripPrice", "twowayPrice", "totalAdultPrice", "roundPrice"):
-                        v = price_entry.get(field)
-                        if v:
-                            raw_price = v
-                            price_is_total = True
-                            break
-                    else:
-                        # 降级为 adultPrice（基础票价，需叠加 adultTax）
-                        raw_price = (
-                            price_entry.get("adultPrice")
-                            or price_entry.get("price")
-                            or price_entry.get("salePrice")
-                            or 0
-                        )
-                else:
-                    raw_price = (
-                        price_entry.get("adultPrice")
-                        or price_entry.get("price")
-                        or price_entry.get("salePrice")
-                        or 0
-                    )
+                raw_price = (
+                    price_entry.get("adultPrice")
+                    or price_entry.get("price")
+                    or price_entry.get("salePrice")
+                    or 0
+                )
                 if not raw_price:
                     continue
-
-                # ── 含税总价 ──────────────────────────────────────────────────
-                # batchSearch 国际航班：adultPrice = 基础票价，adultTax = 机场税/燃油费；
-                # 国内航班：adultTax = None，adultPrice 已含税。
-                # 若 raw_price 来自 roundTripPrice 等"总价"字段则已含税，不再叠加；
-                # 若降级为 adultPrice 则需相加才等于最终价格。
-                if not price_is_total:
-                    adult_tax = price_entry.get("adultTax") or 0
-                    raw_price = raw_price + adult_tax
+                raw_price = Decimal(str(raw_price)) + Decimal(
+                    str(price_entry.get("adultTax") or 0)
+                )
 
                 seats_left = price_entry.get("seatsLeft")
                 # 仅在 seatsLeft 明确为 0 时跳过（已售罄）；
@@ -786,6 +847,8 @@ class CtripScraper(FlightScraper):
                     continue
 
                 candidate = Decimal(str(raw_price))
+                if not candidate.is_finite() or candidate <= 0:
+                    continue
                 if best_price is None or candidate < best_price:
                     best_price = candidate
                     best_cabin_code = str(
@@ -807,7 +870,6 @@ class CtripScraper(FlightScraper):
                 available_seats=best_seats,
                 scraped_at=datetime.now(timezone.utc),
                 source="ctrip",
-                return_flight_info=return_flight_info,
             ))
 
         return prices
@@ -919,27 +981,44 @@ class CtripScraper(FlightScraper):
             return ""
 
         try:
-            # 航班号：".plane-No" 文本形如 "EU6674 空客320(中)"，只取航班代码部分
-            flight_no_raw = await _text(".plane-No") or ""
-            _m = re.match(r"([A-Z0-9]{2,3}\d{3,4})", flight_no_raw.strip().upper())
-            flight_no = (
-                _m.group(1)
-                if _m
-                else (flight_no_raw.split()[0].upper() if flight_no_raw else "UNKNOWN")
-            )
+            flight_numbers = []
+            for plane in await element.query_selector_all(".plane-No"):
+                raw = (await plane.inner_text()).strip().upper()
+                match = re.match(r"([A-Z0-9]{2,3}\d{3,4})\b", raw)
+                if not match:
+                    return None
+                flight_numbers.append(match.group(1))
+            if not flight_numbers:
+                return None
+            transfer = re.search(r"转(\d+)次", await _text(".arrow-box"))
+            if transfer and len(flight_numbers) != int(transfer.group(1)) + 1:
+                return None
+            if "中转" in await _text(".transfer-info-group") and len(flight_numbers) < 2:
+                return None
+            flight_no = "+".join(flight_numbers)
 
             airline = await _text(".airline-name span, .airline-name") or "未知航空公司"
 
             dep_time_raw = await _text(".depart-box .time") or ""
             arr_time_raw = await _text(".arrive-box .time") or ""
+            if not dep_time_raw or not arr_time_raw:
+                return None
             dep_time = self._extract_time_str(dep_time_raw)
             arr_time = self._extract_time_str(arr_time_raw)
+            day_offset = re.search(r"([+-]\d+)\s*天", arr_time_raw)
+            arrival_date = params.departure_date + timedelta(
+                days=int(day_offset.group(1)) if day_offset else 0
+            )
 
             price_text = await _text(".flight-price .price, .price")
-            price_str = re.sub(r"[^\d.]", "", price_text)
-            if not price_str:
+            if "-" in price_text:
                 return None
-            price = Decimal(price_str)
+            price_match = re.search(r"(\d[\d,]*(?:\.\d+)?)", price_text)
+            if not price_match:
+                return None
+            price = Decimal(price_match.group(1).replace(",", ""))
+            if not price.is_finite() or price <= 0:
+                return None
 
             flight_info = FlightInfo(
                 flight_no=flight_no,
@@ -950,6 +1029,9 @@ class CtripScraper(FlightScraper):
                 arrival_time=arr_time,
                 departure_date=params.departure_date,
                 direction=FlightDirection.DEPARTURE,
+                departure_airport=await _text(".depart-box .airport") or None,
+                arrival_airport=await _text(".arrive-box .airport") or None,
+                arrival_date=arrival_date,
             )
             return FlightPrice(
                 flight_info=flight_info,

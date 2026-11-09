@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 _PLATFORM_DISPLAY: Dict[str, Tuple[str, str]] = {
+    "FliggyScraper": ("fliggy", "飞猪"),
     "QunarScraper": ("qunar", "去哪儿"),
     "CtripScraper": ("ctrip", "携程"),
     "TongchengScraper": ("tongcheng", "同程旅行"),
@@ -334,6 +335,8 @@ class PriceMonitorScheduler:
         self.headless = headless
         self._scrape_warnings: List[str] = []  # 最近一次采集的平台级警告（如 Cookie 失效）
         self._active_scraper_tasks: Set[asyncio.Task] = set()
+        self._route_locks: Dict[int, asyncio.Lock] = {}
+        self._scraper_locks: Dict[int, asyncio.Lock] = {}
         self._immediate_scrapes = ImmediateScrapeStore(max_tasks=100)
 
         platforms = [p.strip() for p in settings.scraper_type.split(",") if p.strip()]
@@ -342,6 +345,7 @@ class PriceMonitorScheduler:
         self.analyzer = RuleBasedAnalyzer()
 
         # ── 通知渠道 ──────────────────────────────────────────────────────
+        self._notifications_enabled = enable_notifications
         self.notifiers: List[Notifier] = build_notifiers(settings, enable_notifications)
 
         self.scheduler = AsyncIOScheduler()
@@ -362,13 +366,13 @@ class PriceMonitorScheduler:
                 p.strip() for p in settings.scraper_type.split(",") if p.strip()
             ]
 
-        qunar_cookies = None
-        if "qunar" in platforms and settings.qunar_cookies:
+        fliggy_cookies = None
+        if "fliggy" in platforms and settings.fliggy_cookies:
             try:
-                qunar_cookies = json.loads(settings.qunar_cookies)
-                logger.info("已从配置加载 Qunar Cookie")
+                fliggy_cookies = json.loads(settings.fliggy_cookies)
+                logger.info("已从配置加载 Fliggy Cookie")
             except json.JSONDecodeError as exc:
-                logger.warning("Qunar Cookie 解析失败：%s", exc)
+                logger.warning("Fliggy Cookie 解析失败：%s", exc)
 
         # CtripScraper 也支持通过环境变量传入 Cookie
         ctrip_cookies = None
@@ -397,10 +401,10 @@ class PriceMonitorScheduler:
                 "max_retries": settings.scraper_retry_count,
                 "max_results": settings.max_results_per_platform,
             }
-            if platform == "qunar":
+            if platform == "fliggy":
                 scraper = ScraperRegistry.get(
-                    "qunar",
-                    cookies=qunar_cookies,
+                    "fliggy",
+                    cookies=fliggy_cookies,  # None 时自动尝试 fliggy_cookies.json
                     **common_kwargs,
                 )
             elif platform == "ctrip":
@@ -446,6 +450,12 @@ class PriceMonitorScheduler:
         logger.info("运行中爬虫已热重配：%s", platforms)
         return platforms
 
+    async def reconfigure_notifiers(self) -> int:
+        enabled = getattr(self, "_notifications_enabled", True)
+        self.notifiers = build_notifiers(settings, enabled)
+        logger.info("运行中通知渠道已热重配：%d 个", len(self.notifiers))
+        return len(self.notifiers)
+
     def _immediate_scrape_store(self) -> ImmediateScrapeStore:
         """Return the task store, lazily creating it for legacy/bare instances."""
         store = getattr(self, "_immediate_scrapes", None)
@@ -480,6 +490,19 @@ class PriceMonitorScheduler:
         route: Route,
         task_id: Optional[str] = None,
     ) -> None:
+        """串行执行同一路线的定时、补采和手动采集任务。"""
+        route_id = int(route.id)
+        if not hasattr(self, "_route_locks"):
+            self._route_locks = {}
+        lock = self._route_locks.setdefault(route_id, asyncio.Lock())
+        async with lock:
+            await self._scrape_route(route, task_id=task_id)
+
+    async def _scrape_route(
+        self,
+        route: Route,
+        task_id: Optional[str] = None,
+    ) -> None:
         """对单条路线执行多平台并行采集。
 
         并发调用所有已启用的爬虫，合并去重后存库，并在价格达标时触发告警。
@@ -503,6 +526,7 @@ class PriceMonitorScheduler:
             # ── 精准航班号监控模式 ─────────────────────────────────────────
             if getattr(route, "monitoring_mode", "route") == "flight":
                 await self._scrape_pinned_flights(route, task_id=task_id)
+                await self._check_buy_plan_deadlines(route.id)
                 return
 
             trip_type = getattr(route, "trip_type", "oneway")
@@ -513,13 +537,11 @@ class PriceMonitorScheduler:
                 departure_date=route.target_date,
                 return_date=route.return_date if trip_type == "roundtrip" else None,
             )
-            for scraper in self.scrapers:
-                if hasattr(scraper, "max_results"):
-                    scraper.max_results = getattr(route, "max_results", 20)
             flight_prices = await self._scrape_all_platforms(
                 params,
                 route=route,
                 task_id=task_id,
+                max_results=getattr(route, "max_results", 20),
             )
 
             if not flight_prices:
@@ -527,6 +549,7 @@ class PriceMonitorScheduler:
                     "路线 %s（%s → %s）所有平台均未采集到数据",
                     route.id, route.origin, route.destination,
                 )
+                await self._check_buy_plan_deadlines(route.id)
                 return
 
             logger.info("路线 %s 共采集到 %d 条价格（合并去重后）", route.id, len(flight_prices))
@@ -564,6 +587,7 @@ class PriceMonitorScheduler:
                     "路线 %s 采集结果全部被到达日/机场/时间过滤器过滤（0 条匹配），跳过存库",
                     route.id,
                 )
+                await self._check_buy_plan_deadlines(route.id)
                 return
             logger.info("路线 %s 过滤后剩余 %d 条价格", route.id, len(flight_prices))
 
@@ -616,8 +640,7 @@ class PriceMonitorScheduler:
                         )
 
                 route_service = RouteService(session)
-                for fp in flight_prices:
-                    route_service.save_price_for_route(route.id, fp)
+                route_service.save_prices_for_route(route.id, flight_prices)
                 # A previous all-filtered scrape must not keep suppressing the
                 # newly successful current batch on the dashboard.
                 route_service.update_flight_status(route.id, "available")
@@ -629,11 +652,16 @@ class PriceMonitorScheduler:
                 )
 
                 # ── 价格告警判断 ───────────────────────────────────────────
-                # 1. 获取30天历史并计算统计数据
-                history = filter_prices_by_route(
-                    route,
-                    route_service.get_route_price_history(route.id, days=30),
-                )
+                # 历史统计只使用当前批次之前的数据，避免当前最低价同时成为比较基准。
+                history = [
+                    fp
+                    for fp in filter_prices_by_route(
+                        route,
+                        route_service.get_route_price_history(route.id, days=30),
+                    )
+                    if fp.batch_id != batch_id
+                ]
+                history_with_current = history + flight_prices
                 stats = self._compute_price_stats(history)
                 price_count = int(stats.get("batch_count", len(history)))
 
@@ -644,7 +672,8 @@ class PriceMonitorScheduler:
                 days_until_departure = (route.target_date - date.today()).days
                 recent_3d_low = self._compute_recent_3d_low(history)
                 consecutive_declining = self._compute_consecutive_declining_batches(
-                    history, lookback=settings.notify_trend_lookback_batches
+                    history_with_current,
+                    lookback=settings.notify_trend_lookback_batches,
                 )
 
                 # 更新路线近期最低价记录
@@ -666,7 +695,9 @@ class PriceMonitorScheduler:
                     route, best_fp.price, trigger_reason=reason
                 ):
                     # 6. AI 简报辅助决策
-                    ai_brief = await self._get_ai_brief_for_notify(history, route)
+                    ai_brief = await self._get_ai_brief_for_notify(
+                        history_with_current, route
+                    )
                     if self._ai_should_suppress(reason, ai_brief):
                         logger.info(
                             "路线 %s AI 简报建议 Wait（置信度 %.2f），抑制 %s 通知",
@@ -674,8 +705,10 @@ class PriceMonitorScheduler:
                             ai_brief.get("confidence", 0) if ai_brief else 0,
                             reason,
                         )
-                    elif self.notifiers and history:
-                        trend = self.analyzer.predict_trend(history, route.target_date)
+                    elif self.notifiers:
+                        trend = self.analyzer.predict_trend(
+                            history_with_current, route.target_date
+                        )
                         ctx = self._build_notify_context(
                             route, best_fp, stats, reason, price_count,
                             days_until_departure=days_until_departure,
@@ -690,6 +723,7 @@ class PriceMonitorScheduler:
                             message_json,
                             route_id=route.id,
                             trigger_reason=reason,
+                            event_id=self._route_notification_event_id(route.id),
                         )
                         if sent:
                             self._update_route_notification_state(
@@ -697,7 +731,7 @@ class PriceMonitorScheduler:
                             )
                         else:
                             logger.warning(
-                                "路线 %s 通知全渠道失败，不进入冷却以便下次重试",
+                                "路线 %s 通知未全部送达，不进入冷却并仅重试失败渠道",
                                 route.id,
                             )
                     else:
@@ -712,11 +746,11 @@ class PriceMonitorScheduler:
                     )
 
                 # ── G1：记录预测（每路线每 12 小时最多一次）────────────────────
-                await self._maybe_log_prediction(session, route, history)
+                await self._maybe_log_prediction(session, route, history_with_current)
 
                 # ── 买入计划触发检查（价格达标或到期）─────────────────────
                 await self._check_buy_plans(
-                    session, route, best_fp, history, stats, price_count,
+                    session, route, best_fp, history_with_current, stats, price_count,
                     days_until_departure=days_until_departure,
                     recent_3d_low=recent_3d_low,
                     consecutive_declining=consecutive_declining,
@@ -743,6 +777,7 @@ class PriceMonitorScheduler:
             route,
             prices,
             require_complete_roundtrip=require_complete_roundtrip,
+            strict=True,
         )
 
     async def _scrape_pinned_flights(
@@ -768,11 +803,6 @@ class PriceMonitorScheduler:
             logger.warning("路线 %s 精准模式未设置 outbound_flight_no，跳过", route.id)
             return
 
-        # ── 去程搜索（max_results 调高，确保能找到目标航班） ────────────────
-        for scraper in self.scrapers:
-            if hasattr(scraper, "max_results"):
-                scraper.max_results = 100
-
         out_params = SearchParams(
             departure_city=route.origin,
             arrival_city=route.destination,
@@ -782,6 +812,9 @@ class PriceMonitorScheduler:
         out_prices = await self._scrape_all_platforms(
             out_params,
             task_id=task_id,
+            max_results=100,
+            flight_no=outbound_no,
+            seat_class=seat_class,
         )
         outbound_fp, out_status = self._match_pinned_flight(out_prices, outbound_no, seat_class)
 
@@ -799,6 +832,9 @@ class PriceMonitorScheduler:
             in_prices = await self._scrape_all_platforms(
                 in_params,
                 task_id=task_id,
+                max_results=100,
+                flight_no=inbound_no,
+                seat_class=seat_class,
             )
             inbound_fp, in_status = self._match_pinned_flight(in_prices, inbound_no, seat_class)
 
@@ -835,7 +871,10 @@ class PriceMonitorScheduler:
             )
 
         candidates = filter_prices_by_route(
-            route, candidates, require_complete_roundtrip=False,
+            route,
+            candidates,
+            require_complete_roundtrip=False,
+            strict=True,
         )
         if trip_type == "roundtrip":
             prices_to_save = self._combine_roundtrip_prices(candidates)
@@ -873,24 +912,29 @@ class PriceMonitorScheduler:
         try:
             route_service = RouteService(session)
             route_service.update_flight_status(route.id, status)
-            for fp in prices_to_save:
-                route_service.save_price_for_route(route.id, fp)
+            route_service.save_prices_for_route(route.id, prices_to_save)
             logger.info(
                 "路线 %s 精准航班 %s 已存库（批次 %s）", route.id, outbound_no, batch_id
             )
 
             # ── 价格告警（与普通模式相同逻辑） ────────────────────────────
-            history = filter_prices_by_route(
-                route,
-                route_service.get_route_price_history(route.id, days=30),
-            )
+            history = [
+                fp
+                for fp in filter_prices_by_route(
+                    route,
+                    route_service.get_route_price_history(route.id, days=30),
+                )
+                if fp.batch_id != batch_id
+            ]
+            history_with_current = history + prices_to_save
             stats = self._compute_price_stats(history)
             price_count = int(stats.get("batch_count", len(history)))
 
             days_until_departure = (route.target_date - date.today()).days
             recent_3d_low = self._compute_recent_3d_low(history)
             consecutive_declining = self._compute_consecutive_declining_batches(
-                history, lookback=settings.notify_trend_lookback_batches
+                history_with_current,
+                lookback=settings.notify_trend_lookback_batches,
             )
 
             current_min = float(best_fp.price)
@@ -907,13 +951,17 @@ class PriceMonitorScheduler:
             if should_notify and not self._is_cooldown_active(
                 route, best_fp.price, trigger_reason=reason
             ):
-                ai_brief = await self._get_ai_brief_for_notify(history, route)
+                ai_brief = await self._get_ai_brief_for_notify(
+                    history_with_current, route
+                )
                 if self._ai_should_suppress(reason, ai_brief):
                     logger.info(
                         "路线 %s AI 抑制 %s 通知", route.id, reason
                     )
-                elif self.notifiers and history:
-                    trend = self.analyzer.predict_trend(history, route.target_date)
+                elif self.notifiers:
+                    trend = self.analyzer.predict_trend(
+                        history_with_current, route.target_date
+                    )
                     ctx = self._build_notify_context(
                         route, best_fp, stats, reason, price_count,
                         days_until_departure=days_until_departure,
@@ -928,12 +976,13 @@ class PriceMonitorScheduler:
                         message_json,
                         route_id=route.id,
                         trigger_reason=reason,
+                        event_id=self._route_notification_event_id(route.id),
                     )
                     if sent:
                         self._update_route_notification_state(route.id, best_fp.price, reason)
                     else:
                         logger.warning(
-                            "路线 %s 通知全渠道失败，不进入冷却以便下次重试",
+                            "路线 %s 通知未全部送达，不进入冷却并仅重试失败渠道",
                             route.id,
                         )
                 else:
@@ -942,12 +991,12 @@ class PriceMonitorScheduler:
                         route.id,
                     )
 
-            await self._maybe_log_prediction(session, route, history)
+            await self._maybe_log_prediction(session, route, history_with_current)
             await self._check_buy_plans(
                 session,
                 route,
                 best_fp,
-                history,
+                history_with_current,
                 stats,
                 price_count,
                 days_until_departure=days_until_departure,
@@ -1056,6 +1105,9 @@ class PriceMonitorScheduler:
         params: SearchParams,
         route: Optional[Route] = None,
         task_id: Optional[str] = None,
+        max_results: Optional[int] = None,
+        flight_no: Optional[str] = None,
+        seat_class: Optional[str] = None,
     ) -> List[FlightPrice]:
         """并发调用所有爬虫并合并去重结果。
 
@@ -1075,13 +1127,23 @@ class PriceMonitorScheduler:
         Returns:
             合并去重后的 FlightPrice 列表，按价格升序排列。
         """
-        return await self._scrape_oneway(params, route=route, task_id=task_id)
+        return await self._scrape_oneway(
+            params,
+            route=route,
+            task_id=task_id,
+            max_results=max_results,
+            flight_no=flight_no,
+            seat_class=seat_class,
+        )
 
     async def _scrape_oneway(
         self,
         params: SearchParams,
         route: Optional[Route] = None,
         task_id: Optional[str] = None,
+        max_results: Optional[int] = None,
+        flight_no: Optional[str] = None,
+        seat_class: Optional[str] = None,
     ) -> List[FlightPrice]:
         """并发调用所有爬虫，合并去重搜索结果。
 
@@ -1104,7 +1166,20 @@ class PriceMonitorScheduler:
                 platform, display_name = _scraper_identity(scraper)
                 task_store.mark_platform_running(task_id, platform, display_name)
 
-        tasks = [asyncio.create_task(s.search_flights(params)) for s in scrapers]
+        limit = max_results
+        if limit is None:
+            limit = getattr(route, "max_results", None) or settings.max_results_per_platform
+        if not hasattr(self, "_scraper_locks"):
+            self._scraper_locks = {}
+
+        async def search_with_lock(scraper: FlightScraper):
+            lock = self._scraper_locks.setdefault(id(scraper), asyncio.Lock())
+            async with lock:
+                if hasattr(scraper, "max_results"):
+                    scraper.max_results = limit
+                return await scraper.search_flights(params)
+
+        tasks = [asyncio.create_task(search_with_lock(s)) for s in scrapers]
         self._active_scraper_tasks.update(tasks)
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1135,6 +1210,11 @@ class PriceMonitorScheduler:
                     )
                     warning = f"{display} 未获取到数据，{hint}"
                     self._scrape_warnings.append(warning)
+                if flight_no:
+                    result = self._pinned_flight_matches(
+                        result, flight_no, seat_class
+                    )
+
                 # ── 截断前先按路线过滤器筛一遍，避免最便宜的 N 条全被过滤掉 ──
                 # 路线有 dep_time_from=19:00 之类的约束时，"top N 最低价"里
                 # 可能全是清晨/凌晨便宜航班，filter 后一条不剩；先过滤再截
@@ -1160,7 +1240,6 @@ class PriceMonitorScheduler:
                 # 下游 _combine_roundtrip_prices 无法配对。按方向分别切，保证
                 # 两边都保留。已含 return_flight_info 的组合记录（携程、Qunar
                 # 国际 interroundtrip_compare）只占 DEPARTURE 组，行为不变。
-                limit = getattr(scraper, "max_results", 20)
                 departures = [
                     fp for fp in result
                     if fp.flight_info.direction == FlightDirection.DEPARTURE
@@ -1213,10 +1292,14 @@ class PriceMonitorScheduler:
                     )
 
         # ── 去重：同平台同日同方向同航班同舱位保留最低价 ──────────────────
-        return self._deduplicate(all_prices)
+        return self._deduplicate(
+            all_prices, include_unavailable=flight_no is not None
+        )
 
     @staticmethod
-    def _deduplicate(prices: List[FlightPrice]) -> List[FlightPrice]:
+    def _deduplicate(
+        prices: List[FlightPrice], *, include_unavailable: bool = False
+    ) -> List[FlightPrice]:
         """合并去重：相同航班、舱位、来源、方向和日期仅保留最低价。
 
         不同平台（source）的数据独立保留，便于比价和来源溯源。
@@ -1229,14 +1312,20 @@ class PriceMonitorScheduler:
         Returns:
             去重后按价格升序排列的列表。
         """
-        best: Dict[Tuple[str, str, str, FlightDirection, date], FlightPrice] = {}
+        best: Dict[Tuple[Any, ...], FlightPrice] = {}
         for fp in prices:
+            if not include_unavailable and (fp.price <= 0 or fp.available_seats == 0):
+                continue
+            return_info = fp.return_flight_info
             key = (
                 fp.flight_info.flight_no,
                 fp.seat_class,
                 fp.source,
+                fp.currency,
                 fp.flight_info.direction,
                 fp.flight_info.departure_date,
+                return_info.flight_no if return_info else None,
+                return_info.departure_date if return_info else None,
             )
             if key not in best or fp.price < best[key].price:
                 best[key] = fp
@@ -1357,47 +1446,94 @@ class PriceMonitorScheduler:
         message: str,
         route_id: Optional[int] = None,
         trigger_reason: Optional[str] = None,
+        event_id: Optional[str] = None,
     ) -> bool:
-        """并行调用所有通知渠道发送价格提醒。
+        """发送同一事件的未送达渠道，全部渠道成功后才返回 True。"""
+        if not self.notifiers:
+            return False
 
-        Args:
-            flight_price: 触发通知的航班价格记录（最低价）。
-            trend: 价格趋势分析结果。
-            message: 已序列化为 JSON 字符串的 NotifyContext 数据。
-            route_id: 关联的路线 ID（用于通知日志）。
-            trigger_reason: 通知触发原因（用于通知日志）。
-        """
+        event_id = event_id or uuid.uuid4().hex
         try:
+            delivered = self._successful_notification_channels(event_id)
+            pending = [
+                notifier
+                for notifier in self.notifiers
+                if self._notification_channel(notifier) not in delivered
+            ]
             results = await asyncio.gather(
-                *[n.send_alert(flight_price, trend, message) for n in self.notifiers],
+                *[n.send_alert(flight_price, trend, message) for n in pending],
                 return_exceptions=True,
             )
-            any_success = False
-            for notifier, result in zip(self.notifiers, results):
-                failed = isinstance(result, Exception) or result is False
+            for notifier, result in zip(pending, results):
+                channel = self._notification_channel(notifier)
+                failed = isinstance(result, BaseException) or result is False
                 if failed:
-                    logger.error(
-                        "%s 推送失败：%s", type(notifier).__name__, result
-                    )
+                    logger.error("%s 推送失败：%s", type(notifier).__name__, result)
                 else:
-                    any_success = True
-                # 写入通知日志
+                    delivered.add(channel)
                 if route_id is not None:
                     self._log_notification(
                         route_id=route_id,
                         price=float(flight_price.price),
                         trigger_reason=trigger_reason or "unknown",
-                        channel=type(notifier).__name__.replace("Notifier", "").lower(),
+                        channel=channel,
                         status="failed" if failed else "success",
+                        event_id=event_id,
                     )
-            logger.info(
-                "价格提醒已通过 %d 个渠道发送（航班 %s）",
-                len(self.notifiers), flight_price.flight_info.flight_no,
+
+            all_delivered = all(
+                self._notification_channel(notifier) in delivered
+                for notifier in self.notifiers
             )
-            return any_success
+            logger.info(
+                "价格提醒事件 %s 已送达 %d/%d 个渠道（航班 %s）",
+                event_id,
+                sum(self._notification_channel(n) in delivered for n in self.notifiers),
+                len(self.notifiers),
+                flight_price.flight_info.flight_no,
+            )
+            return all_delivered
         except Exception as exc:
             logger.error("发送价格提醒时出错：%s", exc, exc_info=True)
             return False
+
+    @staticmethod
+    def _notification_channel(notifier: Notifier) -> str:
+        return type(notifier).__name__.replace("Notifier", "").lower()
+
+    def _successful_notification_channels(self, event_id: str) -> Set[str]:
+        from flightscanner.models.database import NotificationLog
+
+        with self._SessionLocal() as session:
+            rows = (
+                session.query(NotificationLog.channel)
+                .filter(
+                    NotificationLog.event_id == event_id,
+                    NotificationLog.status == "success",
+                )
+                .distinct()
+                .all()
+            )
+        return {channel for (channel,) in rows}
+
+    def _route_notification_event_id(self, route_id: int) -> str:
+        with self._SessionLocal() as session:
+            route = session.query(Route).filter(Route.id == route_id).first()
+            if route is None:
+                return f"route:{route_id}:{uuid.uuid4().hex}"
+            if route.pending_notification_event_id:
+                return route.pending_notification_event_id
+            route.pending_notification_event_id = f"route:{route_id}:{uuid.uuid4().hex}"
+            session.commit()
+            return route.pending_notification_event_id
+
+    @staticmethod
+    def _buy_plan_notification_event_id(plan) -> str:
+        triggered_at = plan.triggered_at or plan.created_at
+        if triggered_at is not None and triggered_at.tzinfo is None:
+            triggered_at = triggered_at.replace(tzinfo=timezone.utc)
+        marker = triggered_at.isoformat() if triggered_at is not None else "legacy"
+        return f"buy-plan:{plan.id}:{marker}"
 
     def _log_notification(
         self,
@@ -1406,6 +1542,7 @@ class PriceMonitorScheduler:
         trigger_reason: str,
         channel: str,
         status: str,
+        event_id: Optional[str] = None,
     ) -> None:
         """Write a notification event to the NotificationLog table."""
         try:
@@ -1414,6 +1551,7 @@ class PriceMonitorScheduler:
             try:
                 log = NotificationLog(
                     route_id=route_id,
+                    event_id=event_id,
                     price=price,
                     trigger_reason=trigger_reason,
                     channel=channel,
@@ -1514,8 +1652,12 @@ class PriceMonitorScheduler:
             if float(current_price) > rebound_threshold:
                 return True, "rebound_warning"
 
-        # 条件 4：接近30天最低价（在5%误差内）
-        if min_30d > 0 and float(current_price) <= min_30d * 1.05:
+        # 条件 4：接近30天最低价（至少需要3个历史采集批次）
+        if (
+            price_count >= 3
+            and min_30d > 0
+            and float(current_price) <= min_30d * 1.05
+        ):
             return True, "near_30d_low"
 
         # 条件 5：趋势加速下降
@@ -1618,10 +1760,15 @@ class PriceMonitorScheduler:
         """
         batches: Dict[str, Tuple[float, datetime]] = {}
         for fp in history:
-            key = fp.batch_id if fp.batch_id else fp.scraped_at.isoformat()
+            scraped_at = fp.scraped_at
+            if scraped_at.tzinfo is None:
+                scraped_at = scraped_at.replace(tzinfo=timezone.utc)
+            else:
+                scraped_at = scraped_at.astimezone(timezone.utc)
+            key = fp.batch_id if fp.batch_id else scraped_at.isoformat()
             price = float(fp.price)
             if key not in batches or price < batches[key][0]:
-                batches[key] = (price, fp.scraped_at)
+                batches[key] = (price, scraped_at)
 
         if len(batches) < 2:
             return 0
@@ -1917,6 +2064,7 @@ class PriceMonitorScheduler:
             route = session.query(Route).filter(Route.id == route_id).first()
             if route:
                 route.last_notified_reason = reason
+                route.pending_notification_event_id = None
                 session.commit()
         finally:
             session.close()
@@ -2186,6 +2334,19 @@ class PriceMonitorScheduler:
                 except Exception:
                     logger.exception("每日进化任务注册失败，G2/G3 将不会自动运行")
 
+                try:
+                    self.scheduler.add_job(
+                        self._run_buy_plan_maintenance,
+                        IntervalTrigger(minutes=15),
+                        id="buy_plan_maintenance",
+                        replace_existing=True,
+                        coalesce=True,
+                        max_instances=1,
+                    )
+                    logger.info("买入计划维护任务已注册（每 15 分钟）")
+                except Exception:
+                    logger.exception("买入计划维护任务注册失败")
+
                 # ── 周末低价雷达批处理：每周二、三 UTC 18:00（北京时间 02:00）──
                 try:
                     from apscheduler.triggers.cron import CronTrigger as CronTrigger2
@@ -2352,6 +2513,22 @@ class PriceMonitorScheduler:
             with self._REPREDICT_LOCK:
                 self._REPREDICT_INFLIGHT.discard(route_id)
 
+    async def _check_buy_plan_deadlines(self, route_id: int) -> None:
+        from flightscanner.core.services import PurchaseService
+
+        try:
+            with self._SessionLocal() as session:
+                route = session.query(Route).filter(Route.id == route_id).first()
+                if route is None:
+                    return
+                triggered = PurchaseService(session).check_plans_for_route(route, None)
+            if triggered:
+                await self._retry_buy_plan_notifications()
+        except Exception as exc:
+            logger.error(
+                "路线 %s 无报价买入计划检查失败：%s", route_id, exc, exc_info=True
+            )
+
     async def _check_buy_plans(
         self,
         session,
@@ -2412,11 +2589,12 @@ class PriceMonitorScheduler:
                 success = await self._send_alert(
                     best_fp, trend, message_json,
                     route_id=route.id, trigger_reason=reason,
+                    event_id=self._buy_plan_notification_event_id(plan),
                 )
                 plan.notification_attempts = (plan.notification_attempts or 0) + 1
                 plan.last_notification_at = datetime.now(timezone.utc)
                 plan.notification_status = "sent" if success else "failed"
-                plan.notification_error = None if success else "all notification channels failed"
+                plan.notification_error = None if success else "one or more notification channels failed"
                 session.commit()
                 if success:
                     logger.info(
@@ -2451,18 +2629,23 @@ class PriceMonitorScheduler:
                     BuyPlan.status == "triggered",
                     BuyPlan.notification_status != "sent",
                     Route.deleted_at.is_(None),
-                    Route.target_date >= now.date(),
                 )
                 .order_by(BuyPlan.triggered_at.asc())
                 .all()
             )
             payloads = [
-                (plan.id, plan.route_id, plan.trigger_reason, plan.plan_price)
+                (
+                    plan.id,
+                    plan.route_id,
+                    plan.trigger_reason,
+                    plan.plan_price,
+                    plan.trigger_price,
+                )
                 for plan in plans
             ]
 
         sent = 0
-        for plan_id, route_id, trigger_reason, plan_price in payloads:
+        for plan_id, route_id, trigger_reason, plan_price, trigger_price in payloads:
             try:
                 with self._SessionLocal() as session:
                     plan = session.query(BuyPlan).filter(BuyPlan.id == plan_id).first()
@@ -2505,8 +2688,13 @@ class PriceMonitorScheduler:
                         ai_brief=None,
                     )
                     if trigger_reason == "price_hit" and plan_price is not None:
+                        price_text = (
+                            f"触发时价格 ¥{float(trigger_price):.0f}，"
+                            if trigger_price is not None
+                            else ""
+                        )
                         ctx.recommendation = (
-                            f"买入计划触发：当前价 ¥{float(best_fp.price):.0f} "
+                            f"买入计划触发：{price_text}"
                             f"已达目标价 ¥{float(plan_price):.0f}，请确认是否成交"
                         )
                     else:
@@ -2518,12 +2706,13 @@ class PriceMonitorScheduler:
                         self._build_alert_message_data(ctx),
                         route_id=route_id,
                         trigger_reason=reason,
+                        event_id=self._buy_plan_notification_event_id(plan),
                     )
                     plan.notification_attempts = (plan.notification_attempts or 0) + 1
                     plan.last_notification_at = datetime.now(timezone.utc)
                     plan.notification_status = "sent" if success else "failed"
                     plan.notification_error = (
-                        None if success else "all notification channels failed"
+                        None if success else "one or more notification channels failed"
                     )
                     session.commit()
                     if success:
@@ -2562,12 +2751,9 @@ class PriceMonitorScheduler:
         # ── 买入闭环日任务：到期计划扫描 → 过期处理 → 起飞后自动买点分析 ──
         await self._run_daily_purchase_tasks()
 
-    async def _run_daily_purchase_tasks(self) -> None:
-        """买入闭环每日任务：扫描到期计划、清理过期计划、起飞后自动生成买点分析。"""
-        from flightscanner.core.services import PurchaseService  # lazy import
+    async def _run_buy_plan_maintenance(self) -> None:
+        from flightscanner.core.services import PurchaseService
 
-        # 1. 先过期，再扫描到期计划。否则已起飞路线会先被错误触发 deadline，
-        # 随后因状态不再 pending 而逃过 expire_stale_plans。
         try:
             with self._SessionLocal() as session:
                 svc = PurchaseService(session)
@@ -2575,13 +2761,12 @@ class PriceMonitorScheduler:
                 swept = svc.sweep_deadline_plans()
                 if swept or expired:
                     logger.info(
-                        "[Purchase] 日任务：到期触发 %d 条，过期 %d 条",
+                        "[Purchase] 维护任务：到期触发 %d 条，过期 %d 条",
                         len(swept), expired,
                     )
         except Exception as exc:
             logger.error("[Purchase] 计划扫描/过期处理失败：%s", exc, exc_info=True)
 
-        # 触发与投递分离：既处理本轮 sweep，也重试此前失败/无渠道的提醒。
         try:
             sent = await self._retry_buy_plan_notifications()
             if sent:
@@ -2589,7 +2774,13 @@ class PriceMonitorScheduler:
         except Exception as exc:
             logger.error("[Purchase] 买入计划通知重试任务失败：%s", exc, exc_info=True)
 
-        # 2. 起飞后自动买点分析（筛选与执行分离，避免 session 嵌套协程）
+    async def _run_daily_purchase_tasks(self) -> None:
+        """买入闭环每日任务：执行计划维护并自动生成起飞后买点分析。"""
+        from flightscanner.core.services import PurchaseService  # lazy import
+
+        await self._run_buy_plan_maintenance()
+
+        # 起飞后自动买点分析（筛选与执行分离，避免 session 嵌套协程）
         try:
             with self._SessionLocal() as session:
                 pending_ids = PurchaseService(session).auto_analyze_departed()

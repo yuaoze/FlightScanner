@@ -108,13 +108,19 @@ def _make_price_record(
     batch_id: str,
     scraped_at: datetime,
     source: str = "qunar",
+    return_flight_id: int = None,
+    currency: str = "CNY",
+    seat_class: str = "经济舱",
+    available_seats: int = None,
 ) -> PriceHistory:
     rec = PriceHistory(
         flight_id=flight_id,
+        return_flight_id=return_flight_id,
         route_id=route_id,
         price=Decimal(str(price)),
-        currency="CNY",
-        seat_class="经济舱",
+        currency=currency,
+        seat_class=seat_class,
+        available_seats=available_seats,
         source=source,
         scraped_at=scraped_at,
         batch_id=batch_id,
@@ -235,6 +241,45 @@ class TestPlanTrigger:
         second = svc.check_plans_for_route(future_route, 540.0)
         assert len(first) == 1
         assert second == []
+
+    def test_stale_pending_read_cannot_trigger_twice(self, tmp_path):
+        engine, session_factory = init_db(f"sqlite:///{tmp_path / 'plan-race.db'}")
+        first_session = session_factory()
+        second_session = session_factory()
+        try:
+            route = Route(
+                origin="北京",
+                destination="上海",
+                target_date=date.today() + timedelta(days=10),
+                target_price=Decimal("500"),
+            )
+            first_session.add(route)
+            first_session.commit()
+            first_session.refresh(route)
+            plan = BuyPlan(
+                route_id=route.id,
+                plan_price=Decimal("600"),
+                status="pending",
+            )
+            first_session.add(plan)
+            first_session.commit()
+
+            second_session.query(BuyPlan).filter_by(id=plan.id).one()
+            first = PurchaseService(first_session).check_plans_for_route(route, 550)
+            second_route = second_session.query(Route).filter_by(id=route.id).one()
+            second = PurchaseService(second_session).check_plans_for_route(
+                second_route, 540
+            )
+
+            assert len(first) == 1
+            assert second == []
+            stored = second_session.query(BuyPlan).filter_by(id=plan.id).one()
+            assert stored.trigger_reason == "price_hit"
+            assert float(stored.trigger_price) == 550
+        finally:
+            first_session.close()
+            second_session.close()
+            engine.dispose()
 
 
 # ── 买入计划：状态机 ──────────────────────────────────────────────────────────
@@ -358,6 +403,38 @@ class TestPlanStateMachine:
         svc.create_plan(route_id=future_route.id, plan_price=600.0)
         assert svc.sweep_deadline_plans() == []
 
+    def test_sweep_includes_departed_route_with_pending_deadline(
+        self, svc, departed_route
+    ):
+        plan = BuyPlan(
+            route_id=departed_route.id,
+            plan_execute_by=NOW - timedelta(hours=1),
+            status="pending",
+        )
+        svc.session.add(plan)
+        svc.session.commit()
+
+        triggered = svc.sweep_deadline_plans()
+
+        assert [item.id for item in triggered] == [plan.id]
+        assert plan.trigger_reason == "deadline"
+
+    def test_departed_unnotified_triggered_plan_is_not_expired(
+        self, svc, departed_route
+    ):
+        plan = BuyPlan(
+            route_id=departed_route.id,
+            plan_price=Decimal("600"),
+            status="triggered",
+            triggered_at=NOW - timedelta(days=3),
+            notification_status="failed",
+        )
+        svc.session.add(plan)
+        svc.session.commit()
+
+        assert svc.expire_stale_plans() == 0
+        assert plan.status == "triggered"
+
 
 # ── 一键买入 ──────────────────────────────────────────────────────────────────
 
@@ -447,6 +524,43 @@ class TestInstantBuy:
         assert purchase.route_origin == future_route.origin
         assert purchase.route_target_date == future_route.target_date
 
+    def test_roundtrip_buy_saves_return_flight_from_quote(
+        self, svc, db_session, future_route, sample_flight
+    ):
+        return_flight = Flight(
+            flight_no="CA1235",
+            airline="中国国航",
+            departure_city="上海",
+            arrival_city="北京",
+            departure_time="18:00",
+            arrival_time="20:30",
+            departure_date=future_route.target_date + timedelta(days=3),
+            direction="return",
+        )
+        future_route.trip_type = "roundtrip"
+        future_route.return_date = return_flight.departure_date
+        db_session.add(return_flight)
+        db_session.commit()
+        _make_price_record(
+            db_session,
+            future_route.id,
+            sample_flight.id,
+            880,
+            "roundtrip-latest",
+            datetime.now(timezone.utc),
+            return_flight_id=return_flight.id,
+        )
+
+        purchase = svc.instant_buy(
+            route_id=future_route.id,
+            unit_price=880,
+            seat_class="经济舱",
+        )
+
+        assert purchase.flight_id == sample_flight.id
+        assert purchase.return_flight_id == return_flight.id
+        assert purchase.route_trip_type == "roundtrip"
+
 
 class TestRouteListPerformance:
     def test_latest_batch_query_scales_with_large_history(
@@ -515,12 +629,23 @@ class TestWindowStats:
         purchase = _make_purchase(
             db_session, route.id, price=purchase_price, purchased_at=purchased_at
         )
-        base_day = date.today() - timedelta(days=9)
+        departure_at = datetime(
+            route.target_date.year,
+            route.target_date.month,
+            route.target_date.day,
+            0,
+            0,
+            tzinfo=timezone.utc,
+        )
+        final_at = departure_at - timedelta(hours=12)
         for i, price in enumerate(window_prices):
             _make_price_record(
-                db_session, route.id, flight.id, price, f"b{i}",
-                datetime(base_day.year, base_day.month, base_day.day, 10, 0, tzinfo=timezone.utc)
-                + timedelta(days=i),
+                db_session,
+                route.id,
+                flight.id,
+                price,
+                f"b{i}",
+                final_at - timedelta(days=len(window_prices) - 1 - i),
             )
         return purchase
 
@@ -608,6 +733,36 @@ class TestWindowStats:
         assert stats["analysis_status"] == "insufficient"
         assert stats["data_quality"] == "insufficient"
         assert stats["sample_size"] == 1
+
+    def test_stale_final_quote_cannot_produce_final_verdict(
+        self, svc, db_session, departed_route, departed_flight
+    ):
+        purchased_at = datetime.now(timezone.utc) - timedelta(days=12)
+        purchase = _make_purchase(
+            db_session,
+            departed_route.id,
+            purchased_at=purchased_at,
+        )
+        purchase.flight_id = departed_flight.id
+        db_session.commit()
+        for index, days_ago in enumerate((10, 9)):
+            _make_price_record(
+                db_session,
+                departed_route.id,
+                departed_flight.id,
+                900 + index * 50,
+                f"stale-{index}",
+                datetime.now(timezone.utc) - timedelta(days=days_ago),
+            )
+
+        stats = svc.compute_window_stats(purchase, departed_route)
+
+        assert stats["sample_size"] == 2
+        assert stats["analysis_status"] == "insufficient"
+        assert stats["data_quality"] == "insufficient"
+        assert stats["final_price"] is None
+        assert stats["savings_vs_final"] is None
+        assert stats["verdict"] is None
 
     def test_pre_departure_window_uses_now_as_cutoff(
         self, svc, db_session, future_route, sample_flight
@@ -866,6 +1021,89 @@ class TestPriceSeries:
         series = svc.get_price_series_since(future_route.id, since)
         assert [p for _, p in series] == [550.0, 580.0]
         assert series[0][0] < series[1][0]
+
+    def test_roundtrip_series_requires_the_same_outbound_and_return(
+        self, svc, db_session, future_route, sample_flight
+    ):
+        return_flights = []
+        for index, flight_no in enumerate(("CA2001", "CA2002")):
+            flight = Flight(
+                flight_no=flight_no,
+                airline="中国国航",
+                departure_city="上海",
+                arrival_city="北京",
+                departure_time="18:00",
+                arrival_time="20:30",
+                departure_date=future_route.target_date + timedelta(days=3),
+                direction="return",
+            )
+            db_session.add(flight)
+            return_flights.append(flight)
+        future_route.trip_type = "roundtrip"
+        future_route.return_date = future_route.target_date + timedelta(days=3)
+        db_session.commit()
+
+        now = datetime.now(timezone.utc)
+        purchase = _make_purchase(
+            db_session,
+            future_route.id,
+            purchased_at=now - timedelta(days=2),
+        )
+        purchase.route_trip_type = "roundtrip"
+        purchase.flight_id = sample_flight.id
+        purchase.return_flight_id = return_flights[0].id
+        purchase.currency = "CNY"
+        purchase.seat_class = "经济舱"
+        db_session.commit()
+
+        for batch, hours_ago, matching_price in (("b1", 20, 600), ("b2", 5, 580)):
+            _make_price_record(
+                db_session,
+                future_route.id,
+                sample_flight.id,
+                matching_price,
+                batch,
+                now - timedelta(hours=hours_ago),
+                return_flight_id=return_flights[0].id,
+            )
+            _make_price_record(
+                db_session,
+                future_route.id,
+                sample_flight.id,
+                100,
+                batch,
+                now - timedelta(hours=hours_ago),
+                source="ctrip",
+                return_flight_id=return_flights[1].id,
+            )
+
+        series = svc.get_price_series_since(
+            future_route.id,
+            now - timedelta(days=1),
+            purchase=purchase,
+        )
+        latest_price, _ = svc.get_latest_min_price(
+            future_route.id, purchase=purchase
+        )
+
+        assert [price for _, price in series] == [600, 580]
+        assert latest_price == 580
+
+        purchase.return_flight_id = None
+        db_session.commit()
+        assert svc.get_price_series_since(
+            future_route.id,
+            now - timedelta(days=1),
+            purchase=purchase,
+        ) == []
+        assert svc.get_latest_min_price(future_route.id, purchase=purchase) == (
+            None,
+            None,
+        )
+        stats = svc.compute_window_stats(purchase, future_route)
+        assert stats["analysis_status"] == "insufficient"
+        assert stats["comparison_scope"] == "roundtrip"
+        assert stats["verdict"] is None
 
 
 # ── 经验库 ────────────────────────────────────────────────────────────────────

@@ -20,9 +20,8 @@ from flightscanner.interfaces import (
     FlightScraper,
     SearchParams,
 )
-from flightscanner.scrapers import ScraperRegistry
+from flightscanner.scrapers import FliggyScraper, QunarScraper, ScraperRegistry
 from flightscanner.scrapers.ctrip_scraper import CtripScraper
-from flightscanner.scrapers.qunar_scraper import QunarScraper
 from flightscanner.scrapers.tongcheng_scraper import TongchengScraper
 
 
@@ -35,6 +34,8 @@ def _make_flight_price(
     source: str = "test",
     direction: FlightDirection = FlightDirection.DEPARTURE,
     departure_date: date | None = None,
+    currency: str = "CNY",
+    available_seats: int | None = None,
 ) -> FlightPrice:
     """Create a minimal FlightPrice for test purposes."""
     info = FlightInfo(
@@ -50,9 +51,9 @@ def _make_flight_price(
     return FlightPrice(
         flight_info=info,
         price=Decimal(str(price)),
-        currency="CNY",
+        currency=currency,
         seat_class=seat_class,
-        available_seats=None,
+        available_seats=available_seats,
         scraped_at=datetime.now(timezone.utc),
         source=source,
     )
@@ -68,10 +69,7 @@ class TestScraperRegistry:
         platforms = ScraperRegistry.list_platforms()
 
         assert isinstance(platforms, list)
-        assert "ctrip" in platforms
-        assert "qunar" in platforms
-        assert "tongcheng" in platforms
-        assert platforms == sorted(platforms)
+        assert platforms == ["ctrip", "fliggy", "tongcheng"]
 
     def test_get_ctrip_returns_ctrip_scraper(self):
         """get('ctrip') should return a CtripScraper instance."""
@@ -81,12 +79,28 @@ class TestScraperRegistry:
         assert scraper.headless is True
         assert scraper.timeout == 5000
 
-    def test_get_qunar_returns_qunar_scraper(self):
-        """get('qunar') should return a QunarScraper instance."""
-        scraper = ScraperRegistry.get("qunar", headless=False)
+    def test_get_fliggy_returns_fliggy_scraper(self, tmp_path):
+        """get('fliggy') should pass shared constructor options through."""
+        scraper = ScraperRegistry.get(
+            "fliggy",
+            headless=False,
+            timeout=5000,
+            max_retries=2,
+            max_results=15,
+            cookies_file=str(tmp_path / "fliggy_cookies.json"),
+        )
 
-        assert isinstance(scraper, QunarScraper)
+        assert isinstance(scraper, FliggyScraper)
         assert scraper.headless is False
+        assert scraper.timeout == 5000
+        assert scraper.max_retries == 2
+        assert scraper.max_results == 15
+
+    def test_qunar_is_retired_from_registry_but_remains_exported(self):
+        """Legacy parsers stay importable without enabling retired scraping."""
+        assert issubclass(QunarScraper, FlightScraper)
+        with pytest.raises(ValueError, match="未知爬虫平台"):
+            ScraperRegistry.get("qunar")
 
     def test_get_tongcheng_returns_tongcheng_scraper(self):
         """get('tongcheng') should return a TongchengScraper instance."""
@@ -109,11 +123,11 @@ class TestScraperRegistry:
 
     def test_build_enabled_returns_list_in_order(self):
         """build_enabled() should return scrapers in the same order as input."""
-        scrapers = ScraperRegistry.build_enabled(["ctrip", "qunar"])
+        scrapers = ScraperRegistry.build_enabled(["ctrip", "fliggy"])
 
         assert len(scrapers) == 2
         assert isinstance(scrapers[0], CtripScraper)
-        assert isinstance(scrapers[1], QunarScraper)
+        assert isinstance(scrapers[1], FliggyScraper)
 
     def test_build_enabled_empty_list(self):
         """build_enabled([]) should return an empty list without raising."""
@@ -124,7 +138,7 @@ class TestScraperRegistry:
     def test_build_enabled_raises_for_unknown_platform(self):
         """build_enabled() should raise ValueError if any platform is unknown."""
         with pytest.raises(ValueError):
-            ScraperRegistry.build_enabled(["qunar", "unknown_platform"])
+            ScraperRegistry.build_enabled(["fliggy", "unknown_platform"])
 
     def test_register_adds_custom_scraper(self):
         """register() should add a custom scraper class to the registry."""
@@ -173,6 +187,31 @@ class TestDeduplicateLogic:
         """_deduplicate([]) should return []."""
         deduplicate = self._get_deduplicate()
         assert deduplicate([]) == []
+
+    @pytest.mark.parametrize("price", [0, -100])
+    def test_deduplicate_discards_nonpositive_quotes(self, price):
+        valid = _make_flight_price("CA1234", "经济舱", 500, "qunar", available_seats=5)
+        invalid = _make_flight_price(
+            "CA1234", "经济舱", price, "qunar", available_seats=5
+        )
+
+        assert self._get_deduplicate()([valid, invalid]) == [valid]
+
+    def test_deduplicate_discards_sold_out_quotes(self):
+        valid = _make_flight_price("CA1234", "经济舱", 500, "qunar", available_seats=5)
+        sold_out = _make_flight_price(
+            "CA1234", "经济舱", 400, "qunar", available_seats=0
+        )
+
+        assert self._get_deduplicate()([valid, sold_out]) == [valid]
+
+    def test_deduplicate_preserves_currencies(self):
+        cny = _make_flight_price("CA1234", "经济舱", 500, "qunar", currency="CNY")
+        usd = _make_flight_price("CA1234", "经济舱", 80, "qunar", currency="USD")
+
+        result = self._get_deduplicate()([cny, usd])
+
+        assert {fp.currency for fp in result} == {"CNY", "USD"}
 
     def test_deduplicate_keeps_only_cheapest_within_same_source(self):
         """Same (flight_no, seat_class, source) should keep only the cheapest."""

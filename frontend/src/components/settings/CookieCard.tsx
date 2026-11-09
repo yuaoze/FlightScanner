@@ -149,6 +149,7 @@ function QrLoginDialog({
     refetchInterval: (q) => {
       return q.state.data?.done ? false : 1500;
     },
+    refetchIntervalInBackground: true,
   });
 
   const handleClose = async () => {
@@ -362,7 +363,7 @@ export function CookieCard() {
     <div className="bg-white rounded-xl border border-gray-100 p-5">
       <h3 className="text-sm font-semibold text-gray-700 mb-1">Cookie 管理</h3>
       <p className="text-[11px] text-gray-400 mb-3">
-        去哪儿和携程使用各自 App 扫码；同程使用官方微信 OAuth，请用微信“扫一扫”。也可手动上传 Cookie
+        飞猪使用淘宝 App 扫码；携程使用携程 App 扫码；同程使用官方微信 OAuth，请用微信“扫一扫”。也可手动上传 Cookie
       </p>
 
       {isLoading || !data ? (

@@ -8,6 +8,7 @@ interface Props {
 }
 
 const SOURCE_LABELS: Record<string, string> = {
+  fliggy: '飞猪',
   qunar: '去哪儿',
   ctrip: '携程',
   tongcheng: '同程旅行',
@@ -15,6 +16,7 @@ const SOURCE_LABELS: Record<string, string> = {
 };
 
 const SOURCE_COLORS: Record<string, string> = {
+  fliggy: 'bg-yellow-50 text-yellow-700',
   qunar: 'bg-amber-50 text-amber-700',
   ctrip: 'bg-blue-50 text-blue-700',
   tongcheng: 'bg-violet-50 text-violet-700',

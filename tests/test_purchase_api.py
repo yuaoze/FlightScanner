@@ -47,8 +47,8 @@ def api_context(monkeypatch):
     # This execution environment cannot start AnyIO worker threads. Running
     # sync FastAPI handlers inline keeps the test focused on validation,
     # serialization, and persistence rather than the thread-pool runtime.
-    async def run_inline(function, *args, **kwargs):
-        return function(*args, **kwargs)
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
 
     monkeypatch.setattr(fastapi.routing, "run_in_threadpool", run_inline)
     app.dependency_overrides[get_db] = override_db

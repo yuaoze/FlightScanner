@@ -56,11 +56,6 @@ class Settings(BaseSettings):
         default=None, description="Telegram chat ID"
     )
 
-    # WeCom (企业微信) Notification Configuration
-    wecom_webhook_url: Optional[str] = Field(
-        default=None, description="WeCom group robot Webhook URL"
-    )
-
     # FeiShu (飞书) Notification Configuration
     feishu_webhook_url: Optional[str] = Field(
         default=None, description="飞书自定义机器人 Webhook URL"
@@ -71,10 +66,10 @@ class Settings(BaseSettings):
 
     # Scraper Configuration
     scraper_type: str = Field(
-        default="qunar",
+        default="fliggy,ctrip,tongcheng",
         description=(
             "启用的爬虫平台，单个或逗号分隔多个："
-            "'qunar'、'ctrip'、'tongcheng'"
+            "'fliggy'、'ctrip'、'tongcheng'"
         ),
     )
     scraper_headless: bool = Field(
@@ -86,9 +81,9 @@ class Settings(BaseSettings):
     scraper_retry_count: int = Field(
         default=3, description="Number of retry attempts for failed requests"
     )
-    qunar_cookies: Optional[str] = Field(
+    fliggy_cookies: Optional[str] = Field(
         default=None,
-        description="Qunar cookies JSON string for authentication (optional)",
+        description="Fliggy cookies JSON string for authentication (optional)",
     )
     ctrip_cookies: Optional[str] = Field(
         default=None,
@@ -168,7 +163,7 @@ class Settings(BaseSettings):
     @classmethod
     def validate_scraper_type(cls, v: str) -> str:
         """验证爬虫平台配置，支持单个或逗号分隔的多个平台名。"""
-        allowed = {"qunar", "ctrip", "tongcheng"}
+        allowed = {"fliggy", "ctrip", "tongcheng"}
         platforms = [p.strip().lower() for p in v.split(",") if p.strip()]
         if not platforms:
             raise ValueError("scraper_type 不能为空")

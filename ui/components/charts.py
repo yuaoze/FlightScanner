@@ -17,6 +17,7 @@ from flightscanner.interfaces import FlightPrice
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _SOURCE_LABELS: dict[str, str] = {
+    "fliggy": "飞猪",
     "qunar": "去哪儿",
     "ctrip": "携程",
     "tongcheng": "同程旅行",
@@ -185,8 +186,8 @@ def _color_enc(df_agg: pd.DataFrame) -> alt.Color:
         title="来源平台",
         legend=alt.Legend() if multi else None,
         scale=alt.Scale(
-            domain=["去哪儿", "携程", "同程旅行"],
-            range=["#3d7ff5", "#12b76a", "#8b5cf6"],
+            domain=["飞猪", "去哪儿", "携程", "同程旅行"],
+            range=["#EAB308", "#3d7ff5", "#12b76a", "#8b5cf6"],
         ),
     )
 

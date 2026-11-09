@@ -30,15 +30,15 @@ def in_time_window(
     time_str: str | None,
     from_minute: int | None,
     to_minute: int | None,
+    *,
+    strict: bool = False,
 ) -> bool:
     """Return whether a time is inside an inclusive optional window."""
     if from_minute is None and to_minute is None:
         return True
     minute = hhmm_to_minutes(time_str)
     if minute is None:
-        # Legacy scraper rows may not contain a usable time.  Keep the existing
-        # permissive behaviour rather than silently deleting their history.
-        return True
+        return not strict
     if from_minute is not None and minute < from_minute:
         return False
     if to_minute is not None and minute > to_minute:
@@ -87,7 +87,13 @@ def arrival_within_limit(flight: Any, maximum_offset: int | None) -> bool:
     return offset is not None and offset <= maximum_offset
 
 
-def leg_matches_route(route: Any, flight: Any, *, is_return: bool = False) -> bool:
+def leg_matches_route(
+    route: Any,
+    flight: Any,
+    *,
+    is_return: bool = False,
+    strict: bool = False,
+) -> bool:
     """Apply airport, clock-time and arrival-day constraints to one leg."""
     departure_airport = getattr(route, "dep_airport_code", None)
     arrival_airport = getattr(route, "arr_airport_code", None)
@@ -111,24 +117,28 @@ def leg_matches_route(route: Any, flight: Any, *, is_return: bool = False) -> bo
 
     actual_departure_airport = getattr(flight, "departure_airport_code", None)
     actual_arrival_airport = getattr(flight, "arrival_airport_code", None)
-    if (
-        expected_departure_airport
-        and actual_departure_airport
-        and actual_departure_airport != expected_departure_airport
+    if expected_departure_airport and (
+        actual_departure_airport != expected_departure_airport
+        and (strict or actual_departure_airport is not None)
     ):
         return False
-    if (
-        expected_arrival_airport
-        and actual_arrival_airport
-        and actual_arrival_airport != expected_arrival_airport
-    ):
-        return False
-    if not in_time_window(
-        getattr(flight, "departure_time", None), departure_from, departure_to
+    if expected_arrival_airport and (
+        actual_arrival_airport != expected_arrival_airport
+        and (strict or actual_arrival_airport is not None)
     ):
         return False
     if not in_time_window(
-        getattr(flight, "arrival_time", None), arrival_from, arrival_to
+        getattr(flight, "departure_time", None),
+        departure_from,
+        departure_to,
+        strict=strict,
+    ):
+        return False
+    if not in_time_window(
+        getattr(flight, "arrival_time", None),
+        arrival_from,
+        arrival_to,
+        strict=strict,
     ):
         return False
     return arrival_within_limit(flight, maximum_offset)
@@ -138,6 +148,8 @@ def itinerary_matches_route(
     route: Any,
     outbound: Any,
     return_flight: Any | None = None,
+    *,
+    strict: bool = False,
 ) -> bool:
     """Return whether an outbound/optional-return itinerary meets a route."""
     # A round-trip quote is only usable when both legs are known.  Legacy
@@ -148,10 +160,10 @@ def itinerary_matches_route(
         and return_flight is None
     ):
         return False
-    if not leg_matches_route(route, outbound):
+    if not leg_matches_route(route, outbound, strict=strict):
         return False
     if return_flight is not None and not leg_matches_route(
-        route, return_flight, is_return=True
+        route, return_flight, is_return=True, strict=strict
     ):
         return False
     return True
@@ -162,6 +174,7 @@ def filter_prices_by_route(
     prices: list[FlightPrice],
     *,
     require_complete_roundtrip: bool = True,
+    strict: bool = False,
 ) -> list[FlightPrice]:
     """Filter live or reconstructed price records with the shared semantics.
 
@@ -174,13 +187,17 @@ def filter_prices_by_route(
     for price in prices:
         flight: FlightInfo = price.flight_info
         if price.return_flight_info is not None:
-            matches = itinerary_matches_route(route, flight, price.return_flight_info)
+            matches = itinerary_matches_route(
+                route, flight, price.return_flight_info, strict=strict
+            )
         elif flight.direction == FlightDirection.RETURN:
-            matches = leg_matches_route(route, flight, is_return=True)
+            matches = leg_matches_route(
+                route, flight, is_return=True, strict=strict
+            )
         elif not require_complete_roundtrip:
-            matches = leg_matches_route(route, flight)
+            matches = leg_matches_route(route, flight, strict=strict)
         else:
-            matches = itinerary_matches_route(route, flight)
+            matches = itinerary_matches_route(route, flight, strict=strict)
         if matches:
             filtered.append(price)
     return filtered

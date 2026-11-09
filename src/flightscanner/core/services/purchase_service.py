@@ -15,7 +15,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
@@ -38,6 +38,8 @@ REGRET_GOOD_MAX_PCT = 0.10
 REGRET_FAIR_MAX_PCT = 0.25
 # 触发后未确认的宽限时长，超时置 expired
 TRIGGER_GRACE_HOURS = 48
+# 起飞后终评要求最后一次可比报价贴近实际截止点。
+FINAL_QUOTE_MAX_AGE_HOURS = 48
 # 注入 AI 简报的经验条数上限
 MAX_EXPERIENCE_CONTEXT = 5
 DEFAULT_LIST_LIMIT = 200
@@ -192,13 +194,17 @@ class PurchaseService:
                 if record.available_seats is None or record.available_seats > 0
             ]
         else:
+            if purchase.route_trip_type == "roundtrip" and (
+                purchase.flight_id is None or purchase.return_flight_id is None
+            ):
+                return None, None
             records = [
                 record
                 for record in records
-                if (
-                    purchase.flight_id is None
-                    or purchase.route_trip_type == "roundtrip"
-                    or record.flight_id == purchase.flight_id
+                if (purchase.flight_id is None or record.flight_id == purchase.flight_id)
+                and (
+                    purchase.route_trip_type != "roundtrip"
+                    or record.return_flight_id == purchase.return_flight_id
                 )
                 and (not purchase.currency or record.currency == purchase.currency)
                 and (not purchase.seat_class or record.seat_class == purchase.seat_class)
@@ -293,6 +299,31 @@ class PurchaseService:
         if plan is None:
             raise ValueError(f"买入计划不存在：id={plan_id}")
         return plan
+
+    def _claim_plan_trigger(
+        self,
+        plan: BuyPlan,
+        *,
+        reason: str,
+        now: datetime,
+        current_price: Optional[float],
+    ) -> bool:
+        claimed = (
+            self.session.query(BuyPlan)
+            .filter(BuyPlan.id == plan.id, BuyPlan.status == "pending")
+            .update(
+                {
+                    BuyPlan.status: "triggered",
+                    BuyPlan.triggered_at: now,
+                    BuyPlan.trigger_reason: reason,
+                    BuyPlan.trigger_price: (
+                        Decimal(str(current_price)) if current_price is not None else None
+                    ),
+                },
+                synchronize_session=False,
+            )
+        )
+        return claimed == 1
 
     def confirm_plan(
         self,
@@ -400,13 +431,12 @@ class PurchaseService:
             elif plan.plan_execute_by is not None and _as_utc(plan.plan_execute_by) <= now:
                 reason = "deadline"
 
-            if reason:
-                plan.status = "triggered"
-                plan.triggered_at = now
-                plan.trigger_reason = reason
-                plan.trigger_price = (
-                    Decimal(str(current_min_price)) if current_min_price is not None else None
-                )
+            if reason and self._claim_plan_trigger(
+                plan,
+                reason=reason,
+                now=now,
+                current_price=current_min_price,
+            ):
                 triggered.append(plan)
                 logger.info(
                     "买入计划触发 id=%d route_id=%d reason=%s price=%s",
@@ -415,12 +445,13 @@ class PurchaseService:
 
         if triggered:
             self.session.commit()
+            for plan in triggered:
+                self.session.refresh(plan)
         return triggered
 
     def sweep_deadline_plans(self, now: Optional[datetime] = None) -> List[BuyPlan]:
-        """全量扫描到期的纯时间计划（无价格条件未触发者），供每日任务调用。"""
+        """全量扫描到期计划，包括起飞后仍等待提醒的历史计划。"""
         now = now or datetime.now(timezone.utc)
-        local_today = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
         pending = (
             self.session.query(BuyPlan)
             .join(Route, BuyPlan.route_id == Route.id)
@@ -428,21 +459,24 @@ class PurchaseService:
                 BuyPlan.status == "pending",
                 BuyPlan.plan_execute_by.isnot(None),
                 Route.deleted_at.is_(None),
-                Route.target_date >= local_today,
             )
             .all()
         )
         triggered: List[BuyPlan] = []
         for plan in pending:
             if _as_utc(plan.plan_execute_by) <= now:
-                plan.status = "triggered"
-                plan.triggered_at = now
-                plan.trigger_reason = "deadline"
                 price, _ = self.get_latest_min_price(plan.route_id)
-                plan.trigger_price = Decimal(str(price)) if price is not None else None
-                triggered.append(plan)
+                if self._claim_plan_trigger(
+                    plan,
+                    reason="deadline",
+                    now=now,
+                    current_price=price,
+                ):
+                    triggered.append(plan)
         if triggered:
             self.session.commit()
+            for plan in triggered:
+                self.session.refresh(plan)
             logger.info("到期计划扫描：触发 %d 条", len(triggered))
         return triggered
 
@@ -471,7 +505,13 @@ class PurchaseService:
             self.session.query(BuyPlan)
             .join(Route, BuyPlan.route_id == Route.id)
             .filter(
-                BuyPlan.status.in_(["pending", "triggered"]),
+                or_(
+                    BuyPlan.status == "pending",
+                    and_(
+                        BuyPlan.status == "triggered",
+                        BuyPlan.notification_status == "sent",
+                    ),
+                ),
                 Route.target_date < today,
             )
             .all()
@@ -584,6 +624,7 @@ class PurchaseService:
             route_id=route_id,
             plan_id=plan_id,
             flight_id=flight_id,
+            return_flight_id=quote.return_flight_id if quote is not None else None,
             purchase_price=Decimal(str(price)),
             total_paid=Decimal(str(effective_total)),
             currency=currency,
@@ -660,13 +701,18 @@ class PurchaseService:
 
         传入 ``purchase`` 时，与统计使用完全相同的产品口径：已关联
         flight_id 则仅比较同航班，并限定币种、已知舱位与足够余票；
-        未关联航班则退化为路线口径。
+        往返必须同时匹配去程和回程，缺少产品标识的旧记录不参与比较。
         """
         if purchase is not None and until is None:
             target_date = purchase.route_target_date or purchase.route.target_date
             departure_at = _purchase_departure_at(purchase, target_date)
             now = datetime.now(timezone.utc)
             until = min(now, departure_at or _target_date_end(target_date))
+
+        if purchase is not None and purchase.route_trip_type == "roundtrip" and (
+            purchase.flight_id is None or purchase.return_flight_id is None
+        ):
+            return []
 
         query = self.session.query(PriceHistory).filter(
             PriceHistory.route_id == route_id,
@@ -675,8 +721,12 @@ class PurchaseService:
         if until is not None:
             query = query.filter(PriceHistory.scraped_at <= _as_utc(until))
         if purchase is not None:
-            if purchase.flight_id is not None and purchase.route_trip_type != "roundtrip":
+            if purchase.flight_id is not None:
                 query = query.filter(PriceHistory.flight_id == purchase.flight_id)
+            if purchase.route_trip_type == "roundtrip":
+                query = query.filter(
+                    PriceHistory.return_flight_id == purchase.return_flight_id
+                )
             if purchase.currency:
                 query = query.filter(PriceHistory.currency == purchase.currency)
             if purchase.seat_class:
@@ -743,12 +793,18 @@ class PurchaseService:
             else None
         )
         comparison_scope = (
-            "flight"
-            if purchase.flight_id is not None and purchase.route_trip_type != "roundtrip"
-            else "route"
+            "roundtrip"
+            if purchase.route_trip_type == "roundtrip"
+            else "flight" if purchase.flight_id is not None else "route"
+        )
+        final_quote_stale = bool(
+            flight_departed
+            and series
+            and _as_utc(cutoff_end) - _as_utc(series[-1][0])
+            > timedelta(hours=FINAL_QUOTE_MAX_AGE_HOURS)
         )
 
-        if sample_size < 2:
+        if sample_size < 2 or final_quote_stale:
             return {
                 "post_min_price": None,
                 "post_max_price": None,
@@ -791,9 +847,6 @@ class PurchaseService:
             if sample_size >= 4 and coverage_hours is not None and coverage_hours >= 24
             else "limited"
         )
-        # 当前账本未保存往返的 return_flight_id，只能做路线级近似比较。
-        if purchase.route_trip_type == "roundtrip":
-            data_quality = "limited"
 
         return {
             "post_min_price": post_min,

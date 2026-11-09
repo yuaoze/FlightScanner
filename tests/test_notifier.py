@@ -1,5 +1,6 @@
 """Unit tests for EmailNotifier."""
 
+import json
 import sys
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -12,8 +13,11 @@ import pytest
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
+from flightscanner.core.services import RouteService
 from flightscanner.interfaces import FlightDirection, FlightInfo, FlightPrice, PriceTrend
+from flightscanner.models.database import BuyPlan, NotificationLog, Route, init_db
 from flightscanner.notifiers import EmailNotifier, FeiShuNotifier
+from flightscanner.scheduler.price_monitor import PriceMonitorScheduler
 from flightscanner.utils.config import Settings
 
 
@@ -248,9 +252,17 @@ class TestFeiShuNotifier:
 
     def test_init_with_explicit_url(self):
         """测试传入显式 webhook_url 时初始化正确。"""
-        notifier = FeiShuNotifier(webhook_url="https://example.com/hook")
+        with patch("flightscanner.notifiers.feishu_notifier.settings") as mock_settings:
+            mock_settings.feishu_webhook_secret = None
+            notifier = FeiShuNotifier(webhook_url="https://example.com/hook")
         assert notifier.webhook_url == "https://example.com/hook"
         assert notifier.webhook_secret is None
+
+    def test_wecom_is_no_longer_a_runtime_channel(self):
+        import flightscanner.notifiers as notifier_module
+
+        assert "wecom_webhook_url" not in Settings.model_fields
+        assert not hasattr(notifier_module, "WeComNotifier")
 
     def test_init_with_secret(self):
         """测试同时传入 webhook_url 和 webhook_secret 时初始化正确。"""
@@ -645,3 +657,149 @@ class TestNotifyTriggerLogic:
         assert data["trigger_reason"] == "target_hit"
         assert data["recommendation"] == "立即购买"
         assert data["flight_no"] == "CA1234"
+
+
+class TestNotificationDeliveryRecovery:
+    @pytest.fixture
+    def scheduler(self):
+        engine, session_factory = init_db("sqlite:///:memory:")
+        scheduler = PriceMonitorScheduler.__new__(PriceMonitorScheduler)
+        scheduler._SessionLocal = session_factory
+        with session_factory() as session:
+            session.add(
+                Route(
+                    id=1,
+                    origin="北京",
+                    destination="上海",
+                    target_date=date.today() + timedelta(days=7),
+                    target_price=Decimal("800"),
+                )
+            )
+            session.commit()
+        try:
+            yield scheduler
+        finally:
+            engine.dispose()
+
+    async def test_retries_only_failed_channels_then_clears_pending_event(
+        self, scheduler, sample_flight_price, sample_trend
+    ):
+        class EmailNotifier:
+            pass
+
+        class TelegramNotifier:
+            pass
+
+        email = EmailNotifier()
+        email.send_alert = AsyncMock(return_value=True)
+        telegram = TelegramNotifier()
+        telegram.send_alert = AsyncMock(return_value=False)
+        scheduler.notifiers = [email, telegram]
+
+        event_id = scheduler._route_notification_event_id(1)
+        first = await scheduler._send_alert(
+            sample_flight_price,
+            sample_trend,
+            "test",
+            route_id=1,
+            trigger_reason="target_hit",
+            event_id=event_id,
+        )
+
+        assert first is False
+        with scheduler._SessionLocal() as session:
+            route = session.get(Route, 1)
+            assert route.pending_notification_event_id == event_id
+            assert route.last_notified_at is None
+
+        telegram.send_alert.return_value = True
+        second = await scheduler._send_alert(
+            sample_flight_price,
+            sample_trend,
+            "test",
+            route_id=1,
+            trigger_reason="target_hit",
+            event_id=scheduler._route_notification_event_id(1),
+        )
+        assert second is True
+        if second:
+            scheduler._update_route_notification_state(
+                1, sample_flight_price.price, "target_hit"
+            )
+
+        assert email.send_alert.await_count == 1
+        assert telegram.send_alert.await_count == 2
+        with scheduler._SessionLocal() as session:
+            route = session.get(Route, 1)
+            assert route.pending_notification_event_id is None
+            assert route.last_notified_at is not None
+            logs = session.query(NotificationLog).filter_by(event_id=event_id).all()
+            assert len(logs) == 3
+            assert {(log.channel, log.status) for log in logs} == {
+                ("email", "success"),
+                ("telegram", "failed"),
+                ("telegram", "success"),
+            }
+
+    async def test_departed_buy_plan_retry_uses_trigger_price(
+        self, scheduler, sample_flight_price, sample_trend
+    ):
+        sample_flight_price.price = Decimal("900")
+        with scheduler._SessionLocal() as session:
+            route = session.get(Route, 1)
+            route.target_date = date.today() - timedelta(days=1)
+            session.add(
+                BuyPlan(
+                    id=1,
+                    route_id=1,
+                    plan_price=Decimal("600"),
+                    status="triggered",
+                    triggered_at=datetime.now(timezone.utc) - timedelta(days=2),
+                    trigger_reason="price_hit",
+                    trigger_price=Decimal("500"),
+                    notification_status="failed",
+                )
+            )
+            session.commit()
+
+        scheduler.notifiers = [MagicMock()]
+        scheduler.analyzer = MagicMock()
+        scheduler.analyzer.predict_trend.return_value = sample_trend
+        scheduler._send_alert = AsyncMock(return_value=True)
+
+        with (
+            patch(
+                "flightscanner.scheduler.price_monitor.filter_prices_by_route",
+                side_effect=lambda _route, history: history,
+            ),
+            patch.object(
+                RouteService,
+                "get_route_price_history",
+                return_value=[sample_flight_price],
+            ),
+        ):
+            sent = await scheduler._retry_buy_plan_notifications()
+            repeated = await scheduler._retry_buy_plan_notifications()
+
+        assert sent == 1
+        assert repeated == 0
+        assert scheduler._send_alert.await_count == 1
+        message = json.loads(scheduler._send_alert.await_args.args[2])
+        assert "触发时价格 ¥500" in message["recommendation"]
+        assert "已达目标价 ¥600" in message["recommendation"]
+        assert "触发时价格 ¥900" not in message["recommendation"]
+        with scheduler._SessionLocal() as session:
+            assert session.get(BuyPlan, 1).notification_status == "sent"
+
+    async def test_reconfigure_notifiers_rebuilds_runtime_channels(self, scheduler):
+        replacement = [MagicMock()]
+        scheduler._notifications_enabled = True
+        with patch(
+            "flightscanner.scheduler.price_monitor.build_notifiers",
+            return_value=replacement,
+        ) as build:
+            count = await scheduler.reconfigure_notifiers()
+
+        assert count == 1
+        assert scheduler.notifiers is replacement
+        build.assert_called_once()

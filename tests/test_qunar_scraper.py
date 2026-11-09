@@ -11,6 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
+import httpx
 import pytest
 
 project_root = Path(__file__).parent.parent
@@ -20,6 +21,8 @@ from flightscanner.interfaces import (
     FlightDirection,
     FlightInfo,
     FlightPrice,
+    ParseError,
+    ScraperError,
     SearchParams,
 )
 from flightscanner.scheduler.price_monitor import PriceMonitorScheduler
@@ -57,6 +60,37 @@ def round_trip_params():
         departure_date=date(2026, 4, 1),
         return_date=date(2026, 4, 8),
     )
+
+
+@pytest.mark.asyncio
+async def test_international_single_fallback_never_uses_roundtrip_total(scraper):
+    scraper._search_inter_roundtrip = AsyncMock()
+    params = SearchParams(
+        departure_city="上海",
+        arrival_city="东京",
+        departure_date=date(2026, 4, 1),
+    )
+
+    assert await scraper._search_inter_single_via_roundtrip(params) == []
+    scraper._search_inter_roundtrip.assert_not_awaited()
+
+
+def test_qunar_cookie_writer_uses_private_atomic_files(tmp_path):
+    from scripts.qunar_login import _has_authenticated_cookie, _write_cookies_atomically
+
+    output = tmp_path / "qunar_cookies.json"
+    output.write_text("existing-login", encoding="utf-8")
+    anonymous = [{"name": "QN1", "value": "anonymous"}]
+
+    assert _has_authenticated_cookie(anonymous) is False
+    assert output.read_text(encoding="utf-8") == "existing-login"
+
+    authenticated = [{"name": "_qnauthtoken", "value": "secret"}]
+    assert _has_authenticated_cookie(authenticated) is True
+    _write_cookies_atomically(output, authenticated)
+
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert output.read_text(encoding="utf-8").startswith("[")
 
 
 class TestAirportCodeLookup:
@@ -426,6 +460,21 @@ class TestAntiDetectionSettings:
         # The script must provide a full chrome object
         assert "window.chrome" in script_arg
 
+    @pytest.mark.asyncio
+    async def test_existing_browser_recreates_closed_context(self, scraper: QunarScraper):
+        _, mock_browser, _, mock_context = _make_playwright_mocks()
+        scraper._browser = mock_browser
+        scraper._context = None
+        scraper.cookies = [{"name": "session", "value": "new"}]
+
+        with patch("flightscanner.scrapers.qunar_scraper.async_playwright") as playwright:
+            await scraper._ensure_browser()
+
+        playwright.assert_not_called()
+        mock_browser.new_context.assert_awaited_once()
+        mock_context.add_cookies.assert_awaited_once_with(scraper.cookies)
+        assert scraper._context is mock_context
+
 
 class TestParseApiResponses:
     """Unit tests for _parse_api_responses() — heuristic JSON flight extractor."""
@@ -437,6 +486,39 @@ class TestParseApiResponses:
             arrival_city="成都",
             departure_date=date(2026, 3, 21),
         )
+
+    def test_wbd_connecting_flight_preserves_both_flight_numbers(
+        self, scraper: QunarScraper, params
+    ):
+        responses = [
+            {
+                "url": "https://flight.qunar.com/touch/api/wbdflightlist",
+                "data": {
+                    "data": {
+                        "flights": [
+                            {
+                                "minPrice": 880,
+                                "binfo1": {
+                                    "airCode": "CA1234",
+                                    "fullName": "中国国航",
+                                    "depTime": "08:00",
+                                },
+                                "binfo2": {
+                                    "airCode": "MU5678",
+                                    "arrTime": "14:30",
+                                },
+                            }
+                        ]
+                    }
+                },
+            }
+        ]
+
+        results = scraper._parse_api_responses(responses, params)
+
+        assert len(results) == 1
+        assert results[0].flight_info.flight_no == "CA1234/MU5678"
+        assert results[0].flight_info.arrival_time == "14:30"
 
     def test_extracts_flight_with_price(self, scraper: QunarScraper, params):
         responses = [
@@ -555,6 +637,181 @@ class TestParseApiResponses:
         ]
         results = scraper._parse_api_responses(responses, params)
         assert len(results) == 2
+
+
+def test_homepage_redirect_detection(scraper: QunarScraper):
+    assert scraper._is_homepage_redirect("https://www.qunar.com/") is True
+    assert scraper._is_homepage_redirect("https://www.qunar.com") is True
+    assert scraper._is_homepage_redirect(
+        "https://flight.qunar.com/site/oneway_list_inter.htm"
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_retired_search_page_does_not_wait_for_flights(scraper: QunarScraper):
+    page = AsyncMock()
+    page.url = "https://www.qunar.com/"
+
+    with pytest.raises(ScraperError, match="网页版机票查询及预订服务已停止提供"):
+        await scraper._wait_for_results(page)
+
+    page.wait_for_selector.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retired_roundtrip_page_does_not_fall_back(scraper: QunarScraper):
+    page = AsyncMock()
+    page.url = "https://www.qunar.com/"
+    page.on = MagicMock()
+    scraper._context = AsyncMock()
+    scraper._context.new_page.return_value = page
+    scraper._search_inter_roundtrip_fallback = AsyncMock()
+    params = SearchParams(
+        departure_city="上海",
+        arrival_city="悉尼",
+        departure_date=date(2027, 2, 5),
+        return_date=date(2027, 2, 13),
+    )
+
+    with (
+        patch.object(scraper, "_ensure_browser"),
+        patch("flightscanner.scrapers.qunar_scraper.asyncio.sleep", AsyncMock()),
+        pytest.raises(ScraperError, match="网页版机票查询及预订服务已停止提供"),
+    ):
+        await scraper.search_flights(params)
+
+    scraper._search_inter_roundtrip_fallback.assert_not_awaited()
+    page.close.assert_awaited_once()
+    scraper._context.new_page.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_deterministic_scraper_error_is_not_retried(scraper: QunarScraper):
+    params = SearchParams(
+        departure_city="上海",
+        arrival_city="悉尼",
+        departure_date=date(2027, 2, 5),
+        return_date=date(2027, 2, 13),
+    )
+    scraper._search_inter_roundtrip = AsyncMock(side_effect=ParseError("bad response"))
+
+    with patch.object(scraper, "_ensure_browser"), pytest.raises(ParseError):
+        await scraper.search_flights(params)
+
+    assert scraper._search_inter_roundtrip.await_count == 1
+
+
+class TestQunarFailurePropagation:
+    @staticmethod
+    def _authenticated(scraper: QunarScraper) -> None:
+        scraper.cookies = [
+            {"name": "_qnauthtoken", "value": "secret", "domain": ".qunar.com"}
+        ]
+
+    @staticmethod
+    def _patch_http_client(client: AsyncMock):
+        context = AsyncMock()
+        context.__aenter__.return_value = client
+        return patch(
+            "flightscanner.scrapers.qunar_scraper.httpx.AsyncClient",
+            return_value=context,
+        )
+
+    @pytest.mark.asyncio
+    async def test_http_error_status_raises_scraper_error(
+        self, scraper: QunarScraper, one_way_params: SearchParams
+    ):
+        self._authenticated(scraper)
+        response = MagicMock(status_code=503, text="unavailable")
+        client = AsyncMock()
+        client.post.return_value = response
+
+        with self._patch_http_client(client), pytest.raises(
+            ScraperError, match="HTTP 503"
+        ):
+            await scraper._search_domestic_via_http(one_way_params)
+
+    @pytest.mark.asyncio
+    async def test_ret_false_raises_scraper_error(
+        self, scraper: QunarScraper, one_way_params: SearchParams
+    ):
+        self._authenticated(scraper)
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"ret": False, "msg": "cookie expired", "data": ""}
+        client = AsyncMock()
+        client.post.return_value = response
+
+        with self._patch_http_client(client), pytest.raises(
+            ScraperError, match="cookie expired"
+        ):
+            await scraper._search_domestic_via_http(one_way_params)
+
+    @pytest.mark.asyncio
+    async def test_explicit_empty_response_uses_current_post_api(
+        self, scraper: QunarScraper, one_way_params: SearchParams
+    ):
+        self._authenticated(scraper)
+        response = MagicMock(status_code=200)
+        response.json.return_value = {
+            "ret": False,
+            "code": -1,
+            "msg": "没有查询到符合条件的航班",
+            "data": None,
+        }
+        client = AsyncMock()
+        client.post.return_value = response
+
+        with self._patch_http_client(client):
+            assert await scraper._search_domestic_via_http(one_way_params) == []
+
+        call = client.post.await_args
+        assert call.args[0] == "https://m.flight.qunar.com/flight/api/touchInnerList"
+        assert call.kwargs["json"]["firstRequest"] is True
+        assert call.kwargs["json"]["depCity"] == "上海"
+
+    @pytest.mark.asyncio
+    async def test_network_error_preserves_cause(
+        self, scraper: QunarScraper, one_way_params: SearchParams
+    ):
+        self._authenticated(scraper)
+        client = AsyncMock()
+        client.post.side_effect = httpx.ConnectError("connection failed")
+
+        with self._patch_http_client(client) as mocked_client:
+            with pytest.raises(ScraperError) as exc_info:
+                await scraper._search_domestic_via_http(one_way_params)
+
+        assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+        mocked_client.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_invalid_json_raises_parse_error(
+        self, scraper: QunarScraper, one_way_params: SearchParams
+    ):
+        self._authenticated(scraper)
+        response = MagicMock(status_code=200)
+        response.json.side_effect = ValueError("invalid json")
+        client = AsyncMock()
+        client.post.return_value = response
+
+        with self._patch_http_client(client), pytest.raises(
+            ParseError, match="响应解析失败"
+        ) as exc_info:
+            await scraper._search_domestic_via_http(one_way_params)
+
+        assert isinstance(exc_info.value.__cause__, ValueError)
+
+    @pytest.mark.asyncio
+    async def test_mobile_browser_failure_raises_parse_error(
+        self, scraper: QunarScraper, one_way_params: SearchParams
+    ):
+        scraper._context = AsyncMock()
+        scraper._context.new_page.side_effect = RuntimeError("browser closed")
+
+        with pytest.raises(ParseError, match="移动端航班搜索失败") as exc_info:
+            await scraper._search_via_mobile_api(one_way_params)
+
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 class TestNetworkInterceptionFallback:
@@ -705,6 +962,39 @@ class TestNetworkInterceptionFallback:
 
         mock_parse_api.assert_not_called()
         assert results == [dummy_fp]
+
+    @pytest.mark.asyncio
+    async def test_all_failed_fallbacks_raise_instead_of_empty_result(
+        self, scraper: QunarScraper, one_way_params: SearchParams
+    ):
+        mock_page = AsyncMock()
+        mock_page.on = MagicMock()
+        scraper._context = AsyncMock()
+        scraper._context.new_page.return_value = mock_page
+        scraper.cookies = [
+            {"name": "_qnauthtoken", "value": "secret", "domain": ".qunar.com"}
+        ]
+        http_fallback = AsyncMock(side_effect=ScraperError("http failed"))
+        mobile_fallback = AsyncMock(side_effect=ParseError("mobile failed"))
+
+        with (
+            patch.object(scraper, "_ensure_browser"),
+            patch.object(scraper, "_is_login_required", return_value=False),
+            patch.object(scraper, "_is_blocked", return_value=False),
+            patch.object(scraper, "_wait_for_results"),
+            patch.object(scraper, "_parse_flights", return_value=[]),
+            patch.object(scraper, "_search_domestic_via_http", http_fallback),
+            patch.object(scraper, "_search_via_mobile_api", mobile_fallback),
+            patch.object(scraper, "_maybe_refresh_and_retry", return_value=[]),
+            patch("flightscanner.scrapers.qunar_scraper.asyncio.sleep", AsyncMock()),
+            patch("builtins.open", mock_open()),
+            pytest.raises(ParseError, match="所有去哪儿降级采集路径均失败") as exc_info,
+        ):
+            await scraper.search_flights.__wrapped__(scraper, one_way_params)
+
+        http_fallback.assert_awaited_once()
+        mobile_fallback.assert_awaited_once()
+        assert exc_info.value.__cause__ is mobile_fallback.side_effect
 
 
 class TestUnpricedFlightElementRejected:

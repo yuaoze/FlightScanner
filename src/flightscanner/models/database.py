@@ -172,6 +172,7 @@ class Route(Base):
     recent_3d_low         = Column(Numeric(10, 2), nullable=True)   # 最近3天最低价
     recent_3d_low_at      = Column(DateTime, nullable=True)          # 最近3天低点时间（UTC）
     last_notified_reason  = Column(String(50), nullable=True)        # 上次通知的触发原因
+    pending_notification_event_id = Column(String(100), nullable=True)
 
     # 精准航班号监控字段（通过迁移添加）
     monitoring_mode       = Column(String(20), default="route", nullable=False)  # 'route' | 'flight'
@@ -386,6 +387,7 @@ class PurchaseRecord(Base):
     route_id = Column(Integer, ForeignKey("routes.id"), nullable=False, index=True)
     plan_id = Column(Integer, ForeignKey("buy_plans.id"), nullable=True)
     flight_id = Column(Integer, ForeignKey("flights.id"), nullable=True)
+    return_flight_id = Column(Integer, ForeignKey("flights.id"), nullable=True)
     # purchase_price 始终为单人、同币种的可比票价；total_paid 为订单实付总额。
     purchase_price = Column(Numeric(10, 2), nullable=False)
     total_paid = Column(Numeric(12, 2), nullable=True)
@@ -413,7 +415,8 @@ class PurchaseRecord(Base):
         backref=backref("purchase_records", passive_deletes=True),
     )
     plan = relationship("BuyPlan")
-    flight = relationship("Flight")
+    flight = relationship("Flight", foreign_keys=[flight_id])
+    return_flight = relationship("Flight", foreign_keys=[return_flight_id])
 
     __table_args__ = (
         # 一个计划最多转换为一笔买入；NULL 仍允许多笔即时买入。
@@ -602,6 +605,7 @@ class NotificationLog(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     route_id = Column(Integer, ForeignKey("routes.id"), nullable=False)
+    event_id = Column(String(100), nullable=True, index=True)
     notified_at = Column(DateTime, default=utcnow, nullable=False)
     price = Column(Numeric(10, 2), nullable=False)
     trigger_reason = Column(String(50), nullable=False)
@@ -616,6 +620,7 @@ class NotificationLog(Base):
 
     __table_args__ = (
         Index("ix_notif_route_time", "route_id", "notified_at"),
+        Index("ix_notif_event_channel", "event_id", "channel"),
     )
 
     def __repr__(self) -> str:
@@ -725,6 +730,9 @@ def _apply_migrations(engine) -> None:
         "ALTER TABLE routes ADD COLUMN recent_3d_low NUMERIC",
         "ALTER TABLE routes ADD COLUMN recent_3d_low_at DATETIME",
         "ALTER TABLE routes ADD COLUMN last_notified_reason TEXT",
+        "ALTER TABLE routes ADD COLUMN pending_notification_event_id TEXT",
+        "ALTER TABLE notification_log ADD COLUMN event_id TEXT",
+        "CREATE INDEX IF NOT EXISTS ix_notif_event_channel ON notification_log(event_id, channel)",
         # v2.2.0 买入闭环四表（使用 CREATE TABLE IF NOT EXISTS，已有表静默跳过）
         (
             "CREATE TABLE IF NOT EXISTS buy_plans ("
@@ -752,6 +760,7 @@ def _apply_migrations(engine) -> None:
             "route_id INTEGER NOT NULL REFERENCES routes(id), "
             "plan_id INTEGER UNIQUE REFERENCES buy_plans(id), "
             "flight_id INTEGER REFERENCES flights(id), "
+            "return_flight_id INTEGER REFERENCES flights(id), "
             "purchase_price NUMERIC NOT NULL, "
             "total_paid NUMERIC, "
             "currency TEXT NOT NULL DEFAULT 'CNY', "
@@ -772,6 +781,7 @@ def _apply_migrations(engine) -> None:
             "created_at DATETIME NOT NULL)"
         ),
         "ALTER TABLE purchase_records ADD COLUMN total_paid NUMERIC",
+        "ALTER TABLE purchase_records ADD COLUMN return_flight_id INTEGER REFERENCES flights(id)",
         "ALTER TABLE purchase_records ADD COLUMN quote_price NUMERIC",
         "ALTER TABLE purchase_records ADD COLUMN quote_source TEXT",
         "ALTER TABLE purchase_records ADD COLUMN quote_batch_id TEXT",
@@ -904,7 +914,9 @@ def _apply_migrations(engine) -> None:
                 "deleted_at",
                 "max_arrival_day_offset",
                 "ret_max_arrival_day_offset",
+                "pending_notification_event_id",
             },
+            "notification_log": {"event_id"},
             "buy_plans": {
                 "notification_status",
                 "notification_attempts",
@@ -913,6 +925,7 @@ def _apply_migrations(engine) -> None:
             },
             "purchase_records": {
                 "total_paid",
+                "return_flight_id",
                 "quote_price",
                 "quote_source",
                 "quote_batch_id",

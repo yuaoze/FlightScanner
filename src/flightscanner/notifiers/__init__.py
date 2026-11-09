@@ -5,15 +5,14 @@ from typing import List
 from .email_notifier import EmailNotifier
 from .feishu_notifier import FeiShuNotifier
 from .telegram_notifier import TelegramNotifier
-from .wecom_notifier import WeComNotifier
 
-__all__ = ["EmailNotifier", "FeiShuNotifier", "TelegramNotifier", "WeComNotifier", "build_notifiers"]
+__all__ = ["EmailNotifier", "FeiShuNotifier", "TelegramNotifier", "build_notifiers"]
 
 
 def build_notifiers(settings, enable_notifications: bool = True) -> List:
     """根据配置构建并返回已启用的通知器列表。
 
-    按顺序检测 Email、Telegram、WeCom、飞书四个渠道的配置项是否就绪，
+    按顺序检测 Email、Telegram、飞书三个渠道的配置项是否就绪，
     将已配置的通知器实例追加到列表中返回。
 
     Args:
@@ -39,10 +38,6 @@ def build_notifiers(settings, enable_notifications: bool = True) -> List:
     if settings.telegram_bot_token and settings.telegram_chat_id:
         notifiers.append(TelegramNotifier())
         logger.info("TelegramNotifier 已启用")
-
-    if settings.wecom_webhook_url:
-        notifiers.append(WeComNotifier())
-        logger.info("WeComNotifier 已启用")
 
     if settings.feishu_webhook_url:
         notifiers.append(FeiShuNotifier())

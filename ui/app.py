@@ -21,6 +21,7 @@ from flightscanner.utils.city_codes import (
     is_international_route,
 )
 from ui.utils.db import get_session, get_session_local
+from ui.components.charts import _source_label
 from ui.components.overview import render_overview_cards, render_route_list
 from ui.components.cookie_manager import render_cookie_manager_dialog
 
@@ -93,7 +94,7 @@ def trigger_immediate_scrape(route_id: int) -> None:
             st.session_state["_flash"] = (
                 "warning",
                 f"采集完成，但部分平台未返回数据：{warn_detail}。"
-                "如需刷新 Cookie，请运行 python scripts/qunar_login.py 或在 Cookie 管理中重新登录。",
+                "如需刷新 Cookie，请在 Cookie 管理中重新登录相应平台。",
             )
         else:
             st.session_state["_flash"] = (
@@ -388,11 +389,11 @@ def _search_flights_for_pinned(
 def _format_flight_option(flight_no: str, fp: "FlightPrice") -> str:
     """Build a human-readable selectbox option string for a flight.
 
-    Format:  {flight_no}  {airline}  {dep_time}→{arr_time}[+N]  ¥{price:.0f}{stops}  [{source}]
+    Format:  {flight_no}  {airline}  {dep_time}→{arr_time}[+N]  ¥{price:.0f}{stops}  [{source_label}]
 
     Examples:
-        CA4509  国航  08:30→11:00  ¥480  [qunar]
-        CA953/MU5185  国航  07:00→15:30+1  ¥380  经停1次  [ctrip]
+        CA4509  国航  08:30→11:00  ¥480  [飞猪]
+        CA953/MU5185  国航  07:00→15:30+1  ¥380  经停1次  [携程]
     """
     fi = fp.flight_info
     arr_time = fi.arrival_time or ""
@@ -411,7 +412,7 @@ def _format_flight_option(flight_no: str, fp: "FlightPrice") -> str:
 
     return (
         f"{flight_no}  {fi.airline}  {fi.departure_time}→{arr_time}{overnight}"
-        f"  ¥{float(fp.price):.0f}{stops_str}  [{fp.source}]"
+        f"  ¥{float(fp.price):.0f}{stops_str}  [{_source_label(fp.source)}]"
     )
 
 

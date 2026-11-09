@@ -1,6 +1,6 @@
 """Cookie 管理 UI 组件。
 
-提供去哪儿 / 携程 / 同程旅行 Cookie 状态查看和扫码刷新。
+提供飞猪 / 携程 / 同程旅行 Cookie 状态查看和扫码刷新。
 
 架构说明：
 - `get_login_manager()` — @st.cache_resource 单例，整个进程共享
@@ -24,27 +24,27 @@ import streamlit as st
 _project_root = Path(__file__).resolve().parent.parent.parent
 
 _COOKIE_FILES: dict[str, Path] = {
-    "qunar": _project_root / "qunar_cookies.json",
+    "fliggy": _project_root / "fliggy_cookies.json",
     "ctrip": _project_root / "ctrip_cookies.json",
     "tongcheng": _project_root / "tongcheng_cookies.json",
 }
 
 _PLATFORM_NAMES: dict[str, str] = {
-    "qunar": "去哪儿",
+    "fliggy": "飞猪",
     "ctrip": "携程",
     "tongcheng": "同程旅行",
 }
 
 # 与各平台 login 脚本中的检测集合保持一致
 _KEY_COOKIES: dict[str, set[str]] = {
-    "qunar": {"QN42", "JSESSIONID", "ctt_june"},
+    "fliggy": {"cookie2", "unb"},
     "ctrip": {"ibu_uid", "UBT_VID", "uid", "suid"},
     # 同程公开列表无需固定登录 Cookie；文件中有可用条目即可。
     "tongcheng": set(),
 }
 
-_LOGIN_TIMEOUT = 120  # 去哪儿 / 携程
-_LOGIN_TIMEOUTS = {"qunar": 120, "ctrip": 120, "tongcheng": 300}
+_LOGIN_TIMEOUT = 120  # 飞猪 / 携程
+_LOGIN_TIMEOUTS = {"fliggy": 120, "ctrip": 120, "tongcheng": 300}
 
 
 # ── 共享状态 ──────────────────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ class CookieLoginManager:
 
     def __init__(self) -> None:
         self._states: dict[str, CookieLoginState] = {
-            "qunar": CookieLoginState(),
+            "fliggy": CookieLoginState(),
             "ctrip": CookieLoginState(),
             "tongcheng": CookieLoginState(),
         }
@@ -99,11 +99,12 @@ class CookieLoginManager:
         def _on_qr_ready(png_path: str) -> None:
             state.qr_path = png_path
             state.status = "qr_ready"
-            state.message = (
-                "请使用微信扫描官方 OAuth 二维码"
-                if platform == "tongcheng"
-                else "请用 APP 扫描二维码"
-            )
+            if platform == "fliggy":
+                state.message = "请使用淘宝 App 扫码并确认登录飞猪"
+            elif platform == "tongcheng":
+                state.message = "请使用微信扫描官方 OAuth 二维码"
+            else:
+                state.message = "请用 APP 扫描二维码"
 
         def _thread_target() -> None:
             try:
@@ -115,8 +116,8 @@ class CookieLoginManager:
                 if _root not in sys.path:
                     sys.path.insert(0, _root)
 
-                if platform == "qunar":
-                    from scripts.qunar_login import qr_login
+                if platform == "fliggy":
+                    from scripts.fliggy_login import qr_login
                 elif platform == "ctrip":
                     from scripts.ctrip_login import qr_login  # type: ignore[assignment]
                 elif platform == "tongcheng":
@@ -164,10 +165,15 @@ def _get_cookie_info(platform: str) -> dict:
     except Exception:
         return {"exists": True, "valid": False, "mtime": path.stat().st_mtime, "count": 0}
 
-    # 过滤空值 Cookie 后与关键集合求交
-    cookie_names = {c["name"] for c in cookies if c.get("value")}
-    key_cookies = _KEY_COOKIES[platform]
-    has_key = bool(cookie_names) if not key_cookies else bool(key_cookies & cookie_names)
+    if platform == "fliggy":
+        from scripts.fliggy_login import _has_authenticated_cookie
+
+        has_key = _has_authenticated_cookie(cookies)
+    else:
+        # 过滤空值 Cookie 后与关键集合求交
+        cookie_names = {c["name"] for c in cookies if c.get("value")}
+        key_cookies = _KEY_COOKIES[platform]
+        has_key = bool(cookie_names) if not key_cookies else bool(key_cookies & cookie_names)
 
     return {
         "exists": True,
@@ -197,6 +203,9 @@ def _cookie_dialog_fragment() -> None:
     """对话框内容片段；st.rerun(scope='fragment') 只刷新此片段，不关闭对话框。"""
     manager = get_login_manager()
     active = st.session_state.get("cookie_mgr_active")
+    if active and active not in _PLATFORM_NAMES:
+        st.session_state.pop("cookie_mgr_active", None)
+        active = None
 
     # ── 登录进行中 / 完成：显示扫码进度 ─────────────────────────────
     if active:
@@ -268,7 +277,9 @@ def _cookie_dialog_fragment() -> None:
                 min(elapsed / timeout_seconds, 1.0),
                 text=f"已等待 {int(elapsed)}s / {timeout_seconds}s",
             )
-            if active == "tongcheng":
+            if active == "fliggy":
+                st.caption("请使用淘宝 App 扫码并确认登录飞猪")
+            elif active == "tongcheng":
                 st.caption(
                     "请使用微信“扫一扫”扫描左侧官方 OAuth 二维码"
                     "（不是同程旅行 App）"
@@ -285,12 +296,12 @@ def _cookie_dialog_fragment() -> None:
 
     # ── 默认：显示 Cookie 状态面板 ───────────────────────────────────
     else:
-        tab_qunar, tab_ctrip, tab_tongcheng = st.tabs(
-            ["去哪儿", "携程", "同程旅行"]
+        tab_fliggy, tab_ctrip, tab_tongcheng = st.tabs(
+            ["飞猪", "携程", "同程旅行"]
         )
 
         for tab, platform in (
-            (tab_qunar, "qunar"),
+            (tab_fliggy, "fliggy"),
             (tab_ctrip, "ctrip"),
             (tab_tongcheng, "tongcheng"),
         ):

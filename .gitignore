@@ -75,6 +75,7 @@ logs/
 qunar_cookies.json
 ctrip_cookies.json
 tongcheng_cookies.json
+fliggy_cookies.json
 
 # Screenshots and debug files
 debug_screenshot.png

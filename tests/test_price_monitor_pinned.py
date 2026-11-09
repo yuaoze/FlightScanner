@@ -1,5 +1,6 @@
 """Regression tests for pinned-flight helpers and the persisted scrape pipeline."""
 
+import asyncio
 import sys
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -13,8 +14,8 @@ import pytest
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
-from flightscanner.interfaces import FlightDirection, FlightInfo, FlightPrice
-from flightscanner.models.database import Flight, PriceHistory, Route, init_db
+from flightscanner.interfaces import FlightDirection, FlightInfo, FlightPrice, SearchParams
+from flightscanner.models.database import BuyPlan, Flight, PriceHistory, Route, init_db
 from flightscanner.core.services import RouteService
 from flightscanner.scheduler.price_monitor import (
     PriceMonitorScheduler,
@@ -276,6 +277,33 @@ class TestUpdateFlightStatus:
         svc = RouteService(db_session)
         svc.update_flight_status(9999, "sold_out")  # should not raise
 
+    def test_batch_save_rolls_back_when_a_later_quote_fails(self, db_session):
+        svc = RouteService(db_session)
+        route = svc.add_route(
+            origin="上海",
+            destination="北京",
+            target_date=date(2026, 10, 1),
+            target_price=Decimal("500"),
+        )
+        original_save = svc.save_price_for_route
+        calls = 0
+
+        def fail_second(route_id, flight_price, *, commit=True):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("simulated write failure")
+            return original_save(route_id, flight_price, commit=commit)
+
+        svc.save_price_for_route = fail_second
+        with pytest.raises(RuntimeError, match="simulated write failure"):
+            svc.save_prices_for_route(
+                route.id,
+                [_make_flight_price("CA953"), _make_flight_price("CA954")],
+            )
+
+        assert db_session.query(PriceHistory).filter_by(route_id=route.id).count() == 0
+
 
 # ── _combine_roundtrip_prices ────────────────────────────────────────────────
 
@@ -437,6 +465,92 @@ class TestCombineRoundtripPrices:
 
 # ── pinned scrape integration (real SQLite, no external I/O) ─────────────────
 
+async def test_same_route_scrapes_are_mutually_exclusive():
+    scheduler = PriceMonitorScheduler.__new__(PriceMonitorScheduler)
+    scheduler._route_locks = {}
+    active = 0
+    maximum_active = 0
+
+    async def fake_scrape(route, task_id=None):
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+
+    scheduler._scrape_route = fake_scrape
+    route = MagicMock(id=7)
+
+    await asyncio.gather(scheduler.scrape_route(route), scheduler.scrape_route(route))
+
+    assert maximum_active == 1
+
+
+async def test_shared_scraper_is_serialized_and_uses_call_specific_limits():
+    class FakeScraper:
+        def __init__(self):
+            self.max_results = 20
+            self.active = 0
+            self.maximum_active = 0
+            self.observed_limits = []
+
+        async def search_flights(self, params):
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            self.observed_limits.append(self.max_results)
+            await asyncio.sleep(0.01)
+            self.active -= 1
+            return []
+
+    scheduler = PriceMonitorScheduler.__new__(PriceMonitorScheduler)
+    scraper = FakeScraper()
+    scheduler.scrapers = [scraper]
+    scheduler._scraper_locks = {}
+    scheduler._active_scraper_tasks = set()
+    scheduler._scrape_warnings = []
+    params = SearchParams(
+        departure_city="上海",
+        arrival_city="北京",
+        departure_date=date(2026, 10, 1),
+    )
+
+    await asyncio.gather(
+        scheduler._scrape_oneway(params, max_results=5),
+        scheduler._scrape_oneway(params, max_results=9),
+    )
+
+    assert scraper.maximum_active == 1
+    assert sorted(scraper.observed_limits) == [5, 9]
+
+
+async def test_pinned_flight_is_matched_before_result_limit():
+    target = _make_flight_price("CA953", price=900)
+    cheaper_other_flight = _make_flight_price("CA954", price=100)
+
+    class FakeScraper:
+        max_results = 20
+
+        async def search_flights(self, params):
+            return [cheaper_other_flight, target]
+
+    scheduler = PriceMonitorScheduler.__new__(PriceMonitorScheduler)
+    scheduler.scrapers = [FakeScraper()]
+    scheduler._scraper_locks = {}
+    scheduler._active_scraper_tasks = set()
+    scheduler._scrape_warnings = []
+    params = SearchParams(
+        departure_city="上海",
+        arrival_city="北京",
+        departure_date=date(2026, 10, 1),
+    )
+
+    result = await scheduler._scrape_oneway(
+        params, max_results=1, flight_no="CA953"
+    )
+
+    assert result == [target]
+
+
 @pytest.fixture
 def pinned_scheduler():
     engine, session_factory = init_db("sqlite:///:memory:")
@@ -538,8 +652,8 @@ def _assert_pinned_success(scheduler, route, expected_quotes, expected_status="a
     assert {fp.batch_id for fp in history} == {best.batch_id}
     assert best.batch_id.startswith(f"route_{route.id}_")
     assert scheduler._check_buy_plans.await_args.args[3] == history
-    assert scheduler._check_buy_plans.await_args.args[4]["batch_count"] == 1
-    assert scheduler._check_buy_plans.await_args.args[5] == 1
+    assert scheduler._check_buy_plans.await_args.args[4]["batch_count"] == 0
+    assert scheduler._check_buy_plans.await_args.args[5] == 0
     for fp in history:
         assert fp.flight_info.direction == FlightDirection.DEPARTURE
         if route.trip_type == "roundtrip":
@@ -556,6 +670,28 @@ def _assert_pinned_success(scheduler, route, expected_quotes, expected_status="a
         assert stored_route.last_flight_status == expected_status
         assert stored_route.recent_3d_low == best.price
         assert stored_route.last_notified_price == best.price
+
+
+async def test_empty_scrape_still_triggers_due_buy_plan(pinned_scheduler):
+    scheduler = pinned_scheduler
+    route = _persist_pinned_route(scheduler)
+    with scheduler._SessionLocal() as session:
+        plan = BuyPlan(
+            route_id=route.id,
+            plan_execute_by=datetime.now(timezone.utc) - timedelta(hours=1),
+            status="pending",
+        )
+        session.add(plan)
+        session.commit()
+        plan_id = plan.id
+
+    await scheduler.scrape_route(route)
+
+    with scheduler._SessionLocal() as session:
+        stored = session.get(BuyPlan, plan_id)
+        assert stored.status == "triggered"
+        assert stored.trigger_reason == "deadline"
+    scheduler._check_buy_plans.assert_not_called()
 
 
 async def test_pinned_roundtrip_keeps_legal_platform_pairs_and_selects_legal_best(
@@ -620,7 +756,10 @@ async def test_pinned_roundtrip_keeps_legal_platform_pairs_and_selects_legal_bes
     assert (in_params.departure_city, in_params.arrival_city) == ("北京", "上海")
     assert in_params.departure_date == route.return_date
     assert out_params.return_date is None and in_params.return_date is None
-    assert scheduler.scrapers[0].max_results == 100
+    for call, flight_no in zip(calls, ("CA953", "CA954"), strict=True):
+        assert call.kwargs["max_results"] == 100
+        assert call.kwargs["flight_no"] == flight_no
+    assert scheduler.scrapers[0].max_results == 20
 
 
 @pytest.mark.parametrize(

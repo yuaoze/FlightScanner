@@ -1,9 +1,48 @@
 """Pydantic response schemas for the FlightScanner API."""
 
+import re
 from datetime import date
 from typing import List, Literal, Optional
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+
+def validate_hh_mm(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
+        raise ValueError("Time must be HH:MM between 00:00 and 23:59")
+    return value
+
+
+def validate_time_windows(values) -> None:
+    for prefix in ("dep_time", "arr_time", "ret_dep_time", "ret_arr_time"):
+        time_from = getattr(values, f"{prefix}_from", None)
+        time_to = getattr(values, f"{prefix}_to", None)
+        if time_from is not None and time_to is not None and time_from > time_to:
+            raise ValueError(f"{prefix}_from must be <= {prefix}_to")
+
+
+def validate_route_dates(
+    target_date: date,
+    return_date: Optional[date],
+    trip_type: str,
+) -> None:
+    if trip_type not in {"oneway", "roundtrip"}:
+        raise ValueError("trip_type must be oneway or roundtrip")
+    if target_date < date.today():
+        raise ValueError("target_date cannot be in the past")
+    if trip_type == "roundtrip" and return_date is None:
+        raise ValueError("return_date is required for roundtrip routes")
+    if return_date is not None and return_date < target_date:
+        raise ValueError("return_date must be on or after target_date")
 
 
 class SparklinePoint(BaseModel):
@@ -144,7 +183,10 @@ class RoutePredictionsResponse(BaseModel):
 
 
 class UpdateRouteRequest(BaseModel):
-    target_price: Optional[float] = None
+    target_price: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    target_date: Optional[date] = None
+    return_date: Optional[date] = None
+    trip_type: Optional[str] = None
     scrape_interval: Optional[int] = None
     is_active: Optional[bool] = None
     # Time windows: pass empty string "" to clear, or "HH:MM" to set.
@@ -159,6 +201,14 @@ class UpdateRouteRequest(BaseModel):
     ret_arr_time_to: Optional[str] = None
     max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
     ret_max_arrival_day_offset: Optional[int] = Field(default=None, ge=0, le=2)
+
+    @field_validator(
+        "dep_time_from", "dep_time_to", "arr_time_from", "arr_time_to",
+        "ret_dep_time_from", "ret_dep_time_to", "ret_arr_time_from", "ret_arr_time_to",
+    )
+    @classmethod
+    def validate_time(cls, value: Optional[str]) -> Optional[str]:
+        return validate_hh_mm(value)
 
 
 # ── Flight batch / listing schemas ────────────────────────────────────────

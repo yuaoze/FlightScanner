@@ -2,6 +2,7 @@
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import Mock
 
 import fastapi.routing
 import httpx
@@ -31,8 +32,8 @@ def api_context(monkeypatch):
     async def override_db():
         yield session
 
-    async def run_inline(function, *args, **kwargs):
-        return function(*args, **kwargs)
+    async def run_inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
 
     monkeypatch.setattr(fastapi.routing, "run_in_threadpool", run_inline)
     monkeypatch.setattr(routes, "_register_route_with_scheduler", lambda _route: None)
@@ -447,6 +448,95 @@ async def test_patch_omitted_return_limit_remains_unchanged(api_client) -> None:
     session.refresh(route)
     assert route.max_arrival_day_offset == 0
     assert route.ret_max_arrival_day_offset == 1
+
+
+@pytest.mark.parametrize("target_price", [0, -1])
+async def test_create_and_patch_reject_non_positive_target_price(
+    api_client, target_price: float
+) -> None:
+    client, session = api_client
+    payload = _route_payload(outbound_limit=None, return_limit=None)
+    payload["target_price"] = target_price
+    assert (await client.post("/api/routes", json=payload)).status_code == 422
+
+    route = _add_route(session, outbound_limit=None)
+    response = await client.patch(
+        f"/api/routes/{route.id}", json={"target_price": target_price}
+    )
+    assert response.status_code == 422
+    session.refresh(route)
+    assert route.target_price == Decimal("800")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"trip_type": "roundtrip", "return_date": None},
+        {"target_date": "2030-09-17", "return_date": "2030-09-10"},
+        {"target_date": "2000-01-01", "trip_type": "oneway", "return_date": None},
+    ],
+)
+async def test_create_route_rejects_invalid_dates(api_client, overrides) -> None:
+    client, session = api_client
+    payload = _route_payload(outbound_limit=None, return_limit=None)
+    payload.update(overrides)
+
+    response = await client.post("/api/routes", json=payload)
+
+    assert response.status_code == 422
+    assert session.query(Route).count() == 0
+
+
+async def test_patch_validates_merged_time_window_without_partial_update(api_client) -> None:
+    client, session = api_client
+    route = _add_route(session, outbound_limit=None)
+    route.dep_time_from = "06:00"
+    route.dep_time_to = "09:00"
+    session.commit()
+
+    response = await client.patch(
+        f"/api/routes/{route.id}",
+        json={"dep_time_from": "10:00", "target_price": 700},
+    )
+
+    assert response.status_code == 422
+    session.refresh(route)
+    assert route.dep_time_from == "06:00"
+    assert route.target_price == Decimal("800")
+
+
+async def test_patch_validates_roundtrip_dates(api_client) -> None:
+    client, session = api_client
+    route = _add_route(session, outbound_limit=None, trip_type="oneway")
+
+    response = await client.patch(
+        f"/api/routes/{route.id}", json={"trip_type": "roundtrip"}
+    )
+
+    assert response.status_code == 422
+    session.refresh(route)
+    assert route.trip_type == "oneway"
+
+
+async def test_patch_reschedules_only_when_active_value_changes(
+    api_client, monkeypatch
+) -> None:
+    client, session = api_client
+    route = _add_route(session, outbound_limit=None)
+    monitor = Mock()
+    monkeypatch.setattr(routes, "_get_live_monitor", lambda: monitor)
+
+    for _ in range(2):
+        response = await client.patch(
+            f"/api/routes/{route.id}", json={"is_active": False}
+        )
+        assert response.status_code == 200
+    monitor.unschedule_route.assert_called_once_with(route.id)
+    monitor.schedule_route.assert_not_called()
+
+    response = await client.patch(f"/api/routes/{route.id}", json={"is_active": True})
+    assert response.status_code == 200
+    monitor.schedule_route.assert_called_once()
 
 
 @pytest.mark.parametrize(

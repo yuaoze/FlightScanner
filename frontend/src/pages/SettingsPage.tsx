@@ -14,7 +14,6 @@ interface SettingsData {
   notifications: {
     email: boolean;
     telegram: boolean;
-    wecom: boolean;
     feishu: boolean;
   };
   cooldowns: {
@@ -56,7 +55,6 @@ interface UpdatePayload {
   smtp_password?: string;
   telegram_bot_token?: string;
   telegram_chat_id?: string;
-  wecom_webhook_url?: string;
   feishu_webhook_url?: string;
   feishu_webhook_secret?: string;
 }
@@ -259,7 +257,7 @@ export function SettingsPage() {
         {/* Scraper Settings */}
         <SettingCard title="爬虫设置">
           <div className="py-2">
-            <label className="text-xs text-gray-500 block mb-1">启用平台（逗号分隔，可选 qunar/ctrip/tongcheng）</label>
+            <label className="text-xs text-gray-500 block mb-1">启用平台（逗号分隔，可选 fliggy/ctrip/tongcheng）</label>
             <input
               type="text"
               value={get('scraper_type', settings.scraper.scraper_type) as string}
@@ -317,13 +315,6 @@ export function SettingsPage() {
               </span>
             </div>
             <div className="flex items-center gap-2">
-              <StatusDot active={settings.notifications.wecom} />
-              <span className="text-xs text-gray-600">企业微信</span>
-              <span className="text-[10px] text-gray-400 ml-auto">
-                {settings.notifications.wecom ? '已配置' : '未配置'}
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
               <StatusDot active={settings.notifications.feishu} />
               <span className="text-xs text-gray-600">飞书</span>
               <span className="text-[10px] text-gray-400 ml-auto">
@@ -374,12 +365,6 @@ export function SettingsPage() {
                 label="Telegram Chat ID"
                 value={get('telegram_chat_id', '') as string}
                 onChange={(v) => set('telegram_chat_id', v)}
-              />
-              <TextField
-                label="WeCom Webhook URL"
-                value={get('wecom_webhook_url', '') as string}
-                onChange={(v) => set('wecom_webhook_url', v)}
-                placeholder="https://qyapi.weixin.qq.com/..."
               />
               <TextField
                 label="Feishu Webhook URL"

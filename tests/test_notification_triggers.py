@@ -111,6 +111,19 @@ class TestShouldNotify:
         assert ok is True
         assert reason == "near_30d_low"
 
+    @pytest.mark.parametrize("batch_count", [0, 1, 2])
+    def test_near_30d_low_requires_three_historical_batches(self, batch_count):
+        route = _make_route(target_price=500)
+        ok, reason = PriceMonitorScheduler._should_notify(
+            route,
+            Decimal("800"),
+            _stats(avg=800, min_p=800, count=batch_count),
+            batch_count,
+        )
+
+        assert ok is False
+        assert reason == ""
+
     def test_below_avg(self):
         route = _make_route(target_price=500)
         ok, reason = PriceMonitorScheduler._should_notify(
@@ -282,6 +295,29 @@ class TestConsecutiveDeclining:
         ]
         result = PriceMonitorScheduler._compute_consecutive_declining_batches(history, lookback=5)
         assert result == 2  # only last 2 are declining
+
+    def test_mixed_naive_and_aware_timestamps(self):
+        now = datetime.now(timezone.utc)
+        history = [
+            _make_fp(
+                1000,
+                scraped_at=(now - timedelta(hours=12)).replace(tzinfo=None),
+                batch_id="b1",
+            ),
+            _make_fp(950, scraped_at=now - timedelta(hours=8), batch_id="b2"),
+            _make_fp(
+                900,
+                scraped_at=(now - timedelta(hours=4)).replace(tzinfo=None),
+                batch_id="b3",
+            ),
+            _make_fp(850, scraped_at=now, batch_id="b4"),
+        ]
+
+        result = PriceMonitorScheduler._compute_consecutive_declining_batches(
+            history, lookback=5
+        )
+
+        assert result == 3
 
     def test_single_batch(self):
         history = [_make_fp(1000, batch_id="b1")]

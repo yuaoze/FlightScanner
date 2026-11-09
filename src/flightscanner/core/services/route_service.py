@@ -721,7 +721,9 @@ class RouteService:
     def save_price_for_route(
         self,
         route_id: int,
-        flight_price: FlightPrice
+        flight_price: FlightPrice,
+        *,
+        commit: bool = True,
     ) -> int:
         """Save a price snapshot linked to a route.
 
@@ -760,9 +762,29 @@ class RouteService:
         )
 
         self.session.add(price_history)
-        self.session.commit()
+        if commit:
+            self.session.commit()
+        else:
+            self.session.flush()
 
         return price_history.id
+
+    def save_prices_for_route(
+        self,
+        route_id: int,
+        flight_prices: List[FlightPrice],
+    ) -> List[int]:
+        """Save one scrape batch atomically."""
+        try:
+            ids = [
+                self.save_price_for_route(route_id, fp, commit=False)
+                for fp in flight_prices
+            ]
+            self.session.commit()
+            return ids
+        except Exception:
+            self.session.rollback()
+            raise
 
     def update_notification_state(
         self,
