@@ -489,6 +489,39 @@ class TestBatchPriceSemantics:
         assert _batch_min_prices(list(reversed(records))) == [650.0, 700.0, 900.0, 500.0]
         assert _latest_batch_snapshot(records) == (Decimal("900"), now + timedelta(seconds=1))
 
+    @pytest.mark.parametrize("batch_id", ["latest", None, ""])
+    def test_mixed_timezones_preserve_batch_prices_and_order(self, price_factory, batch_id):
+        now = datetime(2026, 1, 10, 12, tzinfo=timezone.utc)
+        high_time = now + timedelta(seconds=1) if batch_id else now
+        records = [
+            price_factory(1000, (now - timedelta(hours=2)).replace(tzinfo=None), "old-1"),
+            price_factory(
+                1000,
+                (now - timedelta(hours=1)).astimezone(timezone(timedelta(hours=8))),
+                "old-2",
+            ),
+            price_factory(600, now.replace(tzinfo=None), batch_id),
+            price_factory(1800, high_time.astimezone(timezone(timedelta(hours=-5))), batch_id),
+        ]
+        original_times = [fp.scraped_at for fp in records]
+        target_date = date.today() + timedelta(days=30)
+
+        for ordering in permutations(records):
+            history = list(ordering)
+            assert sorted(_batch_min_prices(history)) == [600.0, 1000.0, 1000.0]
+            latest = _latest_batch_snapshot(history)
+            assert latest == (Decimal("600"), high_time)
+            assert latest[1].tzinfo is timezone.utc
+            trend = RuleBasedAnalyzer().predict_trend(history, target_date)
+            assert trend.direction == "down"
+            assert trend.confidence == 0.4
+            brief = _rule_based_brief(history, target_date)
+            assert brief["key_factors"] == [
+                "当前价格 ¥600，30天均价 ¥1000", "低于均价 40.0%"
+            ]
+
+        assert all(fp.scraped_at is original for fp, original in zip(records, original_times))
+
     def test_empty_batches(self):
         assert _batch_min_prices([]) == []
         assert _latest_batch_snapshot([]) is None
@@ -687,13 +720,20 @@ class TestBriefEvidenceGate:
         assert len(loops) == 2 and loops[0] is loops[1]
 
     @pytest.mark.parametrize("mode", ["sync", "async"])
+    @pytest.mark.parametrize("naive_history", [False, True])
     def test_missing_api_key_falls_back_with_enough_batches(
-        self, mode, price_factory, mock_deepseek_client
+        self, mode, naive_history, price_factory, mock_deepseek_client
     ):
         now = datetime(2026, 1, 10, 12, tzinfo=timezone.utc)
-        records = [price_factory(700, now, str(i)) for i in range(7)]
+        history_time = now.replace(tzinfo=None) if naive_history else now
+        records = [
+            price_factory(1000, history_time - timedelta(days=i + 1), str(i))
+            for i in range(6)
+        ]
+        records.append(price_factory(600, now, "latest"))
         brief = _generate_test_brief(mode, records, date.today())
         assert brief["_source"] == "rule_based"
+        assert brief["key_factors"][0] == "当前价格 ¥600，30天均价 ¥1000"
         mock_deepseek_client.constructor.assert_not_called()
         mock_deepseek_client.create.assert_not_awaited()
 

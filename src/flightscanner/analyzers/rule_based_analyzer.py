@@ -5,7 +5,7 @@ interface that uses statistical analysis of historical prices to predict trends
 and generate recommendations.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from statistics import median, stdev
 from typing import Dict, List, Optional
@@ -16,15 +16,21 @@ from flightscanner.interfaces import FlightPrice, PriceAnalyzer, PriceTrend
 def _batch_snapshots(
     price_records: List[FlightPrice],
 ) -> List[tuple[Decimal, datetime]]:
-    """Return (minimum price, latest scrape time) in first-seen batch order."""
+    """Return (minimum price, latest UTC scrape time) in first-seen batch order."""
     batches: Dict[tuple[str, str | datetime], tuple[Decimal, datetime]] = {}
     for fp in price_records:
-        key = ("id", fp.batch_id) if fp.batch_id else ("time", fp.scraped_at)
-        if key in batches:
-            price, scraped_at = batches[key]
-            batches[key] = (min(price, fp.price), max(scraped_at, fp.scraped_at))
+        scraped_at = fp.scraped_at
+        if scraped_at.tzinfo is None:
+            # SQLite drops tzinfo from persisted UTC timestamps.
+            scraped_at = scraped_at.replace(tzinfo=timezone.utc)
         else:
-            batches[key] = (fp.price, fp.scraped_at)
+            scraped_at = scraped_at.astimezone(timezone.utc)
+        key = ("id", fp.batch_id) if fp.batch_id else ("time", scraped_at)
+        if key in batches:
+            price, latest_time = batches[key]
+            batches[key] = (min(price, fp.price), max(latest_time, scraped_at))
+        else:
+            batches[key] = (fp.price, scraped_at)
     return list(batches.values())
 
 

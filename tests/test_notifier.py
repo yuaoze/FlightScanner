@@ -2,6 +2,7 @@
 
 import json
 import sys
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -13,12 +14,13 @@ import pytest
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root / "src"))
 
+from flightscanner.analyzers import RuleBasedAnalyzer
 from flightscanner.core.services import RouteService
 from flightscanner.interfaces import FlightDirection, FlightInfo, FlightPrice, PriceTrend
 from flightscanner.models.database import BuyPlan, NotificationLog, Route, init_db
 from flightscanner.notifiers import EmailNotifier, FeiShuNotifier
 from flightscanner.scheduler.price_monitor import PriceMonitorScheduler
-from flightscanner.utils.config import Settings
+from flightscanner.utils.config import Settings, settings
 
 
 @pytest.fixture
@@ -680,6 +682,73 @@ class TestNotificationDeliveryRecovery:
             yield scheduler
         finally:
             engine.dispose()
+
+    @pytest.mark.parametrize("target_price,reason", [(800, "target_hit"), (600, "below_avg")])
+    async def test_scrape_notifies_with_persisted_and_fresh_timestamps(
+        self, scheduler, sample_flight_price, feishu_notifier,
+        target_price, reason, monkeypatch, caplog,
+    ):
+        monkeypatch.setattr(settings, "deepseek_api_key", "")
+        monkeypatch.setattr(settings, "notify_below_avg_threshold", 10.0)
+        monkeypatch.setattr(settings, "notify_departure_warn_days", 7)
+        monkeypatch.setattr(settings, "notify_rebound_pct", 10.0)
+        with scheduler._SessionLocal() as session:
+            route = session.get(Route, 1)
+            route.target_date = date.today() + timedelta(days=30)
+            route.target_price = Decimal(str(target_price))
+            session.commit()
+            session.refresh(route)
+            current = replace(
+                sample_flight_price,
+                flight_info=replace(
+                    sample_flight_price.flight_info, departure_date=route.target_date
+                ),
+            )
+            history = [
+                replace(
+                    current,
+                    price=Decimal("600" if i == 0 else "800"),
+                    scraped_at=current.scraped_at - timedelta(days=7 - i),
+                    batch_id=f"old-{i}",
+                )
+                for i in range(7)
+            ]
+            service = RouteService(session)
+            service.save_prices_for_route(route.id, history)
+            persisted = service.get_route_price_history(route.id)
+            assert len(persisted) == 7
+            assert all(fp.scraped_at.tzinfo is None for fp in persisted)
+            assert current.scraped_at.tzinfo is timezone.utc
+
+        scheduler.analyzer = RuleBasedAnalyzer()
+        scheduler.notifiers = [feishu_notifier]
+        scheduler._scrape_all_platforms = AsyncMock(return_value=[current])
+        scheduler._maybe_log_prediction = AsyncMock()
+        scheduler._check_buy_plans = AsyncMock()
+        mock_response = Mock()
+        mock_response.json.return_value = {"code": 0, "msg": "success"}
+        mock_client = AsyncMock()
+        mock_client.post.return_value = mock_response
+        mock_client.__aenter__.return_value = mock_client
+        with patch(
+            "flightscanner.notifiers.feishu_notifier.httpx.AsyncClient",
+            return_value=mock_client,
+        ):
+            await scheduler.scrape_route(route)
+
+        mock_client.post.assert_awaited_once()
+        assert mock_client.post.await_args.kwargs["json"]["msg_type"] == "interactive"
+        assert "AI 简报获取失败" not in caplog.text
+        scheduler._maybe_log_prediction.assert_awaited_once()
+        scheduler._check_buy_plans.assert_awaited_once()
+        with scheduler._SessionLocal() as session:
+            stored_route = session.get(Route, route.id)
+            assert stored_route.last_notified_at is not None
+            assert stored_route.last_notified_price == current.price
+            assert stored_route.last_notified_reason == reason
+            assert stored_route.pending_notification_event_id is None
+            log = session.query(NotificationLog).one()
+            assert (log.channel, log.status, log.trigger_reason) == ("feishu", "success", reason)
 
     async def test_retries_only_failed_channels_then_clears_pending_event(
         self, scheduler, sample_flight_price, sample_trend
