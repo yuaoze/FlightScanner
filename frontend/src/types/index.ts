@@ -162,6 +162,10 @@ export interface FlightListItem {
   return_arrival_day_offset: number | null;
   return_departure_time: string | null;
   return_arrival_time: string | null;
+  return_airline: string | null;
+  return_duration: string | null;
+  return_departure_airport_code: string | null;
+  return_arrival_airport_code: string | null;
 }
 
 export interface RouteFlightsResponse {

@@ -737,6 +737,74 @@ async def test_filtered_out_status_suppresses_an_older_matching_batch(
     assert stats_response.json()["buy_count"] == 0
 
 
+@pytest.mark.parametrize("return_offset", [0, 1, 2])
+async def test_flights_exposes_return_leg_details(api_client, return_offset: int) -> None:
+    client, session = api_client
+    route = _add_route(session, outbound_limit=None, trip_type="roundtrip")
+    quote = _add_quote(
+        session,
+        route,
+        flight_no="CZ3502+CZ325",
+        outbound_offset=1,
+        return_offset=return_offset,
+        price="3200",
+        batch_id="itinerary-batch",
+        scraped_at=datetime.now(timezone.utc),
+    )
+    outbound = session.get(Flight, quote.flight_id)
+    outbound.departure_airport_code = "SHA"
+    outbound.arrival_airport_code = "PEK"
+    inbound = session.get(Flight, quote.return_flight_id)
+    inbound.flight_no = "MU5108/MU5110"
+    inbound.airline = "东方航空"
+    inbound.departure_airport_code = "PKX"
+    inbound.arrival_airport_code = "PVG"
+    session.commit()
+
+    response = await client.get(f"/api/routes/{route.id}/flights")
+
+    assert response.status_code == 200, response.text
+    flight = response.json()["flights"][0]
+    assert flight["flight_no"] == "CZ3502+CZ325"
+    assert flight["departure_airport_code"] == "SHA"
+    assert flight["arrival_airport_code"] == "PEK"
+    assert flight["return_flight_no"] == "MU5108/MU5110"
+    assert flight["return_airline"] == "东方航空"
+    assert flight["return_duration"] == f"{2 + 24 * return_offset}h00m"
+    assert flight["return_departure_airport_code"] == "PKX"
+    assert flight["return_arrival_airport_code"] == "PVG"
+    assert flight["return_arrival_day_offset"] == return_offset
+    assert flight["return_arrival_date"] == (
+        route.return_date + timedelta(days=return_offset)
+    ).isoformat()
+    assert flight["price"] == 3200
+
+
+async def test_flights_without_return_leg_exposes_null_details(api_client) -> None:
+    client, session = api_client
+    route = _add_route(session, outbound_limit=None)
+    _add_quote(
+        session,
+        route,
+        flight_no="CZ3502",
+        outbound_offset=0,
+        price="800",
+        batch_id="oneway-batch",
+        scraped_at=datetime.now(timezone.utc),
+    )
+    session.commit()
+
+    response = await client.get(f"/api/routes/{route.id}/flights")
+
+    assert response.status_code == 200, response.text
+    flight = response.json()["flights"][0]
+    for field in (
+        "return_flight_no", "return_airline", "return_duration",
+        "return_departure_airport_code", "return_arrival_airport_code",
+    ):
+        assert flight[field] is None
+
+
 async def test_flights_filters_before_applying_limit(api_client) -> None:
     client, session = api_client
     route = _add_route(session, outbound_limit=0)

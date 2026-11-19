@@ -1082,6 +1082,23 @@ def get_route_flights(
                 return_arrival_time=(
                     return_flight.arrival_time if return_flight else None
                 ),
+                return_airline=(return_flight.airline if return_flight else None),
+                return_duration=(
+                    _compute_duration(
+                        return_flight.departure_time,
+                        return_flight.arrival_time,
+                        return_flight.departure_date,
+                        resolved_return_arrival_date,
+                    )
+                    if return_flight and return_flight.flight_no != "VIRTUAL_RETURN"
+                    else None
+                ),
+                return_departure_airport_code=(
+                    return_flight.departure_airport_code if return_flight else None
+                ),
+                return_arrival_airport_code=(
+                    return_flight.arrival_airport_code if return_flight else None
+                ),
             )
         )
     return RouteFlightsResponse(

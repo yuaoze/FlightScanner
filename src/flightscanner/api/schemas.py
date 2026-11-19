@@ -249,6 +249,10 @@ class FlightListItem(BaseModel):
     return_arrival_day_offset: Optional[int] = Field(default=None, ge=0)
     return_departure_time: Optional[str] = None
     return_arrival_time: Optional[str] = None
+    return_airline: Optional[str] = None
+    return_duration: Optional[str] = None
+    return_departure_airport_code: Optional[str] = None
+    return_arrival_airport_code: Optional[str] = None
 
 
 class RouteFlightsResponse(BaseModel):

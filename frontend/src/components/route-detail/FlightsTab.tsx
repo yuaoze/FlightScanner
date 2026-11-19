@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import type { RouteDetailResponse } from '../../types';
+import type { FlightBriefInfo, RouteDetailResponse } from '../../types';
 import { useRouteBatches, useRouteFlights } from '../../hooks/useRouteDetail';
+import { formatFlightDate } from '../../lib/arrivalDay';
 
 interface Props {
   routeId: number;
@@ -23,6 +24,125 @@ const SOURCE_COLORS: Record<string, string> = {
   trip: 'bg-green-50 text-green-700',
 };
 
+function FlightLeg({
+  label,
+  flight,
+  origin,
+  destination,
+  differentDepartureAirport = false,
+  differentArrivalAirport = false,
+}: {
+  label: string;
+  flight: Omit<FlightBriefInfo, 'arrival_date_is_estimated'>;
+  origin: string;
+  destination: string;
+  differentDepartureAirport?: boolean;
+  differentArrivalAirport?: boolean;
+}) {
+  const flightNumbers = flight.flight_no.split(/[+/]/).map((number) => number.trim()).filter(Boolean);
+  const transferCount = Math.max(0, flightNumbers.length - 1);
+  const airlineCode = flight.flight_no.match(/^([A-Z0-9]{2})(?=\d)/i)?.[1].toUpperCase();
+  const durationMatch = flight.duration?.match(/^(\d+)h(\d+)m$/);
+  const duration = durationMatch
+    ? `${Number(durationMatch[1]) ? `${Number(durationMatch[1])}小时` : ''}${Number(durationMatch[2]) ? `${Number(durationMatch[2])}分` : ''}` || '0分'
+    : flight.duration || '时长待采集';
+  const departureAirport = flight.departure_airport_code || origin;
+  const arrivalAirport = flight.arrival_airport_code || destination;
+
+  return (
+    <div aria-label={`${label} ${flight.flight_no}`}>
+      <div className="grid grid-cols-[28px_60px_minmax(54px,1fr)_72px] items-center gap-1.5 @md:grid-cols-[40px_80px_minmax(100px,1fr)_92px] @md:gap-4">
+        <div className="flex flex-col items-center gap-1">
+          <svg viewBox="0 0 40 36" className="h-8 w-7 @md:h-9 @md:w-10" aria-hidden="true">
+            <path d="M2 31 23 5h15L26 31Z" fill="#0ea5e9" />
+            <path d="m2 31 13-5h13l-2 5Z" fill="#0284c7" />
+            <text x="24" y="23" textAnchor="middle" fill="white" fontSize="11" fontWeight="700" fontFamily="Arial, sans-serif">
+              {airlineCode || '—'}
+            </text>
+          </svg>
+          <span className="text-[10px] text-slate-400">{label}</span>
+        </div>
+
+        <div className="text-center">
+          <time
+            dateTime={flight.departure_date && flight.departure_time ? `${flight.departure_date}T${flight.departure_time}` : undefined}
+            title={`出发 ${formatFlightDate(flight.departure_date)}`}
+            className="block font-[Arial,sans-serif] text-[22px] leading-none tracking-tight tabular-nums text-slate-900 @md:text-[26px]"
+          >
+            {flight.departure_time || '--:--'}
+          </time>
+          <span
+            title={differentDepartureAirport ? `${departureAirport} · 往返使用不同机场` : departureAirport}
+            className={`mt-1.5 inline-block max-w-full rounded-md px-1 py-0.5 text-xs leading-4 @md:text-sm ${
+              differentDepartureAirport ? 'bg-pink-100 text-pink-700' : 'text-slate-500'
+            }`}
+          >
+            {departureAirport}
+          </span>
+        </div>
+
+        <div className="min-w-0 text-center">
+          <p className="text-[10px] leading-4 text-slate-500 @md:text-xs">{duration}</p>
+          <div className="relative my-1 flex h-3 items-center pr-3" aria-hidden="true">
+            <div className="h-px w-full bg-slate-300" />
+            {transferCount > 0 && (
+              <div className="absolute inset-y-0 left-0 right-3 flex items-center justify-evenly">
+                {Array.from({ length: transferCount }, (_, index) => (
+                  <span key={index} className="h-1.5 w-1.5 rounded-full bg-pink-500 ring-2 ring-white" />
+                ))}
+              </div>
+            )}
+            <svg viewBox="0 0 24 24" className="absolute right-0 h-3.5 w-3.5 text-slate-400" fill="currentColor">
+              <path d="m21 12-7-2-5-7H6l3 7-5 1-2-3H0l2 4-2 4h2l2-3 5 1-3 7h3l5-7 7-2Z" />
+            </svg>
+          </div>
+          <p
+            title={transferCount > 0 ? '中转次数按航班段数展示，中转机场暂未提供' : '当前记录包含一个航班号，未提供经停信息'}
+            className={`text-[10px] leading-4 @md:text-xs ${transferCount > 0 ? 'text-pink-500' : 'text-slate-400'}`}
+          >
+            {transferCount > 0 ? `转机${transferCount}次` : '单段航班'}
+          </p>
+        </div>
+
+        <div className="text-left">
+          <span className="relative inline-block font-[Arial,sans-serif] text-[22px] leading-none tracking-tight tabular-nums text-slate-900 @md:text-[26px]">
+            <time
+              dateTime={flight.arrival_date && flight.arrival_time ? `${flight.arrival_date}T${flight.arrival_time}` : undefined}
+              title={`到达 ${formatFlightDate(flight.arrival_date)}`}
+            >
+              {flight.arrival_time || '--:--'}
+            </time>
+            {flight.arrival_day_offset !== null && flight.arrival_day_offset > 0 && (
+              <sup
+                className="absolute -right-3.5 top-0 text-[10px] leading-none tracking-normal"
+                title={`出发后第 ${flight.arrival_day_offset} 天到达`}
+                aria-label={`出发后第 ${flight.arrival_day_offset} 天到达`}
+              >
+                +{flight.arrival_day_offset}
+              </sup>
+            )}
+          </span>
+          <div>
+            <span
+              title={differentArrivalAirport ? `${arrivalAirport} · 往返使用不同机场` : arrivalAirport}
+              className={`mt-1.5 inline-block max-w-full rounded-md px-1 py-0.5 text-xs leading-4 @md:text-sm ${
+                differentArrivalAirport ? 'bg-pink-100 text-pink-700' : 'text-slate-500'
+              }`}
+            >
+              {arrivalAirport}
+            </span>
+          </div>
+        </div>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-0.5 pl-[34px] text-[10px] text-slate-400 @md:pl-14 @md:text-[11px]">
+        <time dateTime={flight.departure_date || undefined}>{formatFlightDate(flight.departure_date)}</time>
+        <span>{flight.airline || '航司待采集'}</span>
+        <span className="break-all font-mono text-slate-500">{flight.flight_no}</span>
+      </div>
+    </div>
+  );
+}
+
 export function FlightsTab({ routeId, route }: Props) {
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
@@ -44,8 +164,9 @@ export function FlightsTab({ routeId, route }: Props) {
       <div className="bg-white rounded-xl border border-gray-100 p-5">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="text-xs text-gray-500 block mb-1.5">采集批次</label>
+            <label htmlFor="flight-batch" className="text-xs text-gray-500 block mb-1.5">采集批次</label>
             <select
+              id="flight-batch"
               value={
                 selectedBatchId && selectedSource
                   ? `${selectedBatchId}::${selectedSource}`
@@ -119,67 +240,83 @@ export function FlightsTab({ routeId, route }: Props) {
         </div>
       ) : (
         <div className="space-y-3">
-          {flightsData.flights.map((f, idx) => (
-            <div
-              key={`${f.flight_no}-${idx}`}
-              className="bg-white rounded-xl border border-gray-100 p-4 hover:shadow-sm transition-shadow"
-            >
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3 flex-1">
-                  <span className="text-xs text-gray-400 w-6">#{idx + 1}</span>
+          {flightsData.flights.map((f, idx) => {
+            const hasReturn = Boolean(f.return_flight_no && f.return_flight_no !== 'VIRTUAL_RETURN');
+            const differentOriginAirports = Boolean(
+              hasReturn && f.departure_airport_code && f.return_arrival_airport_code &&
+              f.departure_airport_code !== f.return_arrival_airport_code,
+            );
+            const differentDestinationAirports = Boolean(
+              hasReturn && f.arrival_airport_code && f.return_departure_airport_code &&
+              f.arrival_airport_code !== f.return_departure_airport_code,
+            );
 
-                  {/* Outbound */}
-                  <div className="flex items-center gap-3 flex-1 min-w-0">
-                    <div className="text-center">
-                      <p className="text-base font-bold text-gray-900">{f.departure_time}</p>
-                      <p className="text-[10px] text-gray-500">
-                        {f.departure_airport_code || route.origin}
+            return (
+              <article
+                key={`${f.flight_no}-${idx}`}
+                aria-label={`第 ${idx + 1} 条航班行程`}
+                className="@container rounded-xl border border-gray-100 bg-white p-3 transition-shadow hover:shadow-sm sm:p-5"
+              >
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400">
+                  <span>#{String(idx + 1).padStart(2, '0')} · {route.trip_type === 'roundtrip' ? '往返行程' : '单程行程'}</span>
+                  {(differentOriginAirports || differentDestinationAirports) && (
+                    <span className="text-pink-600">粉色标记：往返不同机场</span>
+                  )}
+                </div>
+                <div className="flex flex-col gap-4 @[720px]:flex-row @[720px]:items-center @[720px]:gap-8">
+                  <div className="w-full min-w-0 max-w-xl flex-1 space-y-5">
+                    <FlightLeg
+                      label={route.trip_type === 'roundtrip' ? '去程' : '单程'}
+                      flight={f}
+                      origin={route.origin}
+                      destination={route.destination}
+                      differentDepartureAirport={differentOriginAirports}
+                      differentArrivalAirport={differentDestinationAirports}
+                    />
+                    {hasReturn && (
+                      <FlightLeg
+                        label="回程"
+                        flight={{
+                          flight_no: f.return_flight_no!,
+                          airline: f.return_airline || '',
+                          departure_date: f.return_departure_date || route.return_date || '',
+                          arrival_date: f.return_arrival_date,
+                          arrival_day_offset: f.return_arrival_day_offset,
+                          departure_time: f.return_departure_time || '',
+                          arrival_time: f.return_arrival_time || '',
+                          duration: f.return_duration,
+                          departure_airport_code: f.return_departure_airport_code,
+                          arrival_airport_code: f.return_arrival_airport_code,
+                        }}
+                        origin={route.destination}
+                        destination={route.origin}
+                        differentDepartureAirport={differentDestinationAirports}
+                        differentArrivalAirport={differentOriginAirports}
+                      />
+                    )}
+                    {route.trip_type === 'roundtrip' && !hasReturn && (
+                      <p className="pl-[34px] text-xs text-slate-400 @md:pl-14">回程明细待采集</p>
+                    )}
+                  </div>
+
+                  <div className="flex shrink-0 items-center justify-between gap-3 border-t border-gray-100 pt-3 @[720px]:ml-auto @[720px]:block @[720px]:min-w-28 @[720px]:border-l @[720px]:border-t-0 @[720px]:pl-6 @[720px]:pt-0 @[720px]:text-right">
+                    <div>
+                      <p className="text-[10px] text-slate-400">{route.trip_type === 'roundtrip' ? '往返总价' : '单程票价'}</p>
+                      <p className="mt-0.5 text-2xl font-semibold tracking-tight tabular-nums text-slate-900">
+                        <span className="mr-0.5 text-sm font-normal">¥</span>{Math.round(f.price).toLocaleString('zh-CN')}
                       </p>
                     </div>
-                    <div className="flex-1 flex flex-col items-center min-w-0">
-                      <p className="text-[10px] text-gray-400">{f.duration || '--'}</p>
-                      <div className="w-full flex items-center my-0.5">
-                        <div className="flex-1 h-px bg-gray-200" />
-                        <span className="mx-1 text-xs text-gray-400">✈</span>
-                        <div className="flex-1 h-px bg-gray-200" />
-                      </div>
-                      <p className="text-[10px] text-gray-600 truncate w-full text-center">
-                        {f.flight_no} · {f.airline}
-                      </p>
-                    </div>
-                    <div className="text-center">
-                      <p className="text-base font-bold text-gray-900">{f.arrival_time}</p>
-                      <p className="text-[10px] text-gray-500">
-                        {f.arrival_airport_code || route.destination}
-                      </p>
+                    <div className="flex flex-wrap items-center justify-end gap-1.5 @[720px]:mt-2">
+                      <span className={`rounded px-1.5 py-0.5 text-[10px] ${SOURCE_COLORS[f.source] || 'bg-gray-100 text-gray-600'}`}>
+                        {SOURCE_LABELS[f.source] || f.source}
+                      </span>
+                      <span className="text-[10px] text-slate-400">{f.seat_class}</span>
                     </div>
                   </div>
                 </div>
-
-                {/* Price + Source */}
-                <div className="text-right ml-4 flex-shrink-0">
-                  <p className="text-lg font-bold text-gray-900">¥{Math.round(f.price)}</p>
-                  <div className="flex items-center gap-1.5 justify-end mt-1">
-                    <span className={`text-[10px] px-1.5 py-0.5 rounded ${SOURCE_COLORS[f.source] || 'bg-gray-100 text-gray-600'}`}>
-                      {SOURCE_LABELS[f.source] || f.source}
-                    </span>
-                    <span className="text-[10px] text-gray-400">{f.seat_class}</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Return leg for roundtrip */}
-              {f.return_flight_no && f.return_flight_no !== 'VIRTUAL_RETURN' && (
-                <div className="mt-2 pt-2 border-t border-gray-50 flex items-center gap-2 text-xs text-gray-500">
-                  <span className="text-gray-400">回程</span>
-                  <span className="font-medium text-gray-700">{f.return_flight_no}</span>
-                  <span>
-                    {f.return_departure_time} → {f.return_arrival_time}
-                  </span>
-                </div>
-              )}
-            </div>
-          ))}
+              </article>
+            );
+          })}
         </div>
       )}
     </div>
