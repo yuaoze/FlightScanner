@@ -53,13 +53,10 @@ export function DashboardPage() {
 
   return (
     <div>
-      {/* Page Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-xl font-bold text-gray-900">监控总览</h1>
-          <p className="text-sm text-gray-400 mt-0.5">
-            共 {counts.total} 个活跃监控
-          </p>
+          <p className="text-sm text-gray-400 mt-0.5">共 {counts.total} 个活跃监控</p>
         </div>
         <div className="flex items-center gap-3">
           <button
@@ -71,7 +68,6 @@ export function DashboardPage() {
         </div>
       </div>
 
-      {/* Add Monitor Dialog */}
       <AddMonitorDialog
         open={showAddDialog}
         onClose={() => setShowAddDialog(false)}
@@ -102,13 +98,9 @@ export function DashboardPage() {
         </div>
       )}
 
-      {/* KPI Cards */}
       <KpiCards stats={stats} isLoading={statsLoading} />
-
-      {/* Filter Tabs */}
       <FilterTabs activeTab={activeTab} counts={counts} onTabChange={setActiveTab} />
 
-      {/* Monitor Cards */}
       {routesLoading ? (
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
           {Array.from({ length: 6 }).map((_, i) => (

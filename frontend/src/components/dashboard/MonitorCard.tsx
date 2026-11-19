@@ -1,4 +1,4 @@
-import { motion } from 'framer-motion';
+import { motion, useReducedMotion } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
 import type { FlightBriefInfo, RouteResponse } from '../../types';
 import {
@@ -217,6 +217,7 @@ function LatestItinerary({ route }: { route: RouteResponse }) {
 
 export function MonitorCard({ route }: MonitorCardProps) {
   const navigate = useNavigate();
+  const reduceMotion = useReducedMotion();
   useTicker(60_000);
 
   const countdown = nextScrapeCountdown(
@@ -242,10 +243,10 @@ export function MonitorCard({ route }: MonitorCardProps) {
   return (
     <motion.article
       layout
-      initial={{ opacity: 0, y: 20 }}
+      initial={reduceMotion ? false : { opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, scale: 0.95 }}
-      whileHover={{ y: -2 }}
+      exit={reduceMotion ? undefined : { opacity: 0, scale: 0.95 }}
+      whileHover={reduceMotion ? undefined : { y: -2 }}
       transition={{ duration: 0.2 }}
       className="flex min-w-0 flex-col rounded-xl border border-gray-100 bg-white p-4 transition-shadow hover:border-gray-200 hover:shadow-lg sm:p-5"
     >

@@ -1,3 +1,5 @@
+import { useId } from 'react';
+
 interface Props {
   maxBudget: number;
   onBudgetChange: (v: number) => void;
@@ -20,11 +22,13 @@ function Toggle({
 }) {
   return (
     <button
+      type="button"
       onClick={onClick}
-      className={`px-4 py-2 rounded-full text-xs font-medium transition-all border ${
+      aria-pressed={active}
+      className={`rounded-full border px-4 py-2 text-xs font-medium transition-all ${
         active
-          ? `${activeClass} text-white border-transparent shadow`
-          : 'bg-white text-gray-600 border-gray-200 hover:border-gray-300'
+          ? `${activeClass} border-transparent text-white shadow`
+          : 'border-gray-200 bg-white text-gray-600 hover:border-gray-300'
       }`}
     >
       {label}
@@ -40,22 +44,26 @@ export function FilterBar({
   excludeRedEye,
   onToggleRedEye,
 }: Props) {
+  const budgetId = useId();
+
   return (
-    <div className="bg-white/60 backdrop-blur rounded-xl border border-gray-100 p-4 mb-5 flex flex-wrap items-center gap-3">
-      <div className="flex items-center gap-3 flex-1 min-w-[240px]">
-        <span className="text-xs text-gray-500 whitespace-nowrap">💰 预算</span>
+    <div className="mb-5 flex flex-wrap items-center gap-3 rounded-xl border border-gray-100 bg-white/60 p-4 backdrop-blur">
+      <div className="flex min-w-[240px] flex-1 items-center gap-3">
+        <label htmlFor={budgetId} className="whitespace-nowrap text-xs text-gray-500">💰 预算</label>
         <input
+          id={budgetId}
           type="range"
           min="300"
           max="5000"
           step="100"
           value={maxBudget}
-          onChange={(e) => onBudgetChange(Number(e.target.value))}
+          onChange={(event) => onBudgetChange(Number(event.target.value))}
+          aria-valuetext={`往返不超过 ${maxBudget} 元`}
           className="flex-1 accent-purple-600"
         />
-        <span className="text-sm font-semibold text-gray-800 w-20 text-right">
+        <output htmlFor={budgetId} className="w-20 text-right text-sm font-semibold text-gray-800">
           ≤ ¥{maxBudget}
-        </span>
+        </output>
       </div>
 
       <div className="flex items-center gap-2">

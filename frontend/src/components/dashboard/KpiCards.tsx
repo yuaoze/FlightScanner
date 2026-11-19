@@ -57,7 +57,7 @@ export function KpiCards({ stats, isLoading }: KpiCardsProps) {
     { icon: '↑', value: stats.expensive_count, label: '个不推荐', color: '#EF4444' },
     {
       icon: '📉',
-      value: stats.average_drop_pct ? `${stats.average_drop_pct}%` : '--',
+      value: stats.average_drop_pct === null ? '--' : `${stats.average_drop_pct}%`,
       label: '较历史均价',
       color: '#22C55E',
     },
