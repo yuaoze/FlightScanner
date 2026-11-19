@@ -55,7 +55,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="FlightScanner API",
     description="Flight price monitoring dashboard API",
-    version="2.2.1",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
